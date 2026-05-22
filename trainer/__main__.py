@@ -93,7 +93,7 @@ def main():
     cfg.setdefault("finetune_lr",        5e-4)
     cfg.setdefault("loss_fn",            "mse")
     cfg.setdefault("bottleneck_ratio",  0.5)
-    cfg.setdefault("kv_lora_rank",      8)
+    cfg.setdefault("kv_lora_rank",      4)
 
     if cfg.get("save_dir") is None:
         cfg["save_dir"] = f"./runs/{cfg['variant']}_{cfg['artifact'].lower()}"

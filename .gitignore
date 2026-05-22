@@ -1,0 +1,21 @@
+.DS_Store
+.AppleDouble
+.LSOverride
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.vscode/
+.claude/
+.idea/
+runs/      
+data/      
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.weights
+*.onnx
+
+*.log      # 屏蔽运行日志文件
