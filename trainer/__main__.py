@@ -75,7 +75,7 @@ def main():
 
     # Apply fallback defaults for anything still missing
     cfg.setdefault("variant",            "tcn_mla")
-    cfg.setdefault("artifact",           "EOG")
+    cfg.setdefault("artifact",           "EMG")
     cfg.setdefault("data_dir",           DEFAULT_DATA_DIR)
     cfg.setdefault("hidden_channels",    64)
     cfg.setdefault("batch_size",         32)
