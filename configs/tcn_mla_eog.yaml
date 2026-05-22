@@ -1,0 +1,42 @@
+# ============================================================
+# Ablation 1 — TCN + MLA Transformer (EOG artifact)
+# ============================================================
+
+# --- Model ---
+variant: "tcn_mla"
+hidden_channels: 64
+n_heads: 4
+n_attn_layers: 2
+max_seq_len: 512
+kv_lora_rank: 16             # default: d_model // 4 = 16
+
+# --- Data ---
+artifact: "EOG"
+data_dir: "./data/EEGdenoisenet/data/"
+batch_size: 32
+snr_range_db: [-7.0, 2.0]
+master_seed: 42
+
+# --- Training ---
+learning_rate: 5.0e-4
+attn_lr_scale: 3.0           # attention gets 3x base LR
+weight_decay: 0.0
+max_epochs: 100
+log_every: 20
+
+# --- Scheduler (CosineAnnealing + linear warmup) ---
+sched_warmup_epochs: 5
+eta_min: 1.0e-6
+
+# --- Staged training (two-phase) ---
+staged: false
+warmup_epochs: 20
+warmup_lr: 1.0e-3
+finetune_lr: 5.0e-4
+
+# --- Loss function ---
+loss_fn: "l1_combined"              # "l1_combined", "l2_combined", "mse", "l1", or "stft"
+
+# --- Output ---
+save_dir: "./runs/tcn_mla_eog"
+tensorboard: false

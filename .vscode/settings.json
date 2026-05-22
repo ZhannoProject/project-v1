@@ -1,0 +1,10 @@
+{
+    "python.defaultInterpreterPath": "/Users/zhanlungo/Desktop/Mphil Conference project/env/bin/python",
+    "python-envs.pythonProjects": [
+        {
+            "path": ".",
+            "envManager": "ms-python.python:system",
+            "packageManager": "ms-python.python:pip"
+        }
+    ]
+}

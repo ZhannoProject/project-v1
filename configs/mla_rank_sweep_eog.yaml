@@ -1,0 +1,51 @@
+# ============================================================
+# Ablation 2 — MLA KV rank sweep (EOG artifact)
+#
+# This config is used with --rank_override to sweep kv_lora_rank.
+# All other hyperparameters are shared across the sweep.
+# ============================================================
+
+# --- Model (base, rank overridden per run) ---
+variant: "tcn_mla"
+hidden_channels: 64
+n_heads: 4
+n_attn_layers: 2
+max_seq_len: 512
+
+# Rank sweep values: run once per value
+# Use: python trainer/trainer.py --config configs/mla_rank_sweep_eog.yaml --variant tcn_mla_r4
+#      python trainer/trainer.py --config configs/mla_rank_sweep_eog.yaml --variant tcn_mla_r8
+#      python trainer/trainer.py --config configs/mla_rank_sweep_eog.yaml --variant tcn_mla_r16
+#      python trainer/trainer.py --config configs/mla_rank_sweep_eog.yaml --variant tcn_mla_r32
+rank_sweep: [4, 8, 16, 32]
+
+# --- Data ---
+artifact: "EOG"
+data_dir: "./data/EEGdenoisenet/data/"
+batch_size: 32
+snr_range_db: [-7.0, 2.0]
+master_seed: 42
+
+# --- Training ---
+learning_rate: 5.0e-4
+attn_lr_scale: 3.0
+weight_decay: 0.0
+max_epochs: 100
+log_every: 20
+
+# --- Scheduler (CosineAnnealing + linear warmup) ---
+sched_warmup_epochs: 5
+eta_min: 1.0e-6
+
+# --- Staged training (two-phase) ---
+staged: false
+warmup_epochs: 20
+warmup_lr: 1.0e-3
+finetune_lr: 5.0e-4
+
+# --- Loss function ---
+loss_fn: "l1_combined"              # "l1_combined", "l2_combined", "mse", "l1", or "stft"
+
+# --- Output ---
+# save_dir auto-generated per rank: runs/tcn_mla_r{rank}_eog
+tensorboard: false

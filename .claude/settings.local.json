@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/zhanlungo -maxdepth 4 -name \"python*\" -path \"*/bin/*\" 2>/dev/null | head -10)"
+    ]
+  }
+}
