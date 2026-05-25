@@ -192,7 +192,7 @@ The study isolates one variable at a time while sharing everything else:
 |-----------|----------|----------|
 | TCN vs TCN+Attention | Does global context help? | Same TCN backbone, loss, data |
 | MHA vs MLA | Does KV compression hurt/help? | Same block structure, FFN, norms |
-| Sandwich vs Parallel | Which topology prevents collapse? | Same components, different wiring |
+| Sandwich vs Parallel | Which topology prevents collapse? | Same components, different wiring |(not included in the paper yet, further experiment is expected)
 | KV rank sweep (r4/r8/r16/r32) | How much compression is viable? | Same architecture, only rank varies |
 
 ## License
