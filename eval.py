@@ -41,7 +41,7 @@ from scipy.signal import welch
 from data.Dataloader import EEGDenoiseDataset
 from torch.utils.data import DataLoader
 from metrics import compute_all_metrics
-from models.variants import build_model, VARIANT_REGISTRY
+from models.variants import build_model, build_model_from_config, VARIANT_REGISTRY
 from utils.utils import get_device
 
 
@@ -630,6 +630,7 @@ def compare_snr_curves(
             print(f"[Warning] best.pt not found in {run_dir} — skipping")
             continue
 
+        run_cfg = {}
         # Detect variant from directory name or config
         config_path = Path(run_dir) / "config.json"
         if config_path.exists():
@@ -649,12 +650,14 @@ def compare_snr_curves(
             hidden_channels = 64
             kv_lora_rank = None
 
-        # Build and load model
-        model_kwargs = {"hidden_channels": hidden_channels}
-        if kv_lora_rank is not None:
-            model_kwargs["kv_lora_rank"] = kv_lora_rank
-        model = build_model(variant, **model_kwargs)
+        # Prefer architecture metadata stored with the weights.
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        model_cfg = dict(variant=variant, hidden_channels=hidden_channels)
+        if kv_lora_rank is not None:
+            model_cfg["kv_lora_rank"] = kv_lora_rank
+        model_cfg.update(run_cfg)
+        model_cfg.update(ckpt.get("model_config", {}))
+        model = build_model_from_config(model_cfg)
         model.load_state_dict(ckpt["model_state"])
         model.eval().to(device)
 
@@ -733,7 +736,7 @@ def main():
                         help="Path to model checkpoint (e.g. runs/exp1/best.pt)")
     parser.add_argument("--data_dir", default=None,
                         help="Path to EEGdenoisenet data directory")
-    parser.add_argument("--variant", default="tcn", choices=list(VARIANT_REGISTRY.keys()),
+    parser.add_argument("--variant", default=None, choices=list(VARIANT_REGISTRY.keys()),
                         help="Model variant (must match the checkpoint)")
     parser.add_argument("--artifact", default="EOG", choices=["EOG", "EMG"])
 
@@ -766,7 +769,17 @@ def main():
     parser.add_argument("--save_dir", default=None,
                         help="Directory to save all figures (default: display)")
 
+    parser.add_argument("--config", default=None,
+                        help="YAML model config for old checkpoints or evaluation overrides")
+    parser.add_argument("--turboquant", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--turboquant_bits", type=int, choices=range(2, 9), default=None)
+    parser.add_argument("--turboquant_key_mode", choices=["prod", "mse"], default=None)
+    parser.add_argument("--turboquant_seed", type=int, default=None)
     args = parser.parse_args()
+    if args.mode == "compare_snr" and any(value is not None for value in
+            (args.config, args.turboquant, args.turboquant_bits,
+             args.turboquant_key_mode, args.turboquant_seed)):
+        parser.error("compare_snr uses each checkpoint's saved model config; overrides apply to single-model modes")
 
     # ---- Resolve paths ----
     save_dir = Path(args.save_dir) if args.save_dir else None
@@ -789,8 +802,18 @@ def main():
         if args.data_dir is None:
             parser.error(f"--data_dir is required for mode '{args.mode}'")
 
-        model = build_model(args.variant, hidden_channels=64)
         ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        model_cfg = {"variant": "tcn", "hidden_channels": 64}
+        model_cfg.update(ckpt.get("model_config", {}))
+        if args.config:
+            from configs import load_config
+            model_cfg.update(load_config(args.config))
+        for key in ("variant", "turboquant", "turboquant_bits",
+                    "turboquant_key_mode", "turboquant_seed"):
+            value = getattr(args, key)
+            if value is not None:
+                model_cfg[key] = value
+        model = build_model_from_config(model_cfg)
         model.load_state_dict(ckpt["model_state"])
         print(f"[Eval] Loaded checkpoint: {args.ckpt}  (epoch={ckpt['epoch']})")
 

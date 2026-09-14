@@ -17,5 +17,6 @@ data/EEGdenoisenet/
 *.h5
 *.weights
 *.onnx
+deploy/artifacts/
 
 *.log      # 屏蔽运行日志文件

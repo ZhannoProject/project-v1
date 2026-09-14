@@ -3,3 +3,8 @@ numpy>=1.24
 scipy>=1.10
 matplotlib>=3.6
 pyyaml>=6.0
+
+# ONNX export (deploy/export_onnx.py); not needed for training or on the Pi
+onnx>=1.16
+onnxruntime>=1.18
+onnxscript>=0.2

@@ -19,7 +19,7 @@ project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 
 from data.Dataloader import build_dataloaders
-from models.variants import build_model, VARIANT_REGISTRY
+from models.variants import build_model_from_config, VARIANT_REGISTRY
 from configs import load_config, merge_cli_overrides
 from trainer.training import Trainer
 
@@ -37,6 +37,8 @@ def main():
     parser.add_argument("--save_dir", default=None,
                         help="Checkpoint directory (default: runs/<variant>_<artifact>)")
     parser.add_argument("--hidden_channels", type=int, default=None)
+    parser.add_argument("--n_attn_layers", type=int, default=None,
+                        help="Number of transformer layers (e.g. 2, 10, 20, 50)")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--attn_lr_scale", type=float, default=None)
@@ -64,6 +66,12 @@ def main():
                         help="Channel squeeze ratio between TCN and attention "
                              "(e.g. 0.5 → attn_dim = hidden_channels * 0.5). "
                              "Default: 0.5 for sandwich MHA/MLA variants.")
+    parser.add_argument("--turboquant", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable optional TurboQuant K/V quantization")
+    parser.add_argument("--turboquant_bits", type=int, choices=range(2, 9), default=None)
+    parser.add_argument("--turboquant_key_mode", choices=["prod", "mse"], default=None)
+    parser.add_argument("--turboquant_train_mode", choices=["off", "ste"], default=None)
+    parser.add_argument("--turboquant_seed", type=int, default=None)
     args = parser.parse_args()
 
     # --- Build effective config: YAML defaults -> CLI overrides ---
@@ -75,7 +83,7 @@ def main():
 
     # Apply fallback defaults for anything still missing
     cfg.setdefault("variant",            "tcn_mla")
-    cfg.setdefault("artifact",           "EMG")
+    cfg.setdefault("artifact",           "BOTH")
     cfg.setdefault("data_dir",           DEFAULT_DATA_DIR)
     cfg.setdefault("hidden_channels",    64)
     cfg.setdefault("batch_size",         32)
@@ -93,7 +101,11 @@ def main():
     cfg.setdefault("finetune_lr",        5e-4)
     cfg.setdefault("loss_fn",            "mse")
     cfg.setdefault("bottleneck_ratio",  0.5)
-    cfg.setdefault("kv_lora_rank",      4)
+    cfg.setdefault("kv_lora_rank",      16)
+
+    cfg.setdefault("n_attn_layers", 2)
+    if type(cfg["n_attn_layers"]) is not int or cfg["n_attn_layers"] < 1:
+        parser.error("n_attn_layers must be a positive integer")
 
     if cfg.get("save_dir") is None:
         cfg["save_dir"] = f"./runs/{cfg['variant']}_{cfg['artifact'].lower()}"
@@ -107,17 +119,8 @@ def main():
         batch_size=cfg["batch_size"],
     )
 
-    # Model — collect architecture kwargs, only forward those the variant accepts
-    import inspect
-    cls = VARIANT_REGISTRY[cfg["variant"]]
-    sig = inspect.signature(cls)
-
-    model_kwargs = {"hidden_channels": cfg["hidden_channels"]}
-    if "kv_lora_rank" in sig.parameters and cfg.get("kv_lora_rank") is not None:
-        model_kwargs["kv_lora_rank"] = cfg["kv_lora_rank"]
-    if "bottleneck_ratio" in sig.parameters and cfg.get("bottleneck_ratio") is not None:
-        model_kwargs["bottleneck_ratio"] = cfg["bottleneck_ratio"]
-    model = build_model(cfg["variant"], **model_kwargs)
+    # Model settings, including optional quantization, are saved in checkpoints.
+    model = build_model_from_config(cfg)
 
     # Train
     trainer = Trainer(

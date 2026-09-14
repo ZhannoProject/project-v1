@@ -21,6 +21,7 @@ def save_checkpoint(save_dir: Path, epoch, model, optimizer, scheduler, val_loss
     ckpt = {
         "epoch": epoch,
         "model_state": model.state_dict(),
+        "model_config": getattr(model, "model_config", {}),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "val_loss": val_loss,

@@ -492,7 +492,9 @@ for _rank in MLA_RANK_SWEEP:
     VARIANT_REGISTRY[f"tcn_mla_r{_rank}"] = partial(TCNWithMLA, kv_lora_rank=_rank)
 
 
-def build_model(variant: str, **kwargs) -> nn.Module:
+def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
+                turboquant_key_mode="prod", turboquant_train_mode="off",
+                turboquant_seed=42, **kwargs) -> nn.Module:
     """
     Factory function for model construction.
 
@@ -510,7 +512,16 @@ def build_model(variant: str, **kwargs) -> nn.Module:
             f"Unknown variant '{variant}'. "
             f"Available: {list(VARIANT_REGISTRY.keys())}"
         )
-    return VARIANT_REGISTRY[variant](**kwargs)
+    from .AttentionBlocks.turboquant import attach_turboquant
+    model = VARIANT_REGISTRY[variant](**kwargs)
+    attach_turboquant(model, turboquant, turboquant_bits, turboquant_key_mode,
+                     turboquant_train_mode, turboquant_seed)
+    model.model_config = dict(variant=variant, **kwargs, turboquant=turboquant,
+                              turboquant_bits=turboquant_bits,
+                              turboquant_key_mode=turboquant_key_mode,
+                              turboquant_train_mode=turboquant_train_mode,
+                              turboquant_seed=turboquant_seed)
+    return model
 
 
 # ============================================================
@@ -584,3 +595,17 @@ if __name__ == "__main__":
     for name, n in results.items():
         diff = f"+{n - base:,}" if n > base else f"{n - base:,}"
         print(f"{name:<16} {n:>10,} {diff:>10}")
+
+
+def build_model_from_config(config):
+    """Forward supported architecture and quantization options from a run config."""
+    import inspect
+    variant = config.get("variant", "tcn_mla")
+    signature = inspect.signature(VARIANT_REGISTRY[variant])
+    kwargs = {key: value for key, value in config.items()
+              if key in signature.parameters and value is not None}
+    for key in ("turboquant", "turboquant_bits", "turboquant_key_mode",
+                "turboquant_train_mode", "turboquant_seed"):
+        if key in config:
+            kwargs[key] = config[key]
+    return build_model(variant, **kwargs)

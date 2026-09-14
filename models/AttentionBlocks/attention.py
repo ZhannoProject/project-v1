@@ -24,7 +24,7 @@ Tensor shape conventions
 ============================================================================
 
 ============================================================================
-MHA vs MLA : what differs, what stays the same
+MHA vs MLA : Difference and similarity
 ============================================================================
 
   MHA (standard):
@@ -42,7 +42,7 @@ MHA vs MLA : what differs, what stays the same
   After Q, K, V are produced, the attention computation is IDENTICAL:
       att = softmax(causal_mask(Q @ K^T / sqrt(d_k))) @ V
 
-  Ablation isolates exactly one variable: how K and V are produced.
+  Ablation isolates exactly one variable: how K and V are produced,by compressing through a low-rank bottleneck in MLA. Everything else (Q, attention computation, block structure) is shared.
 ============================================================================
 """
 
@@ -100,6 +100,7 @@ class CausalMHA(nn.Module):
         self.register_buffer("causal_mask", causal_mask.view(1, 1, max_seq_len, max_seq_len))
 
         # Attention weight capture (disabled by default to save memory)
+        self.turboquant = None
         self._capture = False
         self.last_attn_weights = None
 
@@ -119,6 +120,9 @@ class CausalMHA(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if self.turboquant is not None:
+            k, v = self.turboquant(k, v)
 
         # Scaled dot-product attention with causal mask
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
@@ -214,6 +218,7 @@ class CausalMLA(nn.Module):
         self.register_buffer("causal_mask", causal_mask.view(1, 1, max_seq_len, max_seq_len))
 
         # Attention weight capture (disabled by default to save memory)
+        self.turboquant = None
         self._capture = False
         self.last_attn_weights = None
 
@@ -241,6 +246,9 @@ class CausalMLA(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if self.turboquant is not None:
+            k, v = self.turboquant(k, v)
 
         # Scaled dot-product attention with causal mask
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
