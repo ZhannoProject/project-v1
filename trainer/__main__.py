@@ -128,6 +128,8 @@ def main():
     cfg.setdefault("loss_fn",            "mse")
     cfg.setdefault("bottleneck_ratio",  0.5)
     cfg.setdefault("kv_lora_rank",      16)
+    cfg.setdefault("snr_range_db",      [-7.0, 2.0])
+    cfg.setdefault("master_seed",       42)
     cfg.setdefault("teacher_ckpt",      None)
     cfg.setdefault("teacher_config",    None)
     cfg.setdefault("kd_alpha",          0.5)
@@ -156,6 +158,8 @@ def main():
         data_dir=cfg["data_dir"],
         artifact_type=cfg["artifact"],
         batch_size=cfg["batch_size"],
+        snr_range_db=tuple(cfg["snr_range_db"]),
+        master_seed=cfg["master_seed"],
     )
 
     # Model settings, including optional quantization, are saved in checkpoints.

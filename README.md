@@ -72,6 +72,11 @@ In the sandwich design, the standard residual connection `x + Attn(LN(x))` lets 
 │   ├── losses.py               # MSE, L1, STFT, L1+STFT, L2+STFT
 │   ├── checkpoint.py           # Save/load checkpoints + history
 │   └── logger.py               # TensorBoard integration
+├── gui/
+│   ├── __main__.py             # python -m gui → local web GUI for the YAML presets + launching runs
+│   ├── config_io.py            # field schema + comment-preserving YAML writer
+│   ├── server.py               # stdlib HTTP/JSON API, training-job runner
+│   └── static/index.html       # the page
 ├── deploy/
 │   ├── export_onnx.py          # checkpoint → verified ONNX (+ sidecar JSON) for Raspberry Pi 5
 │   ├── run_on_pi.sh            # one command: copy to the Pi over SSH, set up, benchmark, score
@@ -138,6 +143,37 @@ python -m trainer --config configs/mla_rank_sweep_eog.yaml --variant tcn_mla_r32
 Config priority: **CLI flag > YAML file > hardcoded defaults**.
 
 Checkpoints are saved to `runs/<variant>_<artifact>/` with `best.pt`, `last.pt`, and `history.json`.
+
+### Training GUI
+
+A local web page that edits the presets in `configs/` and launches
+`python -m trainer` from them. No extra dependencies (stdlib `http.server`
++ the `pyyaml` already required):
+
+```bash
+python -m gui                     # opens http://127.0.0.1:8765/
+python -m gui --port 9000 --no-browser
+```
+
+- **Form ↔ YAML.** Every key of `trainer/__main__.py` is a field, grouped as in
+  the preset files (Model, Data, Training, Scheduler, Staged, Loss, Output,
+  TurboQuant, Knowledge distillation). Fields that do not apply to the selected
+  variant are hidden (e.g. `kv_lora_rank` for MHA, attention settings for `tcn`);
+  keys absent from the file are tagged `default` and only written if you change them.
+- **Comments survive.** The GUI never re-serialises a file: it rewrites only the
+  `key: value` lines that changed and appends new keys under their section
+  header, so `5.0e-4`, inline comments and unknown keys such as `rank_sweep` are
+  kept byte-for-byte. The YAML tab shows the exact text a save will write, with
+  the changed lines highlighted.
+- **Save / Save as… / New…** write to `configs/`; **Train** runs
+  `python -m trainer --config configs/<file> [extra flags]` with the same
+  interpreter and streams the log into the page (also mirrored to
+  `runs/gui_train_<timestamp>.log`); **Stop** terminates it.
+- **Runs** lists every `runs/*/best.pt` with its best-epoch metrics; “Use as
+  teacher” fills `teacher_ckpt` for a distillation run.
+
+The server binds to 127.0.0.1 only and runs one training job at a time.
+Validation: `python -m unittest discover -s tests -p 'test_gui.py'`.
 
 ### Transformer depth choices
 

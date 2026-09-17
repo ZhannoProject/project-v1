@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training settings</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #dfe3e8; --text: #1f2933; --muted: #6b7280;
+    --accent: #2563eb; --accent-text: #ffffff; --ok: #15803d; --warn: #b45309; --err: #b91c1c;
+    --changed: #fff7d6; --changed-text: #7a5a00; --code: #f3f4f6; --hover: #f0f4ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216; --panel: #161a21; --border: #2a3140; --text: #e5e7eb; --muted: #9aa3b2;
+      --accent: #3b82f6; --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+      --changed: #3b3210; --changed-text: #fde68a; --code: #0b0e12; --hover: #1c2330;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; white-space: nowrap; }
+  header .grow { flex: 1; }
+  select, input[type=text], input[type=number] { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font: inherit; }
+  input[type=number] { width: 120px; }
+  input[type=text] { width: 100%; }
+  select { min-width: 120px; }
+  button { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 11px; font: inherit; cursor: pointer; }
+  button:hover { background: var(--hover); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button.primary:hover { filter: brightness(1.08); }
+  button.danger { color: var(--err); }
+  button:disabled { opacity: .5; cursor: default; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .pill.running { border-color: var(--accent); color: var(--accent); }
+  .pill.ok { border-color: var(--ok); color: var(--ok); }
+  .pill.err { border-color: var(--err); color: var(--err); }
+  .pill.dirty { border-color: var(--warn); color: var(--warn); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .pill.running .dot { animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .2; } }
+
+  main { display: grid; grid-template-columns: minmax(360px, 520px) 1fr; gap: 16px; padding: 16px; max-width: 1600px; margin: 0 auto; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+  #form details { border-bottom: 1px solid var(--border); }
+  #form details:last-child { border-bottom: 0; }
+  #form summary { cursor: pointer; padding: 9px 14px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 8px; user-select: none; }
+  #form summary::before { content: "▸"; color: var(--muted); font-size: 12px; transition: transform .15s; }
+  #form details[open] summary::before { transform: rotate(90deg); }
+  #form summary .count { margin-left: auto; font-weight: 400; font-size: 12px; color: var(--muted); }
+  .fields { padding: 4px 14px 12px; display: grid; grid-template-columns: 1fr; gap: 8px; }
+  .field { display: grid; grid-template-columns: 150px 1fr; gap: 4px 10px; align-items: center; padding: 3px 6px; border-radius: 6px; }
+  .field.changed { background: var(--changed); }
+  .field.hidden { display: none; }
+  .field label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .field .ctl { display: flex; align-items: center; gap: 6px; }
+  .field .help { grid-column: 2; font-size: 11.5px; color: var(--muted); }
+  .field .tag { font-size: 10px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+  .field.absent label { color: var(--muted); }
+  .range2 input { width: 90px; }
+
+  .tabs { display: flex; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid var(--border); }
+  .tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 6px 6px 0 0; background: transparent; padding: 7px 12px; color: var(--muted); }
+  .tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+  .tab { display: none; padding: 12px; }
+  .tab.active { display: block; }
+  pre { margin: 0; background: var(--code); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: auto; white-space: pre; }
+  #yaml { max-height: calc(100vh - 210px); }
+  #yaml .ch { background: var(--changed); color: var(--changed-text); display: inline-block; width: 100%; }
+  #log { height: calc(100vh - 330px); min-height: 240px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .row .grow { flex: 1; }
+  .cmd { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); word-break: break-all; margin-bottom: 8px; }
+  .banner { display: none; padding: 8px 12px; border-radius: 8px; margin: 0 16px; font-size: 13px; }
+  .banner.show { display: block; }
+  .banner.err { background: color-mix(in srgb, var(--err) 12%, transparent); color: var(--err); }
+  .banner.info { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  th.num { text-align: right; }
+  .badge { font-size: 10px; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); margin-left: 4px; }
+  .badge.bi { color: var(--warn); border-color: var(--warn); }
+  .badge.kd { color: var(--accent); border-color: var(--accent); }
+  .muted { color: var(--muted); }
+  footer { padding: 6px 16px 16px; color: var(--muted); font-size: 12px; text-align: center; }
+  kbd { font: 11px ui-monospace, Menlo, monospace; border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Training settings</h1>
+  <select id="configSel" title="Preset in configs/"></select>
+  <button id="btnReload" title="Discard edits and re-read the file">Reload</button>
+  <button id="btnSave" class="primary" title="Write to configs/ (⌘S / Ctrl+S)">Save</button>
+  <button id="btnSaveAs" title="Copy this file under a new name and save the edits there">Save as…</button>
+  <button id="btnNew" title="Create a new preset from a template">New…</button>
+  <span class="grow"></span>
+  <span id="dirtyPill" class="pill"><span class="dot"></span><span>saved</span></span>
+  <span id="jobPill" class="pill"><span class="dot"></span><span>idle</span></span>
+</header>
+<div id="banner" class="banner"></div>
+
+<main>
+  <section class="panel" id="form"></section>
+
+  <section class="panel">
+    <div class="tabs">
+      <button data-tab="yaml" class="active">YAML</button>
+      <button data-tab="train">Train</button>
+      <button data-tab="runs">Runs</button>
+    </div>
+
+    <div class="tab active" id="tab-yaml">
+      <div class="row">
+        <span class="muted" id="yamlTitle">configs/…</span>
+        <span class="grow"></span>
+        <span class="muted" id="yamlNote">Highlighted lines change on save. Comments and untouched values are kept verbatim.</span>
+      </div>
+      <pre id="yaml"></pre>
+    </div>
+
+    <div class="tab" id="tab-train">
+      <div class="row">
+        <button id="btnTrain" class="primary">▶ Train</button>
+        <button id="btnStop" class="danger" disabled>■ Stop</button>
+        <input type="text" id="extraArgs" class="grow" placeholder="extra CLI flags, e.g. --max_epochs 2 --staged" title="Appended to the command; CLI flags override the YAML">
+      </div>
+      <div class="cmd" id="cmd"></div>
+      <pre id="log"></pre>
+      <div class="muted" style="margin-top:6px" id="logNote"></div>
+    </div>
+
+    <div class="tab" id="tab-runs">
+      <div class="row">
+        <span class="muted">Checkpoints in <code>runs/</code>, best epoch by val loss. “Use as teacher” fills <code>teacher_ckpt</code>.</span>
+        <span class="grow"></span>
+        <button id="btnRunsRefresh">Refresh</button>
+      </div>
+      <div style="overflow:auto"><table id="runs"></table></div>
+    </div>
+  </section>
+</main>
+<footer id="envNote"></footer>
+
+<script>
+(() => {
+  const $ = (s, r = document) => r.querySelector(s);
+  const state = { meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {}, job: { running: false, next: 0 } };
+  let previewTimer = null, pollTimer = null;
+
+  // ---------- helpers ----------
+  const api = async (path, body) => {
+    const r = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+    const j = await r.json().catch(() => ({ error: r.statusText }));
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    return j;
+  };
+  const deepEq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const fields = () => state.meta.schema.flatMap(s => s.fields);
+  const fieldByKey = k => fields().find(f => f.key === k);
+  const banner = (msg, kind = "err") => {
+    const b = $("#banner"); b.textContent = msg || ""; b.className = "banner" + (msg ? ` show ${kind}` : "");
+  };
+
+  // ---------- form ----------
+  function buildForm() {
+    const root = $("#form"); root.innerHTML = "";
+    for (const sec of state.meta.schema) {
+      const d = document.createElement("details"); d.open = true;
+      d.innerHTML = `<summary>${sec.title}<span class="count"></span></summary><div class="fields"></div>`;
+      const box = $(".fields", d);
+      for (const f of sec.fields) box.appendChild(buildField(f));
+      root.appendChild(d);
+    }
+  }
+
+  function buildField(f) {
+    const el = document.createElement("div");
+    el.className = "field"; el.dataset.key = f.key;
+    const label = document.createElement("label"); label.textContent = f.key; label.htmlFor = "f_" + f.key;
+    const ctl = document.createElement("div"); ctl.className = "ctl";
+    let input;
+    if (f.type === "bool") {
+      input = document.createElement("input"); input.type = "checkbox";
+    } else if (f.type === "select") {
+      input = document.createElement("select");
+      const opts = [...state.meta.choices[f.choices]];
+      if (f.nullable) input.appendChild(new Option("(default)", ""));
+      for (const o of opts) input.appendChild(new Option(o, o));
+    } else if (f.type === "range2") {
+      ctl.classList.add("range2");
+      const lo = document.createElement("input"); lo.type = "number"; lo.step = "0.5"; lo.dataset.part = "0";
+      const hi = document.createElement("input"); hi.type = "number"; hi.step = "0.5"; hi.dataset.part = "1";
+      const sep = document.createElement("span"); sep.className = "muted"; sep.textContent = "to";
+      ctl.append(lo, sep, hi, Object.assign(document.createElement("span"), { className: "muted", textContent: "dB" }));
+      lo.id = "f_" + f.key;
+      [lo, hi].forEach(i => i.addEventListener("input", onChange));
+    } else if (f.type === "int" || f.type === "float") {
+      input = document.createElement("input"); input.type = "number";
+      if (f.min != null) input.min = f.min; if (f.max != null) input.max = f.max;
+      input.step = f.step != null ? f.step : (f.type === "int" ? 1 : "any");
+    } else {
+      input = document.createElement("input"); input.type = "text";
+      if (f.datalist) {
+        const dl = document.createElement("datalist"); dl.id = "dl_" + f.key;
+        for (const v of state.meta.datalists[f.datalist] || []) dl.appendChild(new Option(v));
+        ctl.appendChild(dl); input.setAttribute("list", dl.id);
+      }
+      if (f.nullable) input.placeholder = "(empty = not set)";
+    }
+    if (input) { input.id = "f_" + f.key; input.addEventListener("input", onChange); input.addEventListener("change", onChange); ctl.prepend(input); }
+    const tag = document.createElement("span"); tag.className = "tag"; tag.title = "This key is not in the file; it is written only if you change it from the default"; tag.textContent = "default"; tag.style.display = "none";
+    ctl.appendChild(tag);
+    el.append(label, ctl);
+    if (f.help) { const h = document.createElement("div"); h.className = "help"; h.textContent = f.help; el.appendChild(h); }
+    return el;
+  }
+
+  function setField(f, v) {
+    const el = $(`.field[data-key="${f.key}"]`);
+    if (f.type === "range2") {
+      const [lo, hi] = el.querySelectorAll("input");
+      lo.value = v != null ? v[0] : ""; hi.value = v != null ? v[1] : "";
+      return;
+    }
+    const input = $("#f_" + f.key);
+    if (f.type === "bool") input.checked = !!v;
+    else if (f.type === "list_str") input.value = Array.isArray(v) ? v.join(", ") : (v ?? "");
+    else input.value = v == null ? "" : v;
+  }
+
+  function getField(f) {
+    const el = $(`.field[data-key="${f.key}"]`);
+    if (f.type === "range2") {
+      const [lo, hi] = el.querySelectorAll("input");
+      if (lo.value === "" && hi.value === "") return null;
+      return [Number(lo.value), Number(hi.value)];
+    }
+    const input = $("#f_" + f.key);
+    if (f.type === "bool") return input.checked;
+    if (f.type === "int") return input.value === "" ? null : Number(input.value);
+    if (f.type === "float") return input.value === "" ? null : Number(input.value);
+    if (f.type === "list_str") return input.value.split(",").map(s => s.trim()).filter(Boolean);
+    return input.value === "" ? null : input.value;
+  }
+
+  // what the file will contain: keys present in the file, plus keys changed away from their default
+  function collectValues() {
+    const out = {};
+    for (const f of fields()) {
+      const v = getField(f);
+      const present = state.present.has(f.key);
+      if (present) { out[f.key] = v; continue; }
+      if (v == null || deepEq(v, f.default) || (Array.isArray(v) && v.length === 0 && f.default == null)) continue;
+      out[f.key] = v;
+    }
+    return out;
+  }
+
+  // show_if evaluation
+  function visibility() {
+    const v = k => getField(fieldByKey(k));
+    const variant = v("variant") || "";
+    const attention = variant !== "tcn";
+    const ctx = {
+      attention,
+      mla: attention && variant.includes("mla"),
+      sandwich: attention && !variant.includes("_par"),
+      staged: !!v("staged"),
+      turboquant: attention && !!v("turboquant"),
+      kd: !!v("teacher_ckpt"),
+    };
+    for (const f of fields()) {
+      const el = $(`.field[data-key="${f.key}"]`);
+      el.classList.toggle("hidden", !!f.show_if && !ctx[f.show_if]);
+    }
+    for (const d of document.querySelectorAll("#form details")) {
+      const all = d.querySelectorAll(".field").length, shown = d.querySelectorAll(".field:not(.hidden)").length;
+      $(".count", d).textContent = shown < all ? `${shown}/${all} apply` : "";
+    }
+  }
+
+  function markChanged() {
+    const vals = collectValues();
+    for (const f of fields()) {
+      const el = $(`.field[data-key="${f.key}"]`);
+      const present = state.present.has(f.key);
+      const loaded = present ? state.values[f.key] : f.default;
+      const now = getField(f);
+      el.classList.toggle("changed", !deepEq(now, loaded) && (present || f.key in vals));
+      el.classList.toggle("absent", !present);
+      $(".tag", el).style.display = present ? "none" : "";
+    }
+  }
+
+  function onChange() {
+    state.dirty = true; visibility(); markChanged(); updatePills(); updateCmd();
+    clearTimeout(previewTimer); previewTimer = setTimeout(preview, 250);
+  }
+
+  // ---------- config I/O ----------
+  async function loadConfig(name) {
+    const c = await api(`/api/config?name=${encodeURIComponent(name)}`);
+    state.name = name; state.present = new Set(c.present); state.values = c.values; state.original = c.text; state.text = c.text; state.dirty = false;
+    for (const f of fields()) setField(f, f.key in c.values ? c.values[f.key] : f.default);
+    $("#configSel").value = name;
+    $("#yamlTitle").textContent = `configs/${name}`;
+    const extra = Object.keys(c.extra);
+    $("#yamlNote").textContent = (extra.length ? `Other keys kept as-is: ${extra.join(", ")}. ` : "") + "Highlighted lines change on save.";
+    visibility(); markChanged(); renderYaml(c.text); updatePills(); updateCmd(); banner("");
+    try { localStorage.setItem("trainGui.config", name); } catch (e) {}
+  }
+
+  async function preview() {
+    if (!state.name) return;
+    try {
+      const r = await api("/api/preview", { name: state.name, values: collectValues() });
+      state.text = r.text; renderYaml(r.text); banner("");
+    } catch (e) { banner(e.message); }
+  }
+
+  function renderYaml(text) {
+    const orig = new Set(state.original.split("\n"));
+    const esc = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    $("#yaml").innerHTML = text.split("\n").map(l => orig.has(l) ? esc(l) : `<span class="ch">${esc(l)}</span>`).join("\n");
+  }
+
+  async function save() {
+    if (!state.name) return;
+    try {
+      const r = await api("/api/config", { name: state.name, values: collectValues() });
+      banner(`Saved configs/${state.name}`, "info");
+      await loadConfig(state.name);
+      return true;
+    } catch (e) { banner(e.message); return false; }
+  }
+
+  async function saveAs() {
+    const name = prompt("New file name (in configs/):", state.name.replace(/\.yaml$/, "_copy.yaml"));
+    if (!name) return;
+    try {
+      const vals = collectValues();
+      const r = await api("/api/config/new", { name, template: state.name });
+      fillConfigList(r.configs, name);
+      await api("/api/config", { name, values: vals });
+      await loadConfig(name);
+      banner(`Created configs/${name}`, "info");
+    } catch (e) { banner(e.message); }
+  }
+
+  async function newConfig() {
+    const name = prompt("New preset file name (in configs/):", "my_experiment.yaml");
+    if (!name) return;
+    const tpl = prompt("Template to copy (empty = minimal file):", state.name || "");
+    try {
+      const r = await api("/api/config/new", { name, template: tpl || null });
+      fillConfigList(r.configs, name);
+      await loadConfig(name);
+      banner(`Created configs/${name}`, "info");
+    } catch (e) { banner(e.message); }
+  }
+
+  function fillConfigList(names, selected) {
+    const sel = $("#configSel"); sel.innerHTML = "";
+    for (const n of names) sel.appendChild(new Option(n, n));
+    if (selected) sel.value = selected;
+  }
+
+  // ---------- training ----------
+  function updateCmd() {
+    const extra = $("#extraArgs").value.trim();
+    $("#cmd").textContent = state.name ? `python -m trainer --config configs/${state.name}${extra ? " " + extra : ""}` : "";
+  }
+
+  async function train() {
+    if (!state.name) return;
+    if (state.dirty) {
+      if (!confirm("Save the edited preset before training?")) return;
+      if (!(await save())) return;
+    }
+    try {
+      const s = await api("/api/train", { name: state.name, extra_args: $("#extraArgs").value });
+      $("#log").textContent = ""; state.job.next = 0;
+      applyStatus(s); showTab("train"); startPolling();
+    } catch (e) { banner(e.message); }
+  }
+
+  async function stop() {
+    try { applyStatus(await api("/api/train/stop", {})); } catch (e) { banner(e.message); }
+  }
+
+  function startPolling() { clearInterval(pollTimer); pollTimer = setInterval(poll, 1000); poll(); }
+
+  async function poll() {
+    try {
+      const s = await api(`/api/train/status?since=${state.job.next}`);
+      applyStatus(s);
+      if (!s.running) { clearInterval(pollTimer); pollTimer = null; refreshRuns(); }
+    } catch (e) { clearInterval(pollTimer); }
+  }
+
+  function applyStatus(s) {
+    const log = $("#log");
+    if (s.lines && s.lines.length) {
+      const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+      log.textContent += (log.textContent ? "\n" : "") + s.lines.join("\n");
+      if (atBottom) log.scrollTop = log.scrollHeight;
+    }
+    state.job.next = s.next ?? state.job.next; state.job.running = s.running;
+    if (s.command) $("#cmd").textContent = s.command;
+    $("#logNote").textContent = s.log_path ? `Mirrored to ${s.log_path}` : "";
+    $("#btnTrain").disabled = s.running; $("#btnStop").disabled = !s.running;
+    updatePills(s);
+  }
+
+  function updatePills(s) {
+    const d = $("#dirtyPill");
+    d.className = "pill" + (state.dirty ? " dirty" : " ok"); d.lastElementChild.textContent = state.dirty ? "unsaved edits" : "saved";
+    const j = $("#jobPill");
+    if (s === undefined) s = { running: state.job.running, returncode: state.job.returncode };
+    state.job.returncode = s.returncode;
+    if (s.running) { j.className = "pill running"; j.lastElementChild.textContent = "training…"; }
+    else if (s.returncode == null) { j.className = "pill"; j.lastElementChild.textContent = "idle"; }
+    else if (s.returncode === 0) { j.className = "pill ok"; j.lastElementChild.textContent = "finished"; }
+    else { j.className = "pill err"; j.lastElementChild.textContent = `exit ${s.returncode}`; }
+  }
+
+  // ---------- runs ----------
+  const fmt = (x, d = 3) => x == null ? "—" : Number(x).toFixed(d);
+  async function refreshRuns() {
+    try {
+      const { runs } = await api("/api/runs");
+      state.meta.runs = runs; state.meta.datalists.checkpoints = runs.map(r => r.checkpoint);
+      const dl = $("#dl_teacher_ckpt"); if (dl) { dl.innerHTML = ""; for (const r of runs) dl.appendChild(new Option(r.checkpoint)); }
+      renderRuns();
+    } catch (e) { banner(e.message); }
+  }
+  function renderRuns() {
+    const t = $("#runs");
+    const rows = state.meta.runs.map(r => `<tr>
+      <td>${r.name}${r.bidirectional ? '<span class="badge bi">bi</span>' : ""}${r.kd ? '<span class="badge kd">kd</span>' : ""}</td>
+      <td class="num">${r.epochs ?? "—"}</td><td class="num">${r.best_epoch ?? "—"}</td>
+      <td class="num">${fmt(r.val_loss, 4)}</td><td class="num">${fmt(r.rrmse_t)}</td><td class="num">${fmt(r.rrmse_s)}</td><td class="num">${fmt(r.acc)}</td>
+      <td><button data-ckpt="${r.checkpoint}">Use as teacher</button></td></tr>`).join("");
+    t.innerHTML = `<tr><th>run</th><th class="num">epochs</th><th class="num">best</th><th class="num">val loss</th><th class="num">RRMSE_t</th><th class="num">RRMSE_s</th><th class="num">ACC</th><th></th></tr>${rows || '<tr><td colspan="8" class="muted">no runs/*/best.pt yet</td></tr>'}`;
+    t.querySelectorAll("button[data-ckpt]").forEach(b => b.addEventListener("click", () => {
+      setField(fieldByKey("teacher_ckpt"), b.dataset.ckpt); onChange(); showTab("yaml");
+      $("#f_teacher_ckpt").scrollIntoView({ block: "center" });
+    }));
+  }
+
+  // ---------- tabs / wiring ----------
+  function showTab(id) {
+    document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === id));
+    document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.id === "tab-" + id));
+  }
+  document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
+  $("#configSel").addEventListener("change", e => {
+    if (state.dirty && !confirm("Discard unsaved edits?")) { e.target.value = state.name; return; }
+    loadConfig(e.target.value).catch(err => banner(err.message));
+  });
+  $("#btnReload").addEventListener("click", () => loadConfig(state.name).catch(err => banner(err.message)));
+  $("#btnSave").addEventListener("click", save);
+  $("#btnSaveAs").addEventListener("click", saveAs);
+  $("#btnNew").addEventListener("click", newConfig);
+  $("#btnTrain").addEventListener("click", train);
+  $("#btnStop").addEventListener("click", stop);
+  $("#btnRunsRefresh").addEventListener("click", refreshRuns);
+  $("#extraArgs").addEventListener("input", updateCmd);
+  document.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); save(); } });
+  window.addEventListener("beforeunload", e => { if (state.dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+  (async () => {
+    try {
+      state.meta = await api("/api/meta");
+      buildForm();
+      fillConfigList(state.meta.configs);
+      renderRuns();
+      $("#envNote").textContent = `${state.meta.env.project_root} · ${state.meta.env.python} · device ${state.meta.env.device} · ⌘S saves`;
+      let first = state.meta.configs[0];
+      try { const saved = localStorage.getItem("trainGui.config"); if (saved && state.meta.configs.includes(saved)) first = saved; } catch (e) {}
+      if (first) await loadConfig(first);
+      const s = await api("/api/train/status?since=0");
+      if (s.running || s.returncode != null) { applyStatus(s); if (s.running) startPolling(); }
+    } catch (e) { banner("Could not load: " + e.message); }
+  })();
+})();
+</script>
+</body>
+</html>

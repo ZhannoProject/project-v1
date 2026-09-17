@@ -1,0 +1,282 @@
+"""
+Local HTTP server behind the training GUI (stdlib only).
+
+    GET  /                       the page (gui/static/index.html)
+    GET  /api/meta               schema, choice lists, configs, runs, environment
+    GET  /api/config?name=X      one preset: parsed values + raw text
+    POST /api/preview            {name, values} → the text a save would write
+    POST /api/config             {name, values} → save, returns the new text
+    POST /api/config/new         {name, template} → create a preset
+    GET  /api/runs               runs/ table (refreshed on demand)
+    POST /api/train              {name, extra_args} → start `python -m trainer --config configs/X`
+    POST /api/train/stop
+    GET  /api/train/status?since=N   incremental log lines from index N
+
+Binds to 127.0.0.1 only; there is no authentication.  One training job at
+a time; its output is kept in memory (last 5000 lines) and mirrored to
+runs/gui_train_<timestamp>.log.
+"""
+
+from __future__ import annotations
+
+import collections
+import json
+import shlex
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from gui import config_io
+from gui.config_io import PROJECT_ROOT, RUNS_DIR
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+# ============================================================
+# Training job
+# ============================================================
+class TrainingJob:
+    """Runs one trainer subprocess and buffers its output line by line."""
+
+    MAX_LINES = 5000
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._lines: collections.deque = collections.deque(maxlen=self.MAX_LINES)
+        self._offset = 0                       # index of _lines[0] in the full stream
+        self.command: list[str] = []
+        self.started: str | None = None
+        self.log_path: Path | None = None
+        self.returncode: int | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(self, command: list[str], cwd: Path, log_path: Path | None = None):
+        with self._lock:
+            if self.running:
+                raise RuntimeError("a training run is already in progress")
+            self._lines.clear()
+            self._offset = 0
+            self.command = list(command)
+            self.started = datetime.now().isoformat(timespec="seconds")
+            self.returncode = None
+            self.log_path = log_path
+            if log_path:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._proc = subprocess.Popen(
+                command, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env={**__import__("os").environ, "PYTHONUNBUFFERED": "1"},
+            )
+            threading.Thread(target=self._pump, args=(self._proc,), daemon=True).start()
+
+    def _pump(self, proc: subprocess.Popen):
+        log = open(self.log_path, "w") if self.log_path else None
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                with self._lock:
+                    if len(self._lines) == self._lines.maxlen:
+                        self._offset += 1
+                    self._lines.append(line)
+                if log:
+                    log.write(line + "\n")
+                    log.flush()
+        finally:
+            proc.stdout.close()
+            proc.wait()
+            self.returncode = proc.returncode
+            if log:
+                log.write(f"\n[exit code {proc.returncode}]\n")
+                log.close()
+
+    def stop(self, grace: float = 5.0):
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return False
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return True
+
+    def status(self, since: int = 0) -> dict:
+        with self._lock:
+            start = max(since - self._offset, 0)
+            lines = list(self._lines)[start:]
+            nxt = self._offset + len(self._lines)
+        return {
+            "running": self.running,
+            "returncode": self.returncode,
+            "command": " ".join(shlex.quote(c) for c in self.command),
+            "started": self.started,
+            "log_path": str(self.log_path) if self.log_path else None,
+            "since": since, "next": nxt, "lines": lines,
+        }
+
+
+JOB = TrainingJob()
+
+
+def build_train_command(config_name: str, extra_args: str = "") -> list[str]:
+    """`python -m trainer --config configs/<name> [extra flags]` with this interpreter."""
+    config_io.config_path(config_name)                 # validates the name
+    return [sys.executable, "-m", "trainer", "--config", f"configs/{config_name}",
+            *shlex.split(extra_args or "")]
+
+
+# ============================================================
+# HTTP handler
+# ============================================================
+def meta() -> dict:
+    from models.variants import VARIANT_REGISTRY, BIDIRECTIONAL_VARIANTS
+    runs = config_io.list_runs()
+    return {
+        "schema": config_io.schema_as_json(),
+        "choices": {
+            "variants": list(VARIANT_REGISTRY),
+            "bidirectional_variants": BIDIRECTIONAL_VARIANTS,
+            "artifacts": config_io.ARTIFACTS,
+            "losses": config_io.LOSS_NAMES,
+            "feature_losses": ["mse", "l1"],
+            "tq_key_modes": ["prod", "mse"],
+            "tq_train_modes": ["off", "ste"],
+        },
+        "datalists": {"checkpoints": [r["checkpoint"] for r in runs]},
+        "configs": config_io.list_configs(),
+        "runs": runs,
+        "env": {"python": sys.executable, "project_root": str(PROJECT_ROOT),
+                "device": _device_name()},
+    }
+
+
+def _device_name() -> str:
+    try:
+        from utils.utils import get_device
+        return str(get_device())
+    except Exception:            # torch missing or broken: the GUI still works
+        return "unknown"
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "EEGTrainGUI/1.0"
+
+    # ---- plumbing ----
+    def log_message(self, fmt, *args):          # quieter console
+        if self.server.verbose:                 # type: ignore[attr-defined]
+            super().log_message(fmt, *args)
+
+    def _json(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _error(self, message, status=400):
+        self._json({"error": str(message)}, status)
+
+    def _body(self) -> dict:
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b"{}"
+        data = json.loads(raw or b"{}")
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        return data
+
+    def _file(self, path: Path, content_type: str):
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    # ---- routes ----
+    def do_GET(self):
+        url = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(url.query).items()}
+        try:
+            if url.path in ("/", "/index.html"):
+                return self._file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+            if url.path == "/api/meta":
+                return self._json(meta())
+            if url.path == "/api/config":
+                return self._json(config_io.read_config(q.get("name", "")))
+            if url.path == "/api/runs":
+                return self._json({"runs": config_io.list_runs()})
+            if url.path == "/api/train/status":
+                return self._json(JOB.status(int(q.get("since", 0))))
+            return self._error("not found", 404)
+        except (ValueError, FileNotFoundError, KeyError) as e:
+            return self._error(e, 400)
+
+    def do_POST(self):
+        url = urlparse(self.path)
+        try:
+            body = self._body()
+            if url.path == "/api/preview":
+                text = config_io.render_config(body["name"], body.get("values", {}))
+                return self._json({"name": body["name"], "text": text})
+            if url.path == "/api/config":
+                text = config_io.save_config(body["name"], body.get("values", {}))
+                return self._json({"name": body["name"], "text": text, "saved": True})
+            if url.path == "/api/config/new":
+                text = config_io.create_config(body["name"], body.get("template") or None)
+                return self._json({"name": body["name"], "text": text,
+                                   "configs": config_io.list_configs()})
+            if url.path == "/api/train":
+                if JOB.running:
+                    return self._error("a training run is already in progress", 409)
+                cmd = build_train_command(body["name"], body.get("extra_args", ""))
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                JOB.start(cmd, PROJECT_ROOT, RUNS_DIR / f"gui_train_{stamp}.log")
+                return self._json(JOB.status(0))
+            if url.path == "/api/train/stop":
+                return self._json({"stopped": JOB.stop(), **JOB.status(0)})
+            return self._error("not found", 404)
+        except FileExistsError as e:
+            return self._error(e, 409)
+        except (ValueError, FileNotFoundError, KeyError, RuntimeError) as e:
+            return self._error(e, 400)
+
+
+class GUIServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, verbose: bool = False):
+        super().__init__((host, port), Handler)
+        self.verbose = verbose
+
+
+def serve(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True,
+          verbose: bool = False) -> None:
+    server = GUIServer(host, port, verbose)
+    url = f"http://{host}:{server.server_address[1]}/"
+    print(f"[gui] Training GUI at {url}   (project: {PROJECT_ROOT})")
+    print("[gui] Ctrl-C to stop; a running training job is terminated with the server.")
+    if open_browser:
+        import webbrowser
+        threading.Timer(0.5, webbrowser.open, args=(url,)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if JOB.running:
+            print("[gui] stopping the training job ...")
+            JOB.stop()
+        server.server_close()
+        time.sleep(0.1)
