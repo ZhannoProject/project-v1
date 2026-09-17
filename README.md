@@ -22,6 +22,7 @@ The study also introduces **Multi-head Latent Attention (MLA)**, adapted from De
 | `tcn_mha_par` | Parallel: TCN + MHA branches | Multi-Head Attention | 238k |
 | `tcn_mla_par` | Parallel: TCN + MLA branches | Multi-head Latent Attention | 228k |
 | `tcn_mla_r{N}` | MLA with fixed kv_lora_rank=N | MLA (rank sweep) | varies |
+| `tcn_mha_bi`, `tcn_mla_bi`, `tcn_mha_par_bi`, `tcn_mla_par_bi` | Same as above, **bidirectional** attention (non-causal) | KD teachers only | same as causal twin |
 
 ### Sandwich topology
 
@@ -52,7 +53,9 @@ In the sandwich design, the standard residual connection `x + Attn(LN(x))` lets 
 │   ├── tcn_eog.yaml            #   TCN baseline
 │   ├── tcn_mha_eog.yaml        #   TCN + MHA sandwich
 │   ├── tcn_mla_eog.yaml        #   TCN + MLA sandwich
-│   └── mla_rank_sweep_eog.yaml #   KV rank sweep
+│   ├── mla_rank_sweep_eog.yaml #   KV rank sweep
+│   ├── tcn_{mha,mla}_bi_eog.yaml   # bidirectional teachers (non-causal)
+│   └── tcn_{mha,mla}_eog_kd.yaml   # causal students distilled from them
 ├── data/
 │   ├── Dataloader.py           # Leak-free train/val/test splits + SNR mixing
 │   └── EEGdenoisenet/data/     # .npy files (not in repo, see Data below)
@@ -64,6 +67,7 @@ In the sandwich design, the standard residual connection `x + Attn(LN(x))` lets 
 ├── trainer/
 │   ├── __main__.py             # CLI entry point: python -m trainer
 │   ├── training.py             # Trainer class (fit / staged_fit)
+│   ├── distillation.py         # KDTrainer + DistillationLoss: bidirectional teacher → causal student
 │   ├── optimizer.py            # Per-component LR groups, freeze/unfreeze
 │   ├── losses.py               # MSE, L1, STFT, L1+STFT, L2+STFT
 │   ├── checkpoint.py           # Save/load checkpoints + history
@@ -158,6 +162,67 @@ Each deeper preset has its own output directory and otherwise keeps the
 corresponding 2-layer preset settings. These are experiment choices, not
 validated improvements. Deeper models require more memory and training time;
 reduce `--batch_size` if needed.
+
+### Knowledge distillation: bidirectional teacher → causal student
+
+Every attention variant has a **bidirectional twin** (`tcn_mla_bi`, `tcn_mha_bi`,
+`tcn_mha_par_bi`, `tcn_mla_par_bi`): identical weights and shapes, but the
+attention mask is dropped so each position sees the whole 512-sample window.
+Such a model cannot run online — it needs future samples — but on the same
+weight budget it is a stronger denoiser. It is used as a frozen **teacher**,
+and the deployable causal model is trained as a **student** to reproduce, from
+past-only context, what the teacher produces with full context:
+
+```
+noisy ──► teacher (frozen, causal=False) ──► teacher_out, teacher.decoder
+  │                                              │            │
+  └─────► student (trained, causal=True)  ──► student_out, student.decoder
+                                                 │            │
+L = (1 − α) · loss(student_out, clean)           │            │
+  +      α  · loss(student_out, teacher_out) ◄───┘            │
+  +      β  · MSE(student.decoder, teacher.decoder) ◄─────────┘
+```
+
+The output term uses the same waveform loss as training (`loss_fn`); the
+feature term matches the post-attention `(B, H', T)` tensor — exactly the block
+that differs between the two models — and works on any dotted submodule path.
+Because the state dicts are identical, the student can also be initialised from
+the teacher (`init_from_teacher`).
+
+```bash
+# 1. Train the teacher (non-causal; never deploy this one)
+python -m trainer --config configs/tcn_mla_bi_eog.yaml         # → runs/tcn_mla_bi_eog/
+
+# 2. Distil the causal student from it
+python -m trainer --config configs/tcn_mla_eog_kd.yaml         # → runs/tcn_mla_eog_kd/
+
+# Or add distillation to any preset from the CLI
+python -m trainer --config configs/tcn_mha_eog.yaml \
+       --teacher_ckpt runs/tcn_mha_bi_eog/best.pt --kd_alpha 0.5 \
+       --kd_feature_weight 0.1 --init_from_teacher --save_dir runs/tcn_mha_eog_kd
+```
+
+| Config key | Default | Meaning |
+|------------|---------|---------|
+| `teacher_ckpt` | — | Teacher checkpoint; setting it switches to `KDTrainer` |
+| `teacher_config` | — | YAML of the teacher, only for legacy checkpoints without `model_config` |
+| `kd_alpha` | `0.5` | Weight of the teacher-output term (α); the ground-truth term gets 1 − α |
+| `kd_feature_weight` | `0.0` | Weight of the feature term (β); `0` disables the feature taps |
+| `kd_feature_layers` | `["decoder"]` | Submodules to match, e.g. `["decoder", "decoder.blocks.0"]` |
+| `kd_output_loss` | `loss_fn` | Loss between student and teacher outputs (`mse`, `l1`, `stft`, `l1_combined`, `l2_combined`) |
+| `kd_feature_loss` | `mse` | `mse` or `l1` between features |
+| `init_from_teacher` | `false` | Copy the teacher's weights into the student before training |
+
+`kd_alpha: 0` and `kd_feature_weight: 0` recover ordinary training. The KD
+presets use α = 0.5, β = 0.1 and `init_from_teacher: true` as starting points —
+they are experiment choices, not validated optima. `--staged` works with KD.
+
+The student is validated and checkpointed exactly like a normal run (against
+the clean signal), so `runs/tcn_mla_eog_kd/best.pt` is a drop-in for `eval.py`
+and `deploy/export_onnx.py`. Its `history.json` additionally records the
+per-epoch `kd_task` / `kd_output` / `kd_feature` terms and the teacher's own
+validation metrics under `teacher`. The ONNX exporter refuses `*_bi`
+checkpoints, since they are not causal.
 
 ## Evaluation
 
@@ -354,7 +419,7 @@ python reproduce.py
 python reproduce.py --quick
 ```
 
-This runs **32 automated checks** covering model construction, causality, losses, metrics, training, checkpointing, and evaluation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
+This runs **59 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future), losses, metrics, training, checkpointing, evaluation, and knowledge distillation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
 
 The same script runs in GitHub Actions on every push — see the badge at the top.
 
@@ -368,6 +433,8 @@ The study isolates one variable at a time while sharing everything else:
 | MHA vs MLA | Does KV compression hurt/help? | Same block structure, FFN, norms |
 | Sandwich vs Parallel | Which topology prevents collapse? | Same components, different wiring |(not included in the paper yet, further experiment is expected)
 | KV rank sweep (r4/r8/r16/r32) | How much compression is viable? | Same architecture, only rank varies |
+| Causal vs bidirectional (`X` vs `X_bi`) | What does causality cost? | Same weights and shapes, only the attention mask differs |
+| Student vs distilled student (`X` vs `X` + KD) | Can a non-causal teacher close that gap? | Same model, only the training signal differs |
 
 ## License
 
@@ -425,3 +492,8 @@ paper's LLM results do not establish denoising accuracy for these models.
 Validation: `python -m unittest discover -s tests -p 'test_turboquant.py'`
 checks packing, quantization error, QJL averaging, disabled compatibility,
 10/20/50-layer causality, gradients, config wiring and checkpoint restoration.
+
+`python -m unittest discover -s tests -p 'test_distillation.py'` covers the
+bidirectional attention flag, teacher/student state-dict compatibility, the
+distillation loss terms, teacher loading, the export refusal, and a full
+`KDTrainer` run.

@@ -61,7 +61,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.variants import build_model  # noqa: E402
+from models.variants import build_model, variant_is_causal  # noqa: E402
 from models.AttentionBlocks.attention import CausalMHA, CausalMLA  # noqa: E402
 
 INPUT_NAME = "noisy_eeg"
@@ -128,6 +128,15 @@ def load_checkpoint_model(ckpt_path: str | Path, config_path: str | Path | None 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["model_state"]
     stored = dict(ckpt.get("model_config", {}))
+
+    # Bidirectional teachers (tcn_*_bi) have the same weights as their causal
+    # twins, so only model_config can tell them apart.  They need future
+    # samples and must never be deployed for streaming.
+    if not variant_is_causal(stored.get("variant", "")):
+        raise ValueError(
+            f"{ckpt_path} is a bidirectional teacher ({stored['variant']}); it attends to "
+            f"future samples and cannot run online. Export the distilled causal student instead."
+        )
 
     arch = infer_arch_from_state_dict(sd)
 

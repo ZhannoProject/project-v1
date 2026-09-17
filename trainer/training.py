@@ -129,9 +129,15 @@ class Trainer:
         return avg_loss
 
     @torch.no_grad()  # disable gradient calculation to save memory / compute
-    def _validate(self, epoch: int):
-        """Evaluates the model on the validation dataset."""
-        self.model.eval()  # disables dropout, uses population stats for batchnorm
+    def _validate(self, epoch: int, model: Optional[nn.Module] = None):
+        """
+        Evaluates the model on the validation dataset.
+
+        ``model`` defaults to the model being trained; KDTrainer passes the
+        frozen teacher to report its reference metrics on the same split.
+        """
+        model = self.model if model is None else model
+        model.eval()  # disables dropout, uses population stats for batchnorm
         running_loss = 0.0
         agg_metrics = {"rrmse_t": 0.0, "rrmse_s": 0.0, "acc": 0.0}
         n_seen = 0
@@ -140,7 +146,7 @@ class Trainer:
             noisy = batch["noisy"].to(self.device)
             clean = batch["clean"].to(self.device)
 
-            pred = self.model(noisy)
+            pred = model(noisy)
             loss = self.criterion(pred, clean)
 
             bs = noisy.size(0)
@@ -159,7 +165,8 @@ class Trainer:
               f"RRMSE_t={agg_metrics['rrmse_t']:.3f}  "
               f"RRMSE_s={agg_metrics['rrmse_s']:.3f}  "
               f"ACC={agg_metrics['acc']:.3f}")
-        log_lr(self.optimizer, self.model)
+        if model is self.model:
+            log_lr(self.optimizer, self.model)
         return avg_loss, agg_metrics
 
     # ------------------------------------------------------------------

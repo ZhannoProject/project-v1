@@ -44,6 +44,26 @@ MHA vs MLA : Difference and similarity
 
   Ablation isolates exactly one variable: how K and V are produced,by compressing through a low-rank bottleneck in MLA. Everything else (Q, attention computation, block structure) is shared.
 ============================================================================
+
+============================================================================
+Causal vs bidirectional (student / teacher)
+============================================================================
+
+  Every attention module takes ``causal=True`` by default and applies the
+  lower-triangular mask, so position t attends to [0..t] only.  With
+  ``causal=False`` the mask is skipped and every position attends to the
+  whole window — standard bidirectional (BERT-style) self-attention.
+
+  A bidirectional model cannot run online (it needs future samples), but
+  on the same weight budget it is a strictly stronger denoiser.  It is
+  used as the TEACHER in knowledge distillation: the causal STUDENT learns
+  to reproduce the teacher's output waveform and post-attention features
+  from past-only context (see trainer/distillation.py).
+
+  The mask buffer is registered in both modes, so a causal model and its
+  bidirectional twin have identical state dicts: the student can be
+  initialised directly from the teacher's weights.
+============================================================================
 """
 
 import math
@@ -74,9 +94,12 @@ class CausalMHA(nn.Module):
     forward pass.  After the pass, ``model.decoder.blocks[i].attn.last_attn_weights``
     holds the (B, n_heads, T, T) softmax attention matrix (detached, on CPU).
     Call ``capture_weights(False)`` to stop capturing and free memory.
+
+    ``causal=False`` disables the mask (bidirectional attention, teacher only).
     """
     causal_mask : torch.Tensor
-    def __init__(self, d_model: int, n_heads: int, max_seq_len: int = 512, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, max_seq_len: int = 512, dropout: float = 0.1,
+                 causal: bool = True):
         super().__init__()
         assert d_model % n_heads == 0, (
             f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
@@ -85,6 +108,7 @@ class CausalMHA(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.causal = causal
 
         # Fused QKV projection: one matmul produces Q, K, V together
         self.qkv_proj = nn.Linear(d_model, 3 * d_model)
@@ -124,9 +148,11 @@ class CausalMHA(nn.Module):
         if self.turboquant is not None:
             k, v = self.turboquant(k, v)
 
-        # Scaled dot-product attention with causal mask
+        # Scaled dot-product attention; the mask is skipped in bidirectional
+        # (teacher) mode so every position sees the whole window
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
+        if self.causal:
+            att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
 
         # Optionally store attention weights for heatmap visualisation
@@ -169,7 +195,7 @@ class CausalMLA(nn.Module):
     Output : (B, T, d_model)
 
     Supports the same ``capture_weights()`` API as CausalMHA for
-    attention heatmap visualisation.
+    attention heatmap visualisation, and the same ``causal`` switch.
     """
     causal_mask : torch.Tensor
     def __init__(
@@ -179,6 +205,7 @@ class CausalMLA(nn.Module):
         max_seq_len: int = 512,
         dropout: float = 0.1,
         kv_lora_rank: int | None = None,
+        causal: bool = True,
     ):
         super().__init__()
         assert d_model % n_heads == 0, (
@@ -188,6 +215,7 @@ class CausalMLA(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.causal = causal
 
         # Default: 4× compression ratio
         if kv_lora_rank is None:
@@ -250,9 +278,11 @@ class CausalMLA(nn.Module):
         if self.turboquant is not None:
             k, v = self.turboquant(k, v)
 
-        # Scaled dot-product attention with causal mask
+        # Scaled dot-product attention; the mask is skipped in bidirectional
+        # (teacher) mode so every position sees the whole window
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
+        if self.causal:
+            att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
 
         # Optionally store attention weights for heatmap visualisation
@@ -385,6 +415,8 @@ class CausalTransformerDecoder(nn.Module):
     Uses a causal (autoregressive) attention mask — each position can
     only attend to itself and past positions, making this a decoder in
     the transformer taxonomy (like GPT), not an encoder (like BERT).
+    With ``causal=False`` every block attends bidirectionally (BERT-like);
+    this is the non-deployable teacher used for knowledge distillation.
 
     Sits between TCN_pt1 and TCN_pt2 in the sandwich architecture.
     The `attention_type` parameter is the ONLY switch between
@@ -404,16 +436,19 @@ class CausalTransformerDecoder(nn.Module):
         attention_type: str = "mha",        # "mha" or "mla"
         kv_lora_rank: int | None = None,    # only used when attention_type="mla"
         bottleneck_ratio: float | None = None,  # if set, compress the attention skip path
+        causal: bool = True,                # False → bidirectional (teacher) attention
     ):
         super().__init__()
         self.attention_type = attention_type
+        self.causal = causal
 
         def _build_attention() -> nn.Module:
             """Factory: create one attention instance based on attention_type."""
             if attention_type == "mha":
-                return CausalMHA(d_model, n_heads, max_seq_len, dropout)
+                return CausalMHA(d_model, n_heads, max_seq_len, dropout, causal=causal)
             elif attention_type == "mla":
-                return CausalMLA(d_model, n_heads, max_seq_len, dropout, kv_lora_rank)
+                return CausalMLA(d_model, n_heads, max_seq_len, dropout, kv_lora_rank,
+                                 causal=causal)
             else:
                 raise ValueError(
                     f"Unknown attention_type '{attention_type}'. Use 'mha' or 'mla'."
@@ -536,6 +571,25 @@ if __name__ == "__main__":
     # Test both variants
     mha_params = test_variant("mha")
     mla_params = test_variant("mla", kv_lora_rank=16)
+
+    # ---- Bidirectional (teacher) mode: perturbing the future MUST change the past ----
+    print(f"\n{'='*50}")
+    print("Testing: bidirectional (causal=False)")
+    print(f"{'='*50}")
+    for attention_type in ("mha", "mla"):
+        decoder = CausalTransformerDecoder(
+            d_model=C, n_heads=4, n_layers=2, max_seq_len=T,
+            attention_type=attention_type, causal=False,
+        ).eval()
+        x1 = torch.randn(B, C, T)
+        x2 = x1.clone()
+        x2[:, :, 256] += 10.0
+        with torch.no_grad():
+            past_diff = (decoder(x1)[:, :, :256] - decoder(x2)[:, :, :256]).abs().max().item()
+        # Causal mode gives an exact 0 here (masked logits → softmax weight 0);
+        # any non-zero value proves the future leaked into the past.
+        assert past_diff > 0, f"{attention_type} with causal=False should see the future"
+        print(f"{attention_type.upper()} causal=False: past_diff={past_diff:.2e} (>0, sees the future)")
 
     # ---- Comparison summary ----
     print(f"\n{'='*50}")

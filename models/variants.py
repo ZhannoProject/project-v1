@@ -1,11 +1,13 @@
 """
 Model variants for the EEG causal denoising ablation study.
 
-Four groups of variants, one file:
+Five groups of variants, one file:
   - TCNOnly     : pure causal TCN (baseline)
   - TCNWithMHA  : TCN_pt1 + Causal MHA + TCN_pt2 (sandwich)
   - TCNWithMLA  : TCN_pt1 + Causal MLA + TCN_pt2 (sandwich)
   - tcn_mla_rN  : MLA with explicit kv_lora_rank=N (rank sweep ablation)
+  - tcn_*_bi    : the same models with BIDIRECTIONAL attention — non-causal
+                  teachers for knowledge distillation (see below)
 
 All variants share the same building blocks (CausalTCNBackbone, CausalConv1d)
 and produce the same tensor shape: (B, 1, T) → (B, 1, T).
@@ -93,6 +95,31 @@ Dilation assignment between pt1 and pt2
   total RF, which is intentional — the attention needs room to be useful.
 
 ============================================================================
+Bidirectional teachers and knowledge distillation
+============================================================================
+
+  Every attention variant accepts ``causal``.  ``causal=True`` (default)
+  is the deployable model: attention position t sees [0..t].  With
+  ``causal=False`` the attention mask is dropped and each position sees
+  the whole 512-sample window.  The TCN stages stay causal, but because
+  the attention output already carries future information the model as
+  a whole is non-causal.
+
+  The registry exposes the bidirectional twins as ``tcn_mha_bi``,
+  ``tcn_mla_bi``, ``tcn_mha_par_bi``, ``tcn_mla_par_bi``.  They are
+  trained exactly like the causal models and serve as TEACHERS:
+
+      teacher  = tcn_mla_bi   (offline, sees the future)   ─┐ frozen
+      student  = tcn_mla      (online, past-only)           ─┘ distilled
+
+  Student and teacher share every tensor shape, so the student can be
+  initialised from the teacher, and the post-attention features
+  (``decoder`` output, (B, H', T)) can be matched directly.  The training
+  side lives in trainer/distillation.py (DistillationLoss, KDTrainer).
+
+  TCNOnly has no attention, hence no bidirectional twin.
+
+============================================================================
 """
 
 from functools import partial
@@ -175,6 +202,8 @@ class TCNWithMHA(nn.Module):
 
     The (B,C,T) ↔ (B,T,C) permutation for attention is handled
     INSIDE CausalTransformerDecoder — this forward() stays in (B,C,T).
+
+    ``causal=False`` builds the bidirectional teacher (registry: ``tcn_mha_bi``).
     """
 
     def __init__(
@@ -185,8 +214,10 @@ class TCNWithMHA(nn.Module):
         max_seq_len: int = 512,
         dropout: float = 0.1,
         bottleneck_ratio: float = 0.5,
+        causal: bool = True,
     ):
         super().__init__()
+        self.causal = causal
 
         # Attention operates in a compressed channel space:
         #   H channels  →  squeeze to H' = H * ratio  →  attention  →  expand back to H
@@ -211,6 +242,7 @@ class TCNWithMHA(nn.Module):
             max_seq_len=max_seq_len,
             dropout=dropout,
             attention_type="mha",
+            causal=causal,
         )
 
         # --- Channel bottleneck: expand after attention ---
@@ -258,6 +290,8 @@ class TCNWithMLA(nn.Module):
           → CausalTransformerDecoder (MLA)   → (B, H, T)   global context
           → TCN_pt2  [8, 16, 32]             → (B, H, T)   reconstruction
           → 1×1 CausalConv head              → (B, 1, T)   output
+
+    ``causal=False`` builds the bidirectional teacher (registry: ``tcn_mla_bi``).
     """
 
     def __init__(
@@ -269,8 +303,10 @@ class TCNWithMLA(nn.Module):
         dropout: float = 0.1,
         kv_lora_rank: int | None = None,    # default: hidden_channels // 4
         bottleneck_ratio: float = 0.5,
+        causal: bool = True,
     ):
         super().__init__()
+        self.causal = causal
 
         attn_dim = int(hidden_channels * bottleneck_ratio)
 
@@ -294,6 +330,7 @@ class TCNWithMLA(nn.Module):
             dropout=dropout,
             attention_type="mla",
             kv_lora_rank=kv_lora_rank,
+            causal=causal,
         )
 
         # --- Channel bottleneck: expand after attention ---
@@ -349,6 +386,8 @@ class TCNParallelMHA(nn.Module):
     receives a concatenation of BOTH branches, so attention must produce
     useful features or the head loses half its input channels.  There is
     no residual path that lets TCN_pt2 compensate for a dead attention.
+
+    ``causal=False`` builds the bidirectional teacher (registry: ``tcn_mha_par_bi``).
     """
 
     def __init__(
@@ -358,8 +397,10 @@ class TCNParallelMHA(nn.Module):
         n_attn_layers: int = 2,
         max_seq_len: int = 512,
         dropout: float = 0.1,
+        causal: bool = True,
     ):
         super().__init__()
+        self.causal = causal
 
         # --- Stage 1: shared feature extraction ---
         self.tcn_pt1 = CausalTCNBackbone(
@@ -377,6 +418,7 @@ class TCNParallelMHA(nn.Module):
             max_seq_len=max_seq_len,
             dropout=dropout,
             attention_type="mha",
+            causal=causal,
         )
 
         # --- Branch B: local detail via TCN ---
@@ -419,6 +461,8 @@ class TCNParallelMLA(nn.Module):
             └─ Branch B: TCN_pt2  [8, 16, 32]           → (B, H, T)  local
           → torch.cat(A, B, dim=1)                  → (B, 2H, T)
           → 1×1 CausalConv head                     → (B, 1, T)
+
+    ``causal=False`` builds the bidirectional teacher (registry: ``tcn_mla_par_bi``).
     """
 
     def __init__(
@@ -429,8 +473,10 @@ class TCNParallelMLA(nn.Module):
         max_seq_len: int = 512,
         dropout: float = 0.1,
         kv_lora_rank: int | None = None,
+        causal: bool = True,
     ):
         super().__init__()
+        self.causal = causal
 
         # --- Stage 1: shared feature extraction ---
         self.tcn_pt1 = CausalTCNBackbone(
@@ -449,6 +495,7 @@ class TCNParallelMLA(nn.Module):
             dropout=dropout,
             attention_type="mla",
             kv_lora_rank=kv_lora_rank,
+            causal=causal,
         )
 
         # --- Branch B: local detail via TCN ---
@@ -491,6 +538,21 @@ MLA_RANK_SWEEP = [4, 8, 16, 32]
 for _rank in MLA_RANK_SWEEP:
     VARIANT_REGISTRY[f"tcn_mla_r{_rank}"] = partial(TCNWithMLA, kv_lora_rank=_rank)
 
+# Bidirectional twins: tcn_mha_bi, tcn_mla_bi, tcn_mha_par_bi, tcn_mla_par_bi
+# Same weights and shapes as the causal model, attention mask removed.
+# Non-deployable; they are the teachers for knowledge distillation.
+BIDIRECTIONAL_SUFFIX = "_bi"
+BIDIRECTIONAL_VARIANTS = []
+for _base in ["tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
+    _name = _base + BIDIRECTIONAL_SUFFIX
+    VARIANT_REGISTRY[_name] = partial(VARIANT_REGISTRY[_base], causal=False)
+    BIDIRECTIONAL_VARIANTS.append(_name)
+
+
+def variant_is_causal(variant: str) -> bool:
+    """True for every deployable (past-only) variant, False for the ``_bi`` teachers."""
+    return not variant.endswith(BIDIRECTIONAL_SUFFIX)
+
 
 def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
                 turboquant_key_mode="prod", turboquant_train_mode="off",
@@ -512,7 +574,15 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
             f"Unknown variant '{variant}'. "
             f"Available: {list(VARIANT_REGISTRY.keys())}"
         )
-    from .AttentionBlocks.turboquant import attach_turboquant
+    # Causality is part of the variant name so checkpoints are self-describing;
+    # refuse a `causal` kwarg that contradicts it rather than silently obeying it.
+    if "causal" in kwargs and kwargs["causal"] != variant_is_causal(variant):
+        want = variant + BIDIRECTIONAL_SUFFIX if kwargs["causal"] is False \
+            else variant[: -len(BIDIRECTIONAL_SUFFIX)]
+        raise ValueError(
+            f"causal={kwargs['causal']} contradicts variant '{variant}'; use '{want}' instead"
+        )
+    from models.AttentionBlocks.turboquant import attach_turboquant
     model = VARIANT_REGISTRY[variant](**kwargs)
     attach_turboquant(model, turboquant, turboquant_bits, turboquant_key_mode,
                      turboquant_train_mode, turboquant_seed)
@@ -540,6 +610,7 @@ if __name__ == "__main__":
     all_variants = (
         ["tcn", "tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]
         + [f"tcn_mla_r{r}" for r in MLA_RANK_SWEEP]
+        + BIDIRECTIONAL_VARIANTS
     )
 
     for name in all_variants:
@@ -586,6 +657,17 @@ if __name__ == "__main__":
         print(f"  future_diff = {future_diff:.2e}  (should be >0)")
         assert past_diff < 1e-5, f"CAUSALITY VIOLATED in {variant_name}!"
         print("  Causality verified.")
+
+    # ---- Bidirectional teachers must NOT be causal ----
+    for variant_name in BIDIRECTIONAL_VARIANTS:
+        model = build_model(variant_name, hidden_channels=64).eval()
+        x1 = torch.randn(B, 1, T)
+        x2 = x1.clone()
+        x2[:, :, 256] += 10.0
+        with torch.no_grad():
+            past_diff = (model(x1)[:, :, :256] - model(x2)[:, :, :256]).abs().max().item()
+        assert past_diff > 0, f"{variant_name} should see the future"
+        print(f"  {variant_name:<16s} past_diff = {past_diff:.2e}  (bidirectional, as intended)")
 
     # ---- Summary table ----
     print(f"\n{'='*60}")

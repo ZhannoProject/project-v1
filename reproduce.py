@@ -14,6 +14,8 @@ What it verifies
   5. Checkpoint saving / loading round-trips correctly
   6. Per-SNR evaluation pipeline runs and produces valid metrics
   7. Metrics are sane (perfect-prediction sanity check)
+  8. Bidirectional teachers see the future, and knowledge distillation
+     (teacher → causal student) trains end-to-end
 
 If real EEGdenoiseNet data is present, it uses that.
 Otherwise, it synthesises small random .npy files so CI works without
@@ -40,7 +42,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.variants import build_model, VARIANT_REGISTRY, MLA_RANK_SWEEP
+from models.variants import build_model, VARIANT_REGISTRY, MLA_RANK_SWEEP, BIDIRECTIONAL_VARIANTS
 from models.TCN_backbone import CausalTCNBackbone, CausalConv1d
 from models.AttentionBlocks.attention import (
     CausalMHA, CausalMLA, CausalTransformerBlock, CausalTransformerDecoder,
@@ -82,6 +84,7 @@ def test_model_builds():
     all_names = (
         ["tcn", "tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]
         + [f"tcn_mla_r{r}" for r in MLA_RANK_SWEEP]
+        + BIDIRECTIONAL_VARIANTS
     )
 
     for name in all_names:
@@ -134,6 +137,21 @@ def test_causality():
             )
         except Exception as e:
             report(f"{name:<16s} causality", False, str(e))
+
+    # Bidirectional teachers: the same perturbation MUST leak into the past.
+    # Causal models give an exact 0 (masked logits → softmax weight 0).
+    for name in BIDIRECTIONAL_VARIANTS:
+        try:
+            model = build_model(name, hidden_channels=64)
+            model.eval()
+            x1 = torch.randn(B, 1, T)
+            x2 = x1.clone()
+            x2[:, :, T // 2] += 10.0
+            with torch.no_grad():
+                past_diff = (model(x1)[:, :, :T // 2] - model(x2)[:, :, :T // 2]).abs().max().item()
+            report(f"{name:<16s} sees the future", past_diff > 0, f"past_diff={past_diff:.2e}")
+        except Exception as e:
+            report(f"{name:<16s} sees the future", False, str(e))
 
 
 # =====================================================================
@@ -347,11 +365,143 @@ def test_eval_pipeline(data_dir: str, save_dir: str, variant: str):
 
 
 # =====================================================================
-# 8. Config loading
+# 8. Knowledge distillation
+# =====================================================================
+def test_distillation():
+    print("\n" + "=" * 60)
+    print("8. Knowledge distillation (teacher → student)")
+    print("=" * 60)
+
+    from trainer.distillation import (
+        DistillationLoss, FeatureTap, init_student_from_teacher,
+    )
+
+    kw = dict(hidden_channels=32, bottleneck_ratio=0.5, kv_lora_rank=4)
+    teacher = build_model("tcn_mla_bi", **kw).eval()
+    student = build_model("tcn_mla", **kw)
+
+    # Identical state dicts → the student can be initialised from the teacher
+    try:
+        n_copied, n_skipped = init_student_from_teacher(student, teacher)
+        same = all(torch.equal(a, b) for a, b in
+                   zip(student.state_dict().values(), teacher.state_dict().values()))
+        report("student init from teacher", n_skipped == 0 and same,
+               f"{n_copied} tensors copied, {n_skipped} skipped")
+    except Exception as e:
+        report("student init from teacher", False, str(e))
+
+    # Distillation loss: gradients reach the student only, feature shapes match
+    try:
+        x = torch.randn(B, 1, T)
+        clean = torch.randn(B, 1, T)
+        s_tap, t_tap = FeatureTap(student, ["decoder"]), FeatureTap(teacher, ["decoder"])
+        with torch.no_grad():
+            t_out = teacher(x)
+        s_out = student(x)
+        crit = DistillationLoss(build_loss("l1"), build_loss("l1"), alpha=0.5, feature_weight=0.1)
+        total, parts = crit(s_out, t_out, clean, s_tap.features, t_tap.features)
+        total.backward()
+        student_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                               for p in student.parameters())
+        teacher_no_grad = all(p.grad is None for p in teacher.parameters())
+        feat_shape = tuple(s_tap.features["decoder"].shape)
+        report("distillation loss + backward",
+               torch.isfinite(total).item() and student_has_grad and teacher_no_grad,
+               f"total={total.item():.4f} task={parts['task']:.4f} "
+               f"output={parts['output']:.4f} feature={parts['feature']:.4f}, "
+               f"decoder feature {feat_shape}")
+        s_tap.remove(); t_tap.remove()
+    except Exception as e:
+        report("distillation loss + backward", False, str(e))
+
+    # alpha=0, feature_weight=0 must reduce to the plain task loss
+    try:
+        crit0 = DistillationLoss(build_loss("mse"), build_loss("mse"), alpha=0.0, feature_weight=0.0)
+        with torch.no_grad():
+            total0, _ = crit0(s_out, t_out, clean)
+            plain = build_loss("mse")(s_out, clean)
+        report("alpha=0 reduces to task loss", torch.allclose(total0, plain),
+               f"kd={total0.item():.6f} plain={plain.item():.6f}")
+    except Exception as e:
+        report("alpha=0 reduces to task loss", False, str(e))
+
+
+def test_kd_training_loop(tmpdir: str, data_dir: str):
+    print("\n" + "=" * 60)
+    print("9. KD training loop (teacher → student, 2 epochs)")
+    print("=" * 60)
+
+    from trainer.training import Trainer
+    from trainer.distillation import KDTrainer, load_teacher
+
+    kw = dict(hidden_channels=32, bottleneck_ratio=0.5, kv_lora_rank=2)
+    teacher_dir = os.path.join(tmpdir, "runs", "kd_teacher")
+    student_dir = os.path.join(tmpdir, "runs", "kd_student")
+
+    try:
+        train_loader, val_loader, _ = build_dataloaders(
+            data_dir=data_dir, artifact_type="EOG", batch_size=8,
+        )
+        # Teacher: 1 epoch is enough to produce a checkpoint with model_config
+        Trainer(model=build_model("tcn_mla_bi", **kw), train_loader=train_loader,
+                val_loader=val_loader, save_dir=teacher_dir, learning_rate=1e-3,
+                max_epochs=1, log_every=999, device=DEVICE, loss_fn="mse").fit()
+        teacher = load_teacher(os.path.join(teacher_dir, "best.pt"))
+        report("teacher checkpoint reload", teacher.model_config["variant"] == "tcn_mla_bi"
+               and not teacher.causal)
+    except Exception as e:
+        report("teacher checkpoint reload", False, str(e))
+        return
+
+    try:
+        kd = KDTrainer(
+            model=build_model("tcn_mla", **kw), teacher=teacher,
+            train_loader=train_loader, val_loader=val_loader,
+            kd_alpha=0.5, kd_feature_weight=0.1, init_from_teacher=True,
+            save_dir=student_dir, learning_rate=1e-3, max_epochs=2,
+            log_every=999, device=DEVICE, loss_fn="mse",
+        )
+        kd.fit()
+        report("KD training 2 epochs", True)
+    except Exception as e:
+        report("KD training 2 epochs", False, str(e))
+        return
+
+    try:
+        with open(os.path.join(student_dir, "history.json")) as f:
+            history = json.load(f)
+        kd_keys = ["kd_task", "kd_output", "kd_feature"]
+        ok = (all(len(history[k]) == 2 for k in kd_keys)
+              and "teacher" in history and "rrmse_t" in history["teacher"])
+        report("KD history content", ok,
+               f"kd_output={history['kd_output'][-1]:.4f}, "
+               f"teacher acc={history['teacher']['acc']:.3f}")
+    except Exception as e:
+        report("KD history content", False, str(e))
+
+    # The distilled student must still be strictly causal
+    try:
+        ckpt = torch.load(os.path.join(student_dir, "best.pt"), map_location="cpu", weights_only=False)
+        student = build_model("tcn_mla", **kw)
+        student.load_state_dict(ckpt["model_state"])
+        student.eval()
+        x1 = torch.randn(1, 1, T)
+        x2 = x1.clone()
+        x2[:, :, T // 2] += 10.0
+        with torch.no_grad():
+            past_diff = (student(x1)[:, :, :T // 2] - student(x2)[:, :, :T // 2]).abs().max().item()
+        report("distilled student is causal", past_diff < 1e-5,
+               f"past_diff={past_diff:.2e}, variant={ckpt['model_config']['variant']}")
+    except Exception as e:
+        report("distilled student is causal", False, str(e))
+
+
+# =====================================================================
+# 10. Config loading
 # =====================================================================
 def test_configs():
     print("\n" + "=" * 60)
-    print("8. Config file loading")
+    print("10. Config file loading")
     print("=" * 60)
 
     from configs import load_config
@@ -395,6 +545,7 @@ def main():
     test_causality()
     test_losses()
     test_metrics()
+    test_distillation()
     test_configs()
 
     if not args.quick:
@@ -405,6 +556,7 @@ def main():
                 save_dir, data_dir, variant = result
                 test_checkpoint_roundtrip(save_dir, variant)
                 test_eval_pipeline(data_dir, save_dir, variant)
+                test_kd_training_loop(tmpdir, data_dir)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
     else:

@@ -5,6 +5,10 @@ Usage:
     python -m trainer --config configs/tcn_mha_eog.yaml
     python -m trainer --variant tcn --artifact EOG --max_epochs 50
 
+Knowledge distillation (bidirectional teacher → causal student) is enabled
+by ``--teacher_ckpt`` / ``teacher_ckpt:`` in the YAML; see configs/*_kd.yaml
+and trainer/distillation.py.
+
 All arguments are optional — a YAML config provides defaults, and any CLI
 flag overrides the corresponding YAML key.  Priority chain:
     CLI flag  >  YAML file  >  hardcoded fallbacks below
@@ -19,9 +23,10 @@ project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 
 from data.Dataloader import build_dataloaders
-from models.variants import build_model_from_config, VARIANT_REGISTRY
+from models.variants import build_model_from_config, VARIANT_REGISTRY, variant_is_causal
 from configs import load_config, merge_cli_overrides
 from trainer.training import Trainer
+from trainer.distillation import KDTrainer, load_teacher
 
 DEFAULT_DATA_DIR = "./data/EEGdenoisenet/data/"
 
@@ -72,6 +77,27 @@ def main():
     parser.add_argument("--turboquant_key_mode", choices=["prod", "mse"], default=None)
     parser.add_argument("--turboquant_train_mode", choices=["off", "ste"], default=None)
     parser.add_argument("--turboquant_seed", type=int, default=None)
+    # --- Knowledge distillation (see trainer/distillation.py) ---
+    parser.add_argument("--teacher_ckpt", type=str, default=None,
+                        help="Teacher checkpoint (normally a *_bi run). Enables distillation.")
+    parser.add_argument("--teacher_config", type=str, default=None,
+                        help="YAML of the teacher, only needed for legacy checkpoints without model_config")
+    parser.add_argument("--kd_alpha", type=float, default=None,
+                        help="Weight of the teacher-output term; the ground-truth term gets "
+                             "1 - kd_alpha (default 0.5)")
+    parser.add_argument("--kd_feature_weight", type=float, default=None,
+                        help="Weight of the feature-matching term on --kd_feature_layers "
+                             "(default 0 = off)")
+    parser.add_argument("--kd_feature_layers", nargs="+", default=None,
+                        help="Submodules whose outputs are matched, e.g. decoder decoder.blocks.0 "
+                             "(default: decoder)")
+    parser.add_argument("--kd_output_loss", type=str, default=None,
+                        choices=["mse", "l1", "stft", "l2_combined", "l1_combined"],
+                        help="Loss between student and teacher outputs (default: same as --loss_fn)")
+    parser.add_argument("--kd_feature_loss", type=str, default=None, choices=["mse", "l1"],
+                        help="Loss between student and teacher features (default: mse)")
+    parser.add_argument("--init_from_teacher", action="store_true", default=None,
+                        help="Initialise the student from the teacher's weights before training")
     args = parser.parse_args()
 
     # --- Build effective config: YAML defaults -> CLI overrides ---
@@ -102,13 +128,26 @@ def main():
     cfg.setdefault("loss_fn",            "mse")
     cfg.setdefault("bottleneck_ratio",  0.5)
     cfg.setdefault("kv_lora_rank",      16)
+    cfg.setdefault("teacher_ckpt",      None)
+    cfg.setdefault("teacher_config",    None)
+    cfg.setdefault("kd_alpha",          0.5)
+    cfg.setdefault("kd_feature_weight", 0.0)
+    cfg.setdefault("kd_feature_layers", ["decoder"])
+    cfg.setdefault("kd_output_loss",    None)
+    cfg.setdefault("kd_feature_loss",   "mse")
+    cfg.setdefault("init_from_teacher", False)
 
     cfg.setdefault("n_attn_layers", 2)
     if type(cfg["n_attn_layers"]) is not int or cfg["n_attn_layers"] < 1:
         parser.error("n_attn_layers must be a positive integer")
 
+    distil = cfg["teacher_ckpt"] is not None
     if cfg.get("save_dir") is None:
-        cfg["save_dir"] = f"./runs/{cfg['variant']}_{cfg['artifact'].lower()}"
+        cfg["save_dir"] = f"./runs/{cfg['variant']}_{cfg['artifact'].lower()}" \
+            + ("_kd" if distil else "")
+    if distil and not variant_is_causal(cfg["variant"]):
+        print(f"[Warning] Student '{cfg['variant']}' is bidirectional; distillation is meant "
+              f"to teach a causal student. Continuing anyway.")
 
     print(f"[Config] {cfg}")
 
@@ -123,7 +162,7 @@ def main():
     model = build_model_from_config(cfg)
 
     # Train
-    trainer = Trainer(
+    trainer_kwargs = dict(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -138,6 +177,21 @@ def main():
         use_tensorboard=cfg["tensorboard"],
         loss_fn=cfg["loss_fn"],
     )
+    if distil:
+        teacher = load_teacher(cfg["teacher_ckpt"], cfg["teacher_config"])
+        trainer = KDTrainer(
+            teacher=teacher,
+            teacher_ckpt=cfg["teacher_ckpt"],
+            kd_alpha=cfg["kd_alpha"],
+            kd_feature_weight=cfg["kd_feature_weight"],
+            kd_feature_layers=cfg["kd_feature_layers"],
+            kd_output_loss=cfg["kd_output_loss"],
+            kd_feature_loss=cfg["kd_feature_loss"],
+            init_from_teacher=cfg["init_from_teacher"],
+            **trainer_kwargs,
+        )
+    else:
+        trainer = Trainer(**trainer_kwargs)
 
     if cfg["staged"]:
         trainer.staged_fit(
