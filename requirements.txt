@@ -8,3 +8,6 @@ pyyaml>=6.0
 onnx>=1.16
 onnxruntime>=1.18
 onnxscript>=0.2
+
+# Training GUI native window (python -m gui); without it the GUI falls back to a browser tab
+pywebview>=5.0

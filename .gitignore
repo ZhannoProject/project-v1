@@ -20,3 +20,5 @@ data/EEGdenoisenet/
 deploy/artifacts/
 
 *.log      # 屏蔽运行日志文件
+# macOS launcher built by `python -m gui.make_app` (paths are machine-specific)
+*.app/

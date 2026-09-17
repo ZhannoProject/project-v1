@@ -146,14 +146,24 @@ Checkpoints are saved to `runs/<variant>_<artifact>/` with `best.pt`, `last.pt`,
 
 ### Training GUI
 
-A local web page that edits the presets in `configs/` and launches
-`python -m trainer` from them. No extra dependencies (stdlib `http.server`
-+ the `pyyaml` already required):
+A local app that edits the presets in `configs/` and launches
+`python -m trainer` from them. The page is served by the stdlib
+`http.server` and shown in a native window (via `pywebview`, listed in
+`requirements.txt`); without `pywebview` it opens in a browser tab instead.
 
 ```bash
-python -m gui                     # opens http://127.0.0.1:8765/
-python -m gui --port 9000 --no-browser
+python -m gui                     # native window (default when pywebview is installed)
+python -m gui --browser           # serve http://127.0.0.1:8765/ and open a browser tab
+python -m gui.make_app            # macOS: build a double-clickable "EEG Training GUI.app"
 ```
+
+`make_app` writes a thin launcher bundle (with icon) into the project root
+that runs *this* venv's Python with `-m gui --native`, so it always uses the
+current code; rebuild it if you move the project or the venv. On first launch
+macOS asks for access to the folder that holds the project (Desktop /
+Documents) — allow it. The bundle is git-ignored; its output goes to
+`~/Library/Logs/eeg-training-gui.log`. Closing the window stops the server
+(and asks first if a training run is still going).
 
 - **Form ↔ YAML.** Every key of `trainer/__main__.py` is a field, grouped as in
   the preset files (Model, Data, Training, Scheduler, Staged, Loss, Output,

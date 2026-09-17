@@ -89,6 +89,13 @@
   .muted { color: var(--muted); }
   footer { padding: 6px 16px 16px; color: var(--muted); font-size: 12px; text-align: center; }
   kbd { font: 11px ui-monospace, Menlo, monospace; border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; width: min(440px, 90vw); box-shadow: 0 20px 60px rgba(0,0,0,.35); }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  dialog h3 { margin: 0 0 6px; font-size: 15px; }
+  dialog p { margin: 0 0 12px; color: var(--muted); }
+  dialog .dfield { display: grid; gap: 4px; margin-bottom: 10px; }
+  dialog .dfield label { font-size: 12px; color: var(--muted); }
+  dialog select { width: 100%; }
 </style>
 </head>
 <body>
@@ -147,6 +154,19 @@
 </main>
 <footer id="envNote"></footer>
 
+<dialog id="dlg">
+  <form method="dialog" id="dlgForm">
+    <h3 id="dlgTitle"></h3>
+    <p id="dlgMsg"></p>
+    <div id="dlgFields"></div>
+    <div class="row" style="margin:6px 0 0">
+      <span class="grow"></span>
+      <button type="button" id="dlgCancel">Cancel</button>
+      <button type="submit" id="dlgOk" class="primary">OK</button>
+    </div>
+  </form>
+</dialog>
+
 <script>
 (() => {
   const $ = (s, r = document) => r.querySelector(s);
@@ -166,6 +186,31 @@
   const banner = (msg, kind = "err") => {
     const b = $("#banner"); b.textContent = msg || ""; b.className = "banner" + (msg ? ` show ${kind}` : "");
   };
+
+  // ---------- in-page dialog (replaces prompt()/confirm(); identical in browser and native window) ----------
+  function ask({ title, message = "", fields = [], ok = "OK", cancel = "Cancel", danger = false }) {
+    const dlg = $("#dlg"), form = $("#dlgForm"), box = $("#dlgFields");
+    $("#dlgTitle").textContent = title; $("#dlgMsg").textContent = message; $("#dlgMsg").style.display = message ? "" : "none";
+    $("#dlgOk").textContent = ok; $("#dlgOk").className = danger ? "danger" : "primary"; $("#dlgCancel").textContent = cancel;
+    box.innerHTML = "";
+    for (const f of fields) {
+      const wrap = document.createElement("div"); wrap.className = "dfield";
+      const label = document.createElement("label"); label.textContent = f.label; label.htmlFor = "dlg_" + f.key;
+      let input;
+      if (f.options) { input = document.createElement("select"); for (const o of f.options) input.appendChild(new Option(o.label ?? o, o.value ?? o)); input.value = f.value ?? ""; }
+      else { input = document.createElement("input"); input.type = "text"; input.value = f.value ?? ""; input.placeholder = f.placeholder ?? ""; input.autocomplete = "off"; }
+      input.id = "dlg_" + f.key; input.dataset.key = f.key;
+      wrap.append(label, input); box.appendChild(wrap);
+    }
+    return new Promise(resolve => {
+      const done = (result) => { dlg.close(); form.onsubmit = null; $("#dlgCancel").onclick = null; dlg.oncancel = null; resolve(result); };
+      form.onsubmit = e => { e.preventDefault(); const out = {}; box.querySelectorAll("[data-key]").forEach(i => out[i.dataset.key] = i.value); done(out); };
+      $("#dlgCancel").onclick = () => done(null);
+      dlg.oncancel = e => { e.preventDefault(); done(null); };
+      dlg.showModal();
+      const first = box.querySelector("input, select"); if (first) { first.focus(); if (first.select) first.select(); }
+    });
+  }
 
   // ---------- form ----------
   function buildForm() {
@@ -341,7 +386,9 @@
   }
 
   async function saveAs() {
-    const name = prompt("New file name (in configs/):", state.name.replace(/\.yaml$/, "_copy.yaml"));
+    const r0 = await ask({ title: "Save as…", ok: "Save",
+      fields: [{ key: "name", label: "File name (in configs/)", value: state.name.replace(/\.yaml$/, "_copy.yaml") }] });
+    const name = r0 && r0.name.trim();
     if (!name) return;
     try {
       const vals = collectValues();
@@ -354,11 +401,15 @@
   }
 
   async function newConfig() {
-    const name = prompt("New preset file name (in configs/):", "my_experiment.yaml");
+    const r0 = await ask({ title: "New preset", ok: "Create", fields: [
+      { key: "name", label: "File name (in configs/)", value: "my_experiment.yaml" },
+      { key: "template", label: "Copy settings and comments from", value: state.name || "",
+        options: [{ label: "(minimal file)", value: "" }, ...state.meta.configs] },
+    ] });
+    const name = r0 && r0.name.trim();
     if (!name) return;
-    const tpl = prompt("Template to copy (empty = minimal file):", state.name || "");
     try {
-      const r = await api("/api/config/new", { name, template: tpl || null });
+      const r = await api("/api/config/new", { name, template: r0.template || null });
       fillConfigList(r.configs, name);
       await loadConfig(name);
       banner(`Created configs/${name}`, "info");
@@ -380,7 +431,8 @@
   async function train() {
     if (!state.name) return;
     if (state.dirty) {
-      if (!confirm("Save the edited preset before training?")) return;
+      const go = await ask({ title: "Unsaved edits", message: `configs/${state.name} has unsaved changes. Save them and start training?`, ok: "Save & train" });
+      if (!go) return;
       if (!(await save())) return;
     }
     try {
@@ -460,9 +512,15 @@
     document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.id === "tab-" + id));
   }
   document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
-  $("#configSel").addEventListener("change", e => {
-    if (state.dirty && !confirm("Discard unsaved edits?")) { e.target.value = state.name; return; }
-    loadConfig(e.target.value).catch(err => banner(err.message));
+  $("#configSel").addEventListener("change", async e => {
+    const target = e.target.value;
+    if (state.dirty) {
+      e.target.value = state.name;
+      const go = await ask({ title: "Discard unsaved edits?", message: `Switching to ${target} throws away the edits to ${state.name}.`, ok: "Discard", danger: true });
+      if (!go) return;
+      e.target.value = target;
+    }
+    loadConfig(target).catch(err => banner(err.message));
   });
   $("#btnReload").addEventListener("click", () => loadConfig(state.name).catch(err => banner(err.message)));
   $("#btnSave").addEventListener("click", save);

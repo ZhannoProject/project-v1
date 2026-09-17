@@ -284,5 +284,45 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(self.call("/api/train/status")[1]["running"])
 
 
+class NativeAndBundleTests(unittest.TestCase):
+    def test_cli_mode_selection(self):
+        from gui import __main__ as cli
+        with mock.patch.object(cli, "run_native") as native, mock.patch.object(cli, "serve") as browser:
+            with mock.patch.object(cli, "native_available", return_value=True):
+                cli.main([])                                   # default → native, free port
+                native.assert_called_once_with("127.0.0.1", 0, verbose=False)
+                cli.main(["--browser", "--no-browser"])        # explicit browser mode
+                browser.assert_called_once_with("127.0.0.1", 8765, open_browser=False, verbose=False)
+            native.reset_mock(); browser.reset_mock()
+            with mock.patch.object(cli, "native_available", return_value=False):
+                cli.main(["--port", "9000"])                   # no pywebview → browser fallback
+                browser.assert_called_once_with("127.0.0.1", 9000, open_browser=True, verbose=False)
+                native.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "darwin", "app bundles are macOS-only")
+    def test_make_app_builds_a_launcher_bundle(self):
+        import plistlib
+        from gui.make_app import build_app
+        with tempfile.TemporaryDirectory() as tmp:
+            app = build_app(Path(tmp), python="/venv/bin/python", root=Path("/proj/ect"))
+            self.assertEqual(app.name, "EEG Training GUI.app")
+            launch = app / "Contents" / "MacOS" / "launch"
+            self.assertTrue(launch.stat().st_mode & 0o111)
+            text = launch.read_text()
+            self.assertIn("cd '/proj/ect'", text)
+            self.assertIn("exec '/venv/bin/python' -m gui --native", text)
+            with open(app / "Contents" / "Info.plist", "rb") as f:
+                info = plistlib.load(f)
+            self.assertEqual(info["CFBundleExecutable"], "launch")
+            self.assertEqual(info["CFBundleIdentifier"], "local.eeg-denoise.training-gui")
+            self.assertIn("NSDesktopFolderUsageDescription", info)
+            if shutil.which("iconutil"):
+                self.assertTrue((app / "Contents" / "Resources" / "icon.icns").is_file())
+                self.assertEqual(info["CFBundleIconFile"], "icon")
+            # rebuilding replaces the previous bundle
+            build_app(Path(tmp))
+            self.assertIn("-m gui --native", launch.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
