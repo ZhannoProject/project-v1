@@ -17,7 +17,9 @@ from deploy.export_onnx import (export_checkpoint, infer_arch_from_state_dict,
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy"))
+import raspi_infer  # noqa: E402
 from raspi_infer import EEGDenoiser, StreamingDenoiser  # noqa: E402
+import metrics as torch_metrics  # noqa: E402
 
 
 def _checkpoint(tmp, variant, **kwargs):
@@ -90,6 +92,31 @@ class ExportOnnxTests(unittest.TestCase):
             online = np.concatenate([streamer.push(sig[i:i + 45]) for i in range(0, len(sig), 45)])
             np.testing.assert_array_equal(offline, online)
             np.testing.assert_array_equal(offline[:512], d.denoise_epochs(sig[:512]))
+
+    def test_numpy_metrics_match_torch(self):
+        rng = np.random.default_rng(0)
+        clean = 30.0 * rng.standard_normal((6, 512)).astype(np.float32)
+        pred = clean + 10.0 * rng.standard_normal((6, 512)).astype(np.float32)
+        got = raspi_infer.metrics(pred, clean)
+        p, c = torch.from_numpy(pred)[:, None, :], torch.from_numpy(clean)[:, None, :]
+        for key, fn in [("rrmse_t", torch_metrics.rrmse_temporal),
+                        ("rrmse_s", torch_metrics.rrmse_spectral), ("acc", torch_metrics.acc)]:
+            np.testing.assert_allclose(got[key], fn(p, c).numpy(), rtol=1e-5, atol=1e-6, err_msg=key)
+
+    def test_testdata_scoring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ckpt = _checkpoint(tmp, "tcn_mla", n_attn_layers=2, kv_lora_rank=8)
+            with contextlib.redirect_stdout(io.StringIO()):
+                export_checkpoint(ckpt, out_dir=tmp, name="m")
+            rng = np.random.default_rng(0)
+            clean = 30.0 * rng.standard_normal((20, 512)).astype(np.float32)
+            npz = Path(tmp) / "t.npz"
+            np.savez(npz, noisy=clean + 20.0 * rng.standard_normal(clean.shape).astype(np.float32),
+                     clean=clean, snr_db=np.tile(np.linspace(-7, 2, 10), 2).astype(np.float32), fs=256)
+            with contextlib.redirect_stdout(io.StringIO()):
+                r = raspi_infer.evaluate_testdata(EEGDenoiser(Path(tmp) / "m.onnx", n_threads=1), npz)
+            self.assertEqual(set(r), {"noisy input (no model)", "epoch mode", "stream mode (hop 32)"})
+            self.assertTrue(all(np.isfinite(list(m.values())).all() for m in r.values()))
 
 
 if __name__ == "__main__":

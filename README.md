@@ -70,7 +70,10 @@ In the sandwich design, the standard residual connection `x + Attn(LN(x))` lets 
 │   └── logger.py               # TensorBoard integration
 ├── deploy/
 │   ├── export_onnx.py          # checkpoint → verified ONNX (+ sidecar JSON) for Raspberry Pi 5
-│   ├── raspi_infer.py          # numpy + onnxruntime inference (epoch + causal streaming)
+│   ├── run_on_pi.sh            # one command: copy to the Pi over SSH, set up, benchmark, score
+│   ├── raspi_infer.py          # numpy + onnxruntime inference (epoch + causal streaming) + --testdata scoring
+│   ├── make_testdata.py        # cut a small raw-scale test set from the leak-free test split
+│   ├── testdata/EOG_test100.npz#   100 EOG test epochs, 10 per SNR level, ready for the Pi
 │   └── requirements-raspi.txt  # the only two packages the Pi needs
 ├── eval.py                     # 7-in-1 evaluation: metrics, curves, waveforms, heatmaps
 ├── metrics.py                  # RRMSE_temporal, RRMSE_spectral, ACC
@@ -232,7 +235,23 @@ Options: `--seq_len` bakes in a shorter window (≤ `max_seq_len`; attention is
 O(T²)), `--static_batch` fixes batch = 1, `--max_batches N` makes the metric
 check quick.
 
-### 2. Run on the Pi
+### 2. One-shot test over SSH
+
+With the Pi reachable by SSH, a single command from this machine copies the
+five files it needs, creates a venv there on first use, installs `numpy` +
+`onnxruntime`, and runs the benchmark plus the bundled test set:
+
+```bash
+deploy/run_on_pi.sh pi@raspberrypi.local
+```
+
+`deploy/run_on_pi.sh pi@192.168.1.42 tcn_eog` tests another exported model;
+`HOP=64 THREADS=3 deploy/run_on_pi.sh …` tunes the streaming hop and thread
+count. Re-runs reuse the venv and take a few seconds. The script refuses to
+start if the export or test set is missing and prints the command to create
+it.
+
+### 3. Manual steps on the Pi
 
 ```bash
 # on the Pi (64-bit Raspberry Pi OS, Python 3.11+)
@@ -244,11 +263,11 @@ python raspi_infer.py tcn_mla_eog.onnx --input rec.npy --output clean.npy --stre
 ```
 
 Only `raspi_infer.py`, `requirements-raspi.txt`, the `.onnx` and its `.json`
-need to be copied. From Python:
+need to be copied (plus a test `.npz`, see below). From Python:
 
 ```python
 from raspi_infer import EEGDenoiser, StreamingDenoiser
-d = EEGDenoiser("tcn_mla_eog.onnx")            # 4 threads = the Pi 5's 4 cores
+d = EEGDenoiser("tcn_mla_eog.onnx")            # 2 onnxruntime threads (measured best on a Pi 5)
 clean = d.denoise_epochs(noisy)                 # (N, 512) raw µV in, raw µV out
 clean = d.denoise_stream(recording, hop=32)     # any length, sample-aligned
 
@@ -266,8 +285,47 @@ one forward pass per hop (hop 32 at 256 Hz = 125 ms cadence); the first
 output appears once a full window (2 s) has been acquired. The push-based
 `StreamingDenoiser` is bit-identical to `denoise_stream`.
 
-On an Apple-silicon host a 512-sample window takes ~2 ms; the `--benchmark`
-flag prints the Pi's own numbers and the real-time headroom for the chosen hop.
+Measured on a Raspberry Pi 5 Model B (4 GB, Python 3.13, onnxruntime 1.30,
+ondemand governor) for the shipped 2-layer MLA model, one 512-sample window:
+
+| onnxruntime threads | median | p95 | max | headroom at hop 32 (125 ms) |
+|---|---|---|---|---|
+| 1 | 24.4 ms | 24.7 ms | 31.5 ms | 5.1× |
+| **2 (default)** | **18.2 ms** | **18.9 ms** | **19.2 ms** | **6.6×** |
+| 3 | 17.4 ms | 19.3 ms | 23.7 ms | 6.5× |
+| 4 | 20.0 ms | 29.7 ms | 40.1 ms | 4.2× |
+
+Two threads give the best tail latency; using all four cores contends with
+the OS and doubles the p95. The test-set metrics on the Pi are identical to
+the host (epoch mode RRMSE_t 0.4601 / RRMSE_s 0.4643 / ACC 0.8826). On an
+Apple-silicon host the same window takes ~2 ms. `--benchmark` prints the
+numbers for whatever board it runs on.
+
+### Ready-made test data for the Pi
+
+`deploy/testdata/EOG_test100.npz` (373 KB) holds 100 epochs cut from the
+project's own leak-free **test** split at raw scale — `noisy`, `clean`,
+`snr_db` — 10 epochs at each of the 10 SNR levels from −7 dB to +2 dB. Score
+it on the Pi with the same command you would use on the host:
+
+```bash
+python raspi_infer.py tcn_mla_eog.onnx --testdata EOG_test100.npz
+```
+
+This prints RRMSE_t / RRMSE_s / ACC for epoch mode, streaming mode, and the
+untouched noisy input as a baseline, plus a per-SNR table and timings. The
+metrics are numpy replicas of `metrics.py` (they agree to 2e-7), so host and
+Pi numbers are directly comparable. Reference for the shipped MLA model:
+epoch mode RRMSE_t 0.460 / RRMSE_s 0.464 / ACC 0.883 versus 1.41 / 4.91 /
+0.595 for the raw noisy input. The streaming row is a pessimistic bound —
+the epochs are independent 2-s segments, so every window straddles two
+unrelated signals — and is not what a continuous recording would give.
+
+To cut a different subset (other artifact, more epochs) on the host:
+
+```bash
+python -m deploy.make_testdata --data_dir data/EEGdenoisenet/data --artifact EMG --n 200
+```
 
 ### What the export does not do
 

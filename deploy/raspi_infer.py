@@ -4,6 +4,7 @@ numpy + onnxruntime.  Copy this file, the .onnx and its .json sidecar to the
 Pi; nothing else from the repo is needed.
 
     python raspi_infer.py tcn_mla_eog.onnx --benchmark
+    python raspi_infer.py tcn_mla_eog.onnx --testdata EOG_test100.npz
     python raspi_infer.py tcn_mla_eog.onnx --input noisy.npy --output clean.npy
     python raspi_infer.py tcn_mla_eog.onnx --input noisy.npy --output clean.npy --stream --hop 32
 
@@ -25,6 +26,12 @@ denoise_stream(x)   x is an arbitrarily long 1-D signal.  Because the network
 
 StreamingDenoiser   the same thing as an object you push chunks into, for a
                     live acquisition loop.
+
+--testdata          scores a .npz cut by deploy/make_testdata.py (noisy, clean,
+                    snr_db) with the EEGdenoiseNet metrics, in both epoch and
+                    streaming mode, next to the untouched noisy input as a
+                    baseline.  Running the same command on the host and on the
+                    Pi should give the same numbers.
 """
 
 from __future__ import annotations
@@ -41,10 +48,13 @@ EPS = 1e-8
 
 
 class EEGDenoiser:
-    def __init__(self, onnx_path: str | Path, n_threads: int = 4):
+    def __init__(self, onnx_path: str | Path, n_threads: int = 2):
         onnx_path = Path(onnx_path)
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = n_threads          # Pi 5 has 4 Cortex-A76 cores
+        # Measured on a Pi 5 (tcn_mla_eog, 512-sample window): 1 thread 24 ms,
+        # 2 threads 18 ms with a tight tail (p95 19 ms), 4 threads 20 ms median
+        # but p95 30 ms / max 40 ms from contending with the OS for every core.
+        opts.intra_op_num_threads = n_threads
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.sess = ort.InferenceSession(str(onnx_path), opts, providers=["CPUExecutionProvider"])
 
@@ -130,6 +140,73 @@ class StreamingDenoiser:
         return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
 
 
+# ============================================================
+# EEGdenoiseNet metrics (numpy replicas of metrics.py)
+# ============================================================
+def _rms(x):
+    return np.sqrt(np.mean(x ** 2, axis=-1) + 1e-12)
+
+
+def rrmse_temporal(pred, clean):
+    return _rms(pred - clean) / _rms(clean)
+
+
+def rrmse_spectral(pred, clean):
+    p = np.abs(np.fft.rfft(pred, axis=-1)) ** 2
+    c = np.abs(np.fft.rfft(clean, axis=-1)) ** 2
+    return _rms(p - c) / _rms(c)
+
+
+def acc(pred, clean):
+    pc = pred - pred.mean(axis=-1, keepdims=True)
+    cc = clean - clean.mean(axis=-1, keepdims=True)
+    cov = (pc * cc).mean(axis=-1)
+    return cov / (np.sqrt((pc ** 2).mean(axis=-1) * (cc ** 2).mean(axis=-1)) + 1e-12)
+
+
+def metrics(pred, clean):
+    """Per-epoch (N,) arrays for (N, T) inputs."""
+    pred, clean = np.asarray(pred, np.float32), np.asarray(clean, np.float32)
+    return {"rrmse_t": rrmse_temporal(pred, clean), "rrmse_s": rrmse_spectral(pred, clean),
+            "acc": acc(pred, clean)}
+
+
+def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_snr: bool = True) -> dict:
+    data = np.load(npz_path)
+    noisy, clean, snr = data["noisy"], data["clean"], data["snr_db"]
+    n, T = noisy.shape
+    if T != d.window:
+        raise ValueError(f"test data has {T}-sample epochs but the model window is {d.window}")
+
+    t0 = time.perf_counter()
+    y_epoch = d.denoise_epochs(noisy)
+    t_epoch = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    y_stream = d.denoise_stream(noisy.reshape(-1), hop).reshape(n, T)
+    t_stream = time.perf_counter() - t0
+
+    modes = {"noisy input (no model)": noisy, "epoch mode": y_epoch, f"stream mode (hop {hop})": y_stream}
+    results = {name: metrics(y, clean) for name, y in modes.items()}
+
+    print(f"[test] {Path(npz_path).name}: {n} epochs x {T} samples, SNR {snr.min():+.1f}..{snr.max():+.1f} dB")
+    print(f"       {'':<26s} {'RRMSE_t':>8s} {'RRMSE_s':>8s} {'ACC':>7s}")
+    for name, m in results.items():
+        print(f"       {name:<26s} {m['rrmse_t'].mean():8.4f} {m['rrmse_s'].mean():8.4f} {m['acc'].mean():7.4f}")
+    print(f"       epoch mode: {1e3 * t_epoch / n:.2f} ms/epoch (batched)   "
+          f"stream mode: {1e3 * t_stream / (n * T / hop):.2f} ms/hop, {t_stream:.2f} s for {n * T / d.sample_rate:.0f} s of signal")
+    print("       note: the stream row concatenates independent epochs, so every window straddles two unrelated "
+          "signals at different scales; it is a pessimistic bound, not what a continuous recording would give.")
+
+    if per_snr:
+        m = results["epoch mode"]
+        print(f"       per SNR (epoch mode):  {'SNR dB':>7s} {'n':>3s} {'RRMSE_t':>8s} {'RRMSE_s':>8s} {'ACC':>7s}")
+        for level in np.unique(np.round(snr, 2)):
+            sel = np.isclose(np.round(snr, 2), level)
+            print(f"       {'':<22s} {level:+7.1f} {sel.sum():3d} {m['rrmse_t'][sel].mean():8.4f} "
+                  f"{m['rrmse_s'][sel].mean():8.4f} {m['acc'][sel].mean():7.4f}")
+    return {name: {k: float(v.mean()) for k, v in m.items()} for name, m in results.items()}
+
+
 def benchmark(d: EEGDenoiser, n_iter: int = 200, hop: int = 32) -> dict:
     x = np.random.default_rng(0).standard_normal((1, 1, d.window), dtype=np.float32)
     for _ in range(20):
@@ -156,8 +233,9 @@ def main(argv=None):
     p.add_argument("--output", help=".npy to write the denoised result to")
     p.add_argument("--stream", action="store_true", help="treat --input as one continuous signal")
     p.add_argument("--hop", type=int, default=32, help="stream hop in samples (latency = hop / fs)")
-    p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--threads", type=int, default=2, help="onnxruntime intra-op threads (2 is best on a Pi 5)")
     p.add_argument("--benchmark", action="store_true")
+    p.add_argument("--testdata", help=".npz from deploy/make_testdata.py; prints benchmark metrics")
     a = p.parse_args(argv)
 
     d = EEGDenoiser(a.onnx, a.threads)
@@ -169,6 +247,9 @@ def main(argv=None):
         print(f"[bench] median {r['median_ms']} ms | p95 {r['p95_ms']} ms | max {r['max_ms']} ms per "
               f"{r['window']}-sample window;  hop {r['hop']} = {r['hop_budget_ms']} ms budget "
               f"-> {r['realtime_headroom_x']}x real-time headroom")
+
+    if a.testdata:
+        evaluate_testdata(d, a.testdata, a.hop)
 
     if a.input:
         x = np.load(a.input)
