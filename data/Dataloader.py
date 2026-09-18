@@ -243,6 +243,11 @@ def build_dataloaders(
     """
     Build train, val, and test DataLoaders that share the same master seed
     (and therefore enjoy guaranteed zero leakage at the epoch level).
+
+    The training shuffle draws from its own ``torch.Generator`` seeded with
+    ``master_seed``, not from torch's global RNG: batch order is then a
+    function of the seed alone and is identical across model variants,
+    regardless of how many random numbers their construction consumed.
     """
     # Enable pinned memory for faster host-to-device transfer when on GPU/MPS
     pin = torch.cuda.is_available() or torch.backends.mps.is_available()
@@ -256,10 +261,12 @@ def build_dataloaders(
             snr_range_db=snr_range_db,
             master_seed=master_seed,
         )
+        train = split == "train"
         return DataLoader(
             ds,
             batch_size=batch_size,
-            shuffle=(split == "train"),  # only training set is shuffled
+            shuffle=train,               # only training set is shuffled
+            generator=torch.Generator().manual_seed(master_seed) if train else None,
             pin_memory=pin,
         )
 

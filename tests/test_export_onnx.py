@@ -44,7 +44,9 @@ class ExportOnnxTests(unittest.TestCase):
         cases = [("tcn", {}), ("tcn_mha", {"n_attn_layers": 3}),
                  ("tcn_mla", {"kv_lora_rank": 2, "n_attn_layers": 2}),
                  ("tcn_mla_par", {"kv_lora_rank": 8}),
-                 ("tcn_mha", {"hidden_channels": 96, "bottleneck_ratio": 1 / 3})]
+                 ("tcn_mha", {"hidden_channels": 96, "bottleneck_ratio": 1 / 3}),
+                 ("tcn_mla", {"kv_lora_rank": 4, "skip_bottleneck_ratio": 0.5}),
+                 ("tcn_mha_par", {"skip_bottleneck_ratio": 0.25, "n_attn_layers": 2})]
         for variant, kw in cases:
             kw = {"hidden_channels": 64, **kw}
             sd = build_model(variant, **kw).state_dict()

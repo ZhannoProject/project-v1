@@ -24,8 +24,8 @@ Architecture resolution
 Older checkpoints (e.g. runs/tcn_mla_eog/best.pt) carry no ``model_config``
 and were trained with a kv_lora_rank that differs from the YAML preset.  The
 weights are the ground truth, so every shape-determined hyperparameter
-(hidden_channels, bottleneck_ratio, n_attn_layers, kv_lora_rank, max_seq_len,
-variant) is inferred from the state dict.  ``n_heads`` is the one setting that
+(hidden_channels, bottleneck_ratio, skip_bottleneck_ratio, n_attn_layers,
+kv_lora_rank, max_seq_len, variant) is inferred from the state dict.  ``n_heads`` is the one setting that
 leaves no trace in the weights: it comes from --n_heads, then the checkpoint's
 model_config, then --config, then the project default of 4.
 
@@ -114,6 +114,10 @@ def infer_arch_from_state_dict(sd: dict) -> dict:
         cfg["bottleneck_ratio"] = (attn_dim + 0.5) / hidden
     if is_mla:
         cfg["kv_lora_rank"] = int(sd[attn + "kv_down_proj.weight"].shape[0])
+    skip_w = "decoder.blocks.0.attn_skip.net.0.weight"        # (bottleneck_dim, d_model)
+    if skip_w in sd:                                          # optional BottleneckSkip
+        skip_dim, d_model = sd[skip_w].shape
+        cfg["skip_bottleneck_ratio"] = (skip_dim + 0.5) / d_model   # same truncation trick
     cfg["max_seq_len"] = int(sd[attn + "causal_mask"].shape[-1])
     return cfg
 

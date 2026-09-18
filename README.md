@@ -41,9 +41,19 @@ TCN_pt1 extracts local features with small dilations; the attention decoder mixe
 
 Both branches run side-by-side, then concatenate. This structurally prevents attention bypass — the head needs both branches.
 
-### Anti-collapse mechanism
+### Optional anti-collapse skip (`skip_bottleneck_ratio`)
 
-In the sandwich design, the standard residual connection `x + Attn(LN(x))` lets the optimizer bypass attention entirely. A **BottleneckSkip** replaces the identity skip with a lossy low-rank bottleneck, forcing the attention branch to carry fine-grained temporal information.
+In the sandwich design, the standard residual connection `x + Attn(LN(x))` lets the optimizer bypass attention entirely — the paper reports exactly this collapse on EMG. By default every model keeps that identity skip; the reference checkpoints and all reported results use it.
+
+Setting `skip_bottleneck_ratio` (e.g. `0.5`) swaps the identity skip around each attention block for a **BottleneckSkip** — a lossy `Linear → GELU → Linear` low-rank bottleneck — so the attention branch has to carry the fine-grained temporal information. It works with every attention variant, is recorded in the checkpoint's `model_config`, exports to ONNX, and is inferred from the weights for legacy checkpoints. It is an experiment switch, not a validated improvement.
+
+```bash
+python -m trainer --config configs/tcn_mla_eog_bskip.yaml                   # ready-made preset
+python -m trainer --config configs/tcn_mha_eog.yaml --skip_bottleneck_ratio 0.5 \
+       --save_dir runs/tcn_mha_eog_bskip                                    # any preset
+```
+
+Not to be confused with `bottleneck_ratio`, which is the channel squeeze between the TCN (H) and the attention decoder (H' = H × ratio).
 
 ## Project structure
 
@@ -54,10 +64,11 @@ In the sandwich design, the standard residual connection `x + Attn(LN(x))` lets 
 │   ├── tcn_mha_eog.yaml        #   TCN + MHA sandwich
 │   ├── tcn_mla_eog.yaml        #   TCN + MLA sandwich
 │   ├── mla_rank_sweep_eog.yaml #   KV rank sweep
+│   ├── tcn_mla_eog_bskip.yaml  #   MLA sandwich with the optional BottleneckSkip
 │   ├── tcn_{mha,mla}_bi_eog.yaml   # bidirectional teachers (non-causal)
 │   └── tcn_{mha,mla}_eog_kd.yaml   # causal students distilled from them
 ├── data/
-│   ├── Dataloader.py           # Leak-free train/val/test splits + SNR mixing
+│   ├── Dataloader.py           # Leak-free train/val/test splits + SNR mixing (seeded)
 │   └── EEGdenoisenet/data/     # .npy files (not in repo, see Data below)
 ├── models/
 │   ├── TCN_backbone.py         # CausalConv1d → ResidualBlock → CausalTCNBackbone
@@ -84,6 +95,7 @@ In the sandwich design, the standard residual connection `x + Attn(LN(x))` lets 
 │   ├── make_testdata.py        # cut a small raw-scale test set from the leak-free test split
 │   ├── testdata/EOG_test100.npz#   100 EOG test epochs, 10 per SNR level, ready for the Pi
 │   └── requirements-raspi.txt  # the only two packages the Pi needs
+├── utils/utils.py              # get_device(), seed_everything()
 ├── eval.py                     # 7-in-1 evaluation: metrics, curves, waveforms, heatmaps
 ├── metrics.py                  # RRMSE_temporal, RRMSE_spectral, ACC
 ├── reproduce.py                # Reproducibility smoke test (32 checks)
@@ -143,6 +155,17 @@ python -m trainer --config configs/mla_rank_sweep_eog.yaml --variant tcn_mla_r32
 Config priority: **CLI flag > YAML file > hardcoded defaults**.
 
 Checkpoints are saved to `runs/<variant>_<artifact>/` with `best.pt`, `last.pt`, and `history.json`.
+
+### Seeding
+
+`master_seed` (default 42, `--master_seed N` on the CLI) is the single seed for a run: the train/val/test split, artifact pairing and SNR draws (numpy), the training batch order (a dedicated `torch.Generator`, so it is identical across variants), and weight initialisation and dropout (`seed_everything` in `utils/utils.py`, which also switches cuDNN / `torch.use_deterministic_algorithms` to deterministic kernels).
+
+```bash
+python -m trainer --config configs/tcn_mla_eog.yaml --master_seed 1 --save_dir runs/tcn_mla_eog_s1
+python -m trainer --config configs/tcn_mla_eog.yaml --device cpu     # bit-exact repeats
+```
+
+Two runs of the same config give bit-identical checkpoints on CPU (verified) and on CUDA with the deterministic kernels; **Apple MPS is not deterministic even when seeded** (two runs drift at the 1e-4 level within one epoch), so the trainer prints a reminder and `--device cpu` (or `device: cpu` in the YAML / GUI) is the option for exact repeats. Results across different hardware or torch versions can still differ at floating-point level. Checkpoints produced before seeding was added were not seeded, so their run-to-run variance is unknown — re-run a config with a few seeds before reading small differences as real.
 
 ### Training GUI
 
@@ -472,7 +495,7 @@ python reproduce.py
 python reproduce.py --quick
 ```
 
-This runs **59 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future), losses, metrics, training, checkpointing, evaluation, and knowledge distillation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
+This runs **71 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future, and that the optional BottleneckSkip stays causal), seeding (same `master_seed` → same init and batch order), losses, metrics, training, checkpointing, evaluation, and knowledge distillation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
 
 The same script runs in GitHub Actions on every push — see the badge at the top.
 

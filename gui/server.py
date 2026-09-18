@@ -149,6 +149,7 @@ def meta() -> dict:
             "feature_losses": ["mse", "l1"],
             "tq_key_modes": ["prod", "mse"],
             "tq_train_modes": ["off", "ste"],
+            "devices": _device_choices(),
         },
         "datalists": {"checkpoints": [r["checkpoint"] for r in runs]},
         "configs": config_io.list_configs(),
@@ -164,6 +165,14 @@ def _device_name() -> str:
         return str(get_device())
     except Exception:            # torch missing or broken: the GUI still works
         return "unknown"
+
+
+def _device_choices() -> list[str]:
+    try:
+        from utils.utils import DEVICE_CHOICES
+        return list(DEVICE_CHOICES)
+    except Exception:
+        return ["auto", "cpu", "cuda", "mps"]
 
 
 class Handler(BaseHTTPRequestHandler):

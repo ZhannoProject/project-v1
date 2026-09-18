@@ -188,17 +188,20 @@ class TCNWithMHA(nn.Module):
           → TCN_pt2  [8, 16, 32]             → (B, H, T)   reconstruction
           → 1×1 CausalConv head              → (B, 1, T)   output
 
-    Topological collapse prevention
-    ────────────────────────────────
-    Without intervention, the attention decoder can be bypassed entirely:
-    inside each transformer block the identity skip ``x + Attn(LN(x))``
+    Topological collapse and the optional BottleneckSkip
+    ─────────────────────────────────────────────────────
+    Inside each transformer block the identity skip ``x + Attn(LN(x))``
     lets the optimizer keep x unchanged and drive Attn → 0, so the whole
-    sandwich collapses into a pure TCN.
+    sandwich can collapse into a pure TCN (observed on EMG, see the paper).
 
-    Setting ``bottleneck_ratio`` (e.g. 0.5) replaces the identity skip
-    with a low-rank bottleneck that intentionally discards high-frequency
-    detail, forcing the attention branch to become the primary source of
-    fine-grained temporal information.
+    ``skip_bottleneck_ratio`` (default None = identity skip, what every
+    reference checkpoint uses) replaces that skip with a low-rank
+    BottleneckSkip that intentionally discards high-frequency detail,
+    forcing the attention branch to carry fine-grained temporal
+    information.  It is an experiment switch, not a validated improvement.
+
+    ``bottleneck_ratio`` is a different knob: the CHANNEL squeeze between
+    the TCN (H channels) and the attention decoder (H' = H × ratio).
 
     The (B,C,T) ↔ (B,T,C) permutation for attention is handled
     INSIDE CausalTransformerDecoder — this forward() stays in (B,C,T).
@@ -214,6 +217,7 @@ class TCNWithMHA(nn.Module):
         max_seq_len: int = 512,
         dropout: float = 0.1,
         bottleneck_ratio: float = 0.5,
+        skip_bottleneck_ratio: float | None = None,
         causal: bool = True,
     ):
         super().__init__()
@@ -242,6 +246,7 @@ class TCNWithMHA(nn.Module):
             max_seq_len=max_seq_len,
             dropout=dropout,
             attention_type="mha",
+            skip_bottleneck_ratio=skip_bottleneck_ratio,
             causal=causal,
         )
 
@@ -303,6 +308,7 @@ class TCNWithMLA(nn.Module):
         dropout: float = 0.1,
         kv_lora_rank: int | None = None,    # default: hidden_channels // 4
         bottleneck_ratio: float = 0.5,
+        skip_bottleneck_ratio: float | None = None,
         causal: bool = True,
     ):
         super().__init__()
@@ -330,6 +336,7 @@ class TCNWithMLA(nn.Module):
             dropout=dropout,
             attention_type="mla",
             kv_lora_rank=kv_lora_rank,
+            skip_bottleneck_ratio=skip_bottleneck_ratio,
             causal=causal,
         )
 
@@ -386,6 +393,8 @@ class TCNParallelMHA(nn.Module):
     receives a concatenation of BOTH branches, so attention must produce
     useful features or the head loses half its input channels.  There is
     no residual path that lets TCN_pt2 compensate for a dead attention.
+    The per-block identity skip inside the decoder still exists;
+    ``skip_bottleneck_ratio`` swaps it for a BottleneckSkip here too.
 
     ``causal=False`` builds the bidirectional teacher (registry: ``tcn_mha_par_bi``).
     """
@@ -397,6 +406,7 @@ class TCNParallelMHA(nn.Module):
         n_attn_layers: int = 2,
         max_seq_len: int = 512,
         dropout: float = 0.1,
+        skip_bottleneck_ratio: float | None = None,
         causal: bool = True,
     ):
         super().__init__()
@@ -418,6 +428,7 @@ class TCNParallelMHA(nn.Module):
             max_seq_len=max_seq_len,
             dropout=dropout,
             attention_type="mha",
+            skip_bottleneck_ratio=skip_bottleneck_ratio,
             causal=causal,
         )
 
@@ -473,6 +484,7 @@ class TCNParallelMLA(nn.Module):
         max_seq_len: int = 512,
         dropout: float = 0.1,
         kv_lora_rank: int | None = None,
+        skip_bottleneck_ratio: float | None = None,
         causal: bool = True,
     ):
         super().__init__()
@@ -495,6 +507,7 @@ class TCNParallelMLA(nn.Module):
             dropout=dropout,
             attention_type="mla",
             kv_lora_rank=kv_lora_rank,
+            skip_bottleneck_ratio=skip_bottleneck_ratio,
             causal=causal,
         )
 
@@ -565,6 +578,7 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
         model = build_model("tcn_mha",     hidden_channels=64, n_heads=4)
         model = build_model("tcn_mla",     hidden_channels=64, kv_lora_rank=16)
         model = build_model("tcn_mla_r8",  hidden_channels=64)   # rank sweep
+        model = build_model("tcn_mla",     skip_bottleneck_ratio=0.5)  # BottleneckSkip on
 
     The Trainer and eval scripts only need this function.
     They never import TCNOnly / TCNWithMHA / TCNWithMLA directly.

@@ -16,6 +16,10 @@ What it verifies
   7. Metrics are sane (perfect-prediction sanity check)
   8. Bidirectional teachers see the future, and knowledge distillation
      (teacher → causal student) trains end-to-end
+  9. The optional BottleneckSkip (skip_bottleneck_ratio) builds, replaces
+     the identity skip, and keeps the model causal
+ 10. Seeding is deterministic: same master_seed → same weights, same
+     batch order
 
 If real EEGdenoiseNet data is present, it uses that.
 Otherwise, it synthesises small random .npy files so CI works without
@@ -46,11 +50,12 @@ from models.variants import build_model, VARIANT_REGISTRY, MLA_RANK_SWEEP, BIDIR
 from models.TCN_backbone import CausalTCNBackbone, CausalConv1d
 from models.AttentionBlocks.attention import (
     CausalMHA, CausalMLA, CausalTransformerBlock, CausalTransformerDecoder,
-    init_transformer_weights,
+    BottleneckSkip, init_transformer_weights,
 )
 from metrics import compute_all_metrics, rrmse_temporal, rrmse_spectral, acc
 from trainer.losses import build_loss
 from data.Dataloader import build_dataloaders, EEGDenoiseDataset
+from utils.utils import seed_everything
 
 DEVICE = torch.device("cpu")  # CI has no GPU; force CPU for determinism
 B, T = 4, 512
@@ -103,6 +108,23 @@ def test_model_builds():
         except Exception as e:
             report(f"{name:<16s} build + forward", False, str(e))
 
+    # Optional BottleneckSkip: off by default, a real module when requested
+    for name in ["tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
+        try:
+            plain = build_model(name, hidden_channels=64)
+            skip = build_model(name, hidden_channels=64, skip_bottleneck_ratio=0.5)
+            off_ok = all(isinstance(b.attn_skip, torch.nn.Identity) for b in plain.decoder.blocks)
+            on_ok = all(isinstance(b.attn_skip, BottleneckSkip) for b in skip.decoder.blocks)
+            skip.eval()
+            with torch.no_grad():
+                y = skip(x)
+            n_extra = sum(p.numel() for p in skip.parameters()) - sum(p.numel() for p in plain.parameters())
+            report(f"{name:<16s} skip_bottleneck_ratio", off_ok and on_ok and y.shape == x.shape,
+                   f"default=Identity, 0.5=BottleneckSkip (+{n_extra:,} params), "
+                   f"model_config={skip.model_config.get('skip_bottleneck_ratio')}")
+        except Exception as e:
+            report(f"{name:<16s} skip_bottleneck_ratio", False, str(e))
+
 
 # =====================================================================
 # 2. Causality verification
@@ -112,9 +134,12 @@ def test_causality():
     print("2. Causality verification")
     print("=" * 60)
 
-    for name in ["tcn", "tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
+    cases = [(name, {}) for name in ["tcn", "tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]]
+    cases += [(name, {"skip_bottleneck_ratio": 0.5}) for name in ["tcn_mha", "tcn_mla", "tcn_mla_par"]]
+    for name, kw in cases:
+        label = name + (" +skip" if kw else "")
         try:
-            model = build_model(name, hidden_channels=64)
+            model = build_model(name, hidden_channels=64, **kw)
             model.eval()
 
             x1 = torch.randn(B, 1, T)
@@ -131,12 +156,12 @@ def test_causality():
 
             causal = past_diff < 1e-5 and future_diff > 1e-3
             report(
-                f"{name:<16s} causality",
+                f"{label:<16s} causality",
                 causal,
                 f"past_diff={past_diff:.2e}, future_diff={future_diff:.2e}",
             )
         except Exception as e:
-            report(f"{name:<16s} causality", False, str(e))
+            report(f"{label:<16s} causality", False, str(e))
 
     # Bidirectional teachers: the same perturbation MUST leak into the past.
     # Causal models give an exact 0 (masked logits → softmax weight 0).
@@ -152,6 +177,38 @@ def test_causality():
             report(f"{name:<16s} sees the future", past_diff > 0, f"past_diff={past_diff:.2e}")
         except Exception as e:
             report(f"{name:<16s} sees the future", False, str(e))
+
+
+# =====================================================================
+# 2b. Seeding
+# =====================================================================
+def test_seeding():
+    print("\n" + "=" * 60)
+    print("2b. Seeding (same seed → same weights)")
+    print("=" * 60)
+
+    def build(seed):
+        seed_everything(seed)
+        m = build_model("tcn_mla", hidden_channels=32, kv_lora_rank=4)
+        return [p.detach().clone() for p in m.parameters()]
+
+    try:
+        a, b, c = build(123), build(123), build(124)
+        same = all(torch.equal(x, y) for x, y in zip(a, b))
+        differ = any(not torch.equal(x, y) for x, y in zip(a, c))
+        report("same master_seed → identical init", same)
+        report("different master_seed → different init", differ)
+    except Exception as e:
+        report("seeded model init", False, str(e))
+
+    try:
+        seed_everything(7)
+        r1 = torch.randn(8)
+        seed_everything(7)
+        r2 = torch.randn(8)
+        report("torch RNG reseeded", torch.equal(r1, r2))
+    except Exception as e:
+        report("torch RNG reseeded", False, str(e))
 
 
 # =====================================================================
@@ -246,6 +303,21 @@ def test_training_loop(tmpdir: str):
     except Exception as e:
         report("data loading", False, str(e))
         return None
+
+    # Batch order must depend on master_seed alone, not on the global RNG state
+    try:
+        torch.manual_seed(0)
+        first_a = next(iter(build_dataloaders(data_dir=data_dir, artifact_type="EOG",
+                                              batch_size=8, master_seed=42)[0]))["clean"]
+        torch.manual_seed(999)
+        first_b = next(iter(build_dataloaders(data_dir=data_dir, artifact_type="EOG",
+                                              batch_size=8, master_seed=42)[0]))["clean"]
+        first_c = next(iter(build_dataloaders(data_dir=data_dir, artifact_type="EOG",
+                                              batch_size=8, master_seed=43)[0]))["clean"]
+        report("batch order seeded by master_seed",
+               torch.equal(first_a, first_b) and not torch.equal(first_a, first_c))
+    except Exception as e:
+        report("batch order seeded by master_seed", False, str(e))
 
     # Build model
     variant = "tcn_mla"
@@ -543,6 +615,7 @@ def main():
     # Always run these (fast, no data needed)
     test_model_builds()
     test_causality()
+    test_seeding()
     test_losses()
     test_metrics()
     test_distillation()

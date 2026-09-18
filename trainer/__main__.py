@@ -27,6 +27,7 @@ from models.variants import build_model_from_config, VARIANT_REGISTRY, variant_i
 from configs import load_config, merge_cli_overrides
 from trainer.training import Trainer
 from trainer.distillation import KDTrainer, load_teacher
+from utils.utils import seed_everything, resolve_device, DEVICE_CHOICES
 
 DEFAULT_DATA_DIR = "./data/EEGdenoisenet/data/"
 
@@ -71,6 +72,16 @@ def main():
                         help="Channel squeeze ratio between TCN and attention "
                              "(e.g. 0.5 → attn_dim = hidden_channels * 0.5). "
                              "Default: 0.5 for sandwich MHA/MLA variants.")
+    parser.add_argument("--skip_bottleneck_ratio", type=float, default=None,
+                        help="Replace the identity skip around each attention block with a "
+                             "low-rank BottleneckSkip of this ratio (e.g. 0.5), so attention "
+                             "cannot be bypassed. Default: off (identity skip).")
+    parser.add_argument("--master_seed", type=int, default=None,
+                        help="Seed for data splits, SNR draws, weight init, dropout and "
+                             "batch order (default 42)")
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default=None,
+                        help="auto (default: cuda > mps > cpu). Use cpu for bit-exact "
+                             "reproducibility: MPS is not deterministic even when seeded.")
     parser.add_argument("--turboquant", action=argparse.BooleanOptionalAction, default=None,
                         help="Enable optional TurboQuant K/V quantization")
     parser.add_argument("--turboquant_bits", type=int, choices=range(2, 9), default=None)
@@ -127,9 +138,11 @@ def main():
     cfg.setdefault("finetune_lr",        5e-4)
     cfg.setdefault("loss_fn",            "mse")
     cfg.setdefault("bottleneck_ratio",  0.5)
+    cfg.setdefault("skip_bottleneck_ratio", None)
     cfg.setdefault("kv_lora_rank",      16)
     cfg.setdefault("snr_range_db",      [-7.0, 2.0])
     cfg.setdefault("master_seed",       42)
+    cfg.setdefault("device",            "auto")
     cfg.setdefault("teacher_ckpt",      None)
     cfg.setdefault("teacher_config",    None)
     cfg.setdefault("kd_alpha",          0.5)
@@ -152,6 +165,14 @@ def main():
               f"to teach a causal student. Continuing anyway.")
 
     print(f"[Config] {cfg}")
+
+    # One seed for everything: splits / SNR (numpy, inside the dataset), batch
+    # order (DataLoader generator), weight init and dropout (torch global RNG).
+    seed_everything(cfg["master_seed"])
+    device = resolve_device(cfg["device"])
+    print(f"[Seed] master_seed = {cfg['master_seed']}  device = {device}"
+          + ("  (MPS is not bit-deterministic; use --device cpu for exact repeats)"
+             if device.type == "mps" else ""))
 
     # Data
     train_loader, val_loader, test_loader = build_dataloaders(
@@ -180,6 +201,7 @@ def main():
         eta_min=cfg["eta_min"],
         use_tensorboard=cfg["tensorboard"],
         loss_fn=cfg["loss_fn"],
+        device=device,
     )
     if distil:
         teacher = load_teacher(cfg["teacher_ckpt"], cfg["teacher_config"])

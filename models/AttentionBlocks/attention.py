@@ -350,16 +350,19 @@ class CausalTransformerBlock(nn.Module):
     """
     Pre-LayerNorm Transformer block with injectable attention.
 
-    Structure (default, bottleneck_ratio=None — same as minGPT):
+    Structure (default, skip_bottleneck_ratio=None — same as minGPT):
         x  →  LN  →  Attention  →  (+x)  →  LN  →  FFN  →  (+x)  →  out
 
-    Structure (with bottleneck skip):
+    Structure (with skip_bottleneck_ratio set):
         x  →  LN  →  Attention  ──┐
         x  →  BottleneckSkip  ────┘(+)  →  LN  →  FFN  →  (+x)  →  out
 
     The bottleneck deliberately discards high-frequency detail in the
     skip path, forcing the attention branch to become the primary source
-    of fine-grained temporal information.
+    of fine-grained temporal information.  It is OFF by default: the
+    identity skip is what the reference checkpoints and the paper's
+    results use.  ``skip_bottleneck_ratio`` is distinct from the channel
+    ``bottleneck_ratio`` of the sandwich models (H → H' before attention).
 
     The `attention` argument can be CausalMHA, CausalMLA, or any
     future variant — as long as its forward is (B,T,C) → (B,T,C).
@@ -373,7 +376,7 @@ class CausalTransformerBlock(nn.Module):
         attention: nn.Module,
         d_model: int,
         dropout: float = 0.1,
-        bottleneck_ratio: float | None = None,
+        skip_bottleneck_ratio: float | None = None,
     ):
         super().__init__()
 
@@ -385,8 +388,8 @@ class CausalTransformerBlock(nn.Module):
         self.attn = attention
 
         # Attention skip path: identity (standard) or bottleneck
-        if bottleneck_ratio is not None:
-            self.attn_skip = BottleneckSkip(d_model, bottleneck_ratio)
+        if skip_bottleneck_ratio is not None:
+            self.attn_skip = BottleneckSkip(d_model, skip_bottleneck_ratio)
         else:
             self.attn_skip = nn.Identity()
 
@@ -435,12 +438,13 @@ class CausalTransformerDecoder(nn.Module):
         dropout: float = 0.1,
         attention_type: str = "mha",        # "mha" or "mla"
         kv_lora_rank: int | None = None,    # only used when attention_type="mla"
-        bottleneck_ratio: float | None = None,  # if set, compress the attention skip path
+        skip_bottleneck_ratio: float | None = None,  # if set, BottleneckSkip on the attention residual
         causal: bool = True,                # False → bidirectional (teacher) attention
     ):
         super().__init__()
         self.attention_type = attention_type
         self.causal = causal
+        self.skip_bottleneck_ratio = skip_bottleneck_ratio
 
         def _build_attention() -> nn.Module:
             """Factory: create one attention instance based on attention_type."""
@@ -460,7 +464,7 @@ class CausalTransformerDecoder(nn.Module):
                 attention=_build_attention(),
                 d_model=d_model,
                 dropout=dropout,
-                bottleneck_ratio=bottleneck_ratio,
+                skip_bottleneck_ratio=skip_bottleneck_ratio,
             )
             for _ in range(n_layers)
         ])
@@ -492,9 +496,12 @@ def init_transformer_weights(module: nn.Module, n_layers: int = 2):
     - Residual-path projections (out_proj, ffn second linear) :
       N(0, 0.02 / sqrt(2 * n_layers))  — GPT-2 scaled init
     - LayerNorm       : bias=0, weight=1
+    - BottleneckSkip  : left at PyTorch's default init.  It replaces the
+      identity on the residual stream; N(0, 0.02) would zero that stream
+      at init and starve every block of its input.
     """
     for name, param in module.named_parameters():
-        if param.dim() < 2:
+        if param.dim() < 2 or ".attn_skip." in name:
             continue
 
         # Residual-path projections get scaled init for stable deep residual streams
@@ -502,11 +509,11 @@ def init_transformer_weights(module: nn.Module, n_layers: int = 2):
         std = 0.02 / math.sqrt(2 * n_layers) if is_residual_proj else 0.02
         nn.init.normal_(param, mean=0.0, std=std)
 
-    for m in module.modules():
+    for name, m in module.named_modules():
         if isinstance(m, nn.LayerNorm):
             nn.init.zeros_(m.bias)
             nn.init.ones_(m.weight)
-        elif isinstance(m, nn.Linear) and m.bias is not None:
+        elif isinstance(m, nn.Linear) and m.bias is not None and ".attn_skip." not in name:
             nn.init.zeros_(m.bias)
 
 
@@ -571,6 +578,17 @@ if __name__ == "__main__":
     # Test both variants
     mha_params = test_variant("mha")
     mla_params = test_variant("mla", kv_lora_rank=16)
+
+    # Optional BottleneckSkip: must build, stay causal, and actually replace the identity
+    print(f"\n{'='*50}")
+    print("Testing: optional BottleneckSkip (skip_bottleneck_ratio=0.5)")
+    print(f"{'='*50}")
+    for attention_type in ("mha", "mla"):
+        n_skip = test_variant(attention_type, skip_bottleneck_ratio=0.5)
+        dec = CausalTransformerDecoder(d_model=C, n_heads=4, n_layers=2,
+                                       attention_type=attention_type, skip_bottleneck_ratio=0.5)
+        assert all(isinstance(b.attn_skip, BottleneckSkip) for b in dec.blocks)
+        print(f"{attention_type.upper()} + skip: {n_skip:,} params, attn_skip = BottleneckSkip")
 
     # ---- Bidirectional (teacher) mode: perturbing the future MUST change the past ----
     print(f"\n{'='*50}")
