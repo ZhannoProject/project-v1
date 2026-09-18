@@ -101,14 +101,16 @@ def main():
                              "(default 0 = off)")
     parser.add_argument("--kd_feature_layers", nargs="+", default=None,
                         help="Submodules whose outputs are matched, e.g. decoder decoder.blocks.0 "
-                             "(default: decoder)")
+                             "(default: decoder). student:teacher pairs map different depths, "
+                             "e.g. decoder.blocks.1:decoder.blocks.9")
     parser.add_argument("--kd_output_loss", type=str, default=None,
                         choices=["mse", "l1", "stft", "l2_combined", "l1_combined"],
                         help="Loss between student and teacher outputs (default: same as --loss_fn)")
     parser.add_argument("--kd_feature_loss", type=str, default=None, choices=["mse", "l1"],
                         help="Loss between student and teacher features (default: mse)")
     parser.add_argument("--init_from_teacher", action="store_true", default=None,
-                        help="Initialise the student from the teacher's weights before training")
+                        help="Initialise the student from the teacher's weights before training "
+                             "(a smaller student receives the leading slice of each tensor)")
     args = parser.parse_args()
 
     # --- Build effective config: YAML defaults -> CLI overrides ---

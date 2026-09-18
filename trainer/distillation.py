@@ -34,6 +34,32 @@ Three terms
 have identical state dicts, the student can also be *initialised* from
 the teacher (``init_from_teacher``), which usually gives a head start.
 
+Compressing the student (optional)
+----------------------------------
+The student does not have to be the teacher's twin.  Its size comes from
+its own model keys (``hidden_channels``, ``n_attn_layers``, ``kv_lora_rank``,
+``bottleneck_ratio``, even the variant), so a KD preset can distil a
+64-channel / 10-layer teacher into a 32-channel / 2-layer student.  The
+three loss terms then work as follows:
+
+  task, output   unchanged — both models emit (B, 1, T)
+  feature        a learnable ``FeatureProjector`` (a FitNets regressor:
+                 one Linear along the mismatched channel axis, pointwise in
+                 time and therefore causal) maps each student feature to
+                 the teacher's width.  Projectors are trained with the
+                 student and discarded afterwards — they are not part of
+                 the checkpoint.  Depth mismatch is handled by naming pairs
+                 in ``kd_feature_layers``: ``decoder.blocks.1:decoder.blocks.9``
+                 taps student block 1 against teacher block 9.
+  init_from_teacher
+                 same-name tensors of different shape receive the teacher's
+                 leading slice (weight inheritance: the first C_s of C_t
+                 channels, the first n of N blocks); everything else keeps
+                 its random init.
+
+With identical sizes nothing changes: every projector is the identity and
+every tensor copies exactly.
+
 Usage
 -----
     # 1. train the teacher (any *_bi preset)
@@ -72,6 +98,7 @@ from torch.utils.data import DataLoader
 from models.variants import build_model_from_config, variant_is_causal
 from trainer.training import Trainer
 from trainer.losses import build_loss
+from utils.utils import get_device
 
 
 # ============================================================
@@ -134,20 +161,40 @@ def load_teacher(
 
 def init_student_from_teacher(student: nn.Module, teacher: nn.Module) -> Tuple[int, int]:
     """
-    Copy every teacher tensor whose name and shape exist in the student.
+    Copy every teacher tensor whose name exists in the student.
 
-    For a ``tcn_mla_bi`` → ``tcn_mla`` pair this is the whole state dict
-    (the causal mask is a buffer with identical contents in both).
-    Returns (n_copied, n_skipped).
+    Same shape → copied whole.  For a ``tcn_mla_bi`` → ``tcn_mla`` pair this
+    is the entire state dict (the causal mask is a buffer with identical
+    contents in both).
+
+    Different shape, same rank (a narrower or shallower student) → the
+    overlapping leading block is copied, e.g. the first C_s of the teacher's
+    C_t channels; the rest of the student tensor keeps its random init.
+    Tensors the student lacks (deeper teacher blocks) and tensors the teacher
+    lacks are skipped.  Returns (n_copied, n_skipped), where copied counts
+    both exact and sliced tensors.
     """
     t_sd = teacher.state_dict()
     s_sd = student.state_dict()
-    compatible = {k: v for k, v in t_sd.items()
-                  if k in s_sd and s_sd[k].shape == v.shape}
-    student.load_state_dict(compatible, strict=False)
-    n_copied, n_skipped = len(compatible), len(s_sd) - len(compatible)
-    print(f"[KD] Student initialised from teacher: {n_copied} tensors copied, "
-          f"{n_skipped} left at random init")
+    new_sd, n_exact, n_sliced = {}, 0, 0
+    for k, s_t in s_sd.items():
+        t_t = t_sd.get(k)
+        if t_t is None or t_t.dim() != s_t.dim():
+            continue
+        if t_t.shape == s_t.shape:
+            new_sd[k] = t_t
+            n_exact += 1
+        else:
+            block = tuple(slice(0, min(a, b)) for a, b in zip(t_t.shape, s_t.shape))
+            merged = s_t.clone()
+            merged[block] = t_t[block].to(merged.dtype)
+            new_sd[k] = merged
+            n_sliced += 1
+    student.load_state_dict(new_sd, strict=False)
+    n_copied, n_skipped = n_exact + n_sliced, len(s_sd) - len(new_sd)
+    print(f"[KD] Student initialised from teacher: {n_exact} tensors copied"
+          + (f", {n_sliced} copied as a leading slice (student is a different size)" if n_sliced else "")
+          + f", {n_skipped} left at random init")
     return n_copied, n_skipped
 
 
@@ -192,6 +239,86 @@ class FeatureTap:
         for h in self._handles:
             h.remove()
         self._handles = []
+
+
+def parse_feature_layers(layer_names: Sequence[str]) -> list:
+    """
+    ``["decoder", "decoder.blocks.1:decoder.blocks.9"]`` →
+    ``[("decoder", "decoder", "decoder"),
+       ("decoder.blocks.1:decoder.blocks.9", "decoder.blocks.1", "decoder.blocks.9")]``
+
+    Each entry is ``student_path[:teacher_path]``; the label (first element)
+    is the raw entry and keys the logged features.
+    """
+    pairs = []
+    for entry in layer_names:
+        student_name, _, teacher_name = str(entry).partition(":")
+        student_name, teacher_name = student_name.strip(), teacher_name.strip()
+        if not student_name:
+            raise ValueError(f"kd_feature_layers: empty student path in {entry!r}")
+        pairs.append((str(entry), student_name, teacher_name or student_name))
+    return pairs
+
+
+class FeatureProjector(nn.Module):
+    """
+    Map a student feature onto the teacher's shape (a FitNets regressor).
+
+    Shapes must have the same rank and differ in at most one non-batch axis;
+    a single ``Linear`` acts along that axis and nothing mixes along the
+    others, so a (B, C, T) or (B, T, C) feature stays causal in T.  With
+    identical shapes it is the identity and owns no parameters.
+    """
+
+    def __init__(self, student_shape: Sequence[int], teacher_shape: Sequence[int]):
+        super().__init__()
+        student_shape, teacher_shape = tuple(student_shape), tuple(teacher_shape)
+        if len(student_shape) != len(teacher_shape):
+            raise ValueError(f"feature rank mismatch: student {student_shape} vs teacher {teacher_shape}")
+        diff = [i for i in range(1, len(student_shape)) if student_shape[i] != teacher_shape[i]]
+        if len(diff) > 1:
+            raise ValueError(
+                f"features differ in more than one axis: student {student_shape} vs teacher "
+                f"{teacher_shape}; a projector can only bridge a channel-width difference"
+            )
+        self.axis = diff[0] if diff else None
+        self.proj = nn.Linear(student_shape[self.axis], teacher_shape[self.axis]) if diff else None
+        self.student_shape, self.teacher_shape = student_shape[1:], teacher_shape[1:]
+
+    @property
+    def is_identity(self) -> bool:
+        return self.proj is None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.proj is None:
+            return x
+        return self.proj(x.movedim(self.axis, -1)).movedim(-1, self.axis)
+
+    def extra_repr(self) -> str:
+        return "identity" if self.proj is None else \
+            f"axis={self.axis}, {self.student_shape} -> {self.teacher_shape}"
+
+
+@torch.no_grad()
+def probe_feature_shapes(student: nn.Module, teacher: nn.Module, pairs, seq_len: int) -> dict:
+    """
+    One dry forward of each model on a zero window → ``{label: (student_shape,
+    teacher_shape)}`` for the tapped submodules (batch axis excluded).
+    """
+    dev = next(student.parameters()).device
+    x = torch.zeros(1, 1, seq_len, device=dev)
+    s_tap = FeatureTap(student, [s for _, s, _ in pairs])
+    t_tap = FeatureTap(teacher, [t for _, _, t in pairs])
+    was_training = student.training
+    try:
+        student.eval()(x)
+        teacher(x.to(next(teacher.parameters()).device))
+    finally:
+        student.train(was_training)
+        s_tap.remove()
+        t_tap.remove()
+    return {label: (tuple(s_tap.features[s].shape[1:]), tuple(t_tap.features[t].shape[1:]))
+            for label, s, t in pairs}
 
 
 # ============================================================
@@ -252,8 +379,8 @@ class DistillationLoss(nn.Module):
                 if s_feat.shape != t_feat.shape:
                     raise ValueError(
                         f"feature '{name}': student {tuple(s_feat.shape)} vs teacher "
-                        f"{tuple(t_feat.shape)} — feature KD needs matching shapes "
-                        f"(same hidden_channels / bottleneck_ratio / topology)"
+                        f"{tuple(t_feat.shape)} — shapes must match after projection "
+                        f"(KDTrainer builds a FeatureProjector for a channel-width difference)"
                     )
                 per_layer.append(self.feature_loss(s_feat, t_feat.detach()))
             feature = torch.stack(per_layer).mean()
@@ -274,6 +401,13 @@ class KDTrainer(Trainer):
     checkpointing, LR schedule, staged_fit.  The student is validated on
     the clean signal (not the teacher), so ``best.pt`` is picked by real
     denoising quality.
+
+    The student may be smaller than the teacher.  When the feature term is
+    on, one ``FeatureProjector`` per tapped layer is built from a dry
+    forward (identity when the shapes already agree) and trained with the
+    student through the optimizer's ``extra`` group; ``kd_feature_layers``
+    entries may be ``student_path:teacher_path`` pairs.  Projectors are
+    never written to the checkpoint.
     """
 
     def __init__(
@@ -295,6 +429,22 @@ class KDTrainer(Trainer):
         if init_from_teacher:
             init_student_from_teacher(model, teacher)
 
+        # Feature taps and projectors are only needed when the feature term is active.
+        # They must exist before super().__init__ builds the optimizer (see _extra_trainable).
+        self._pairs = parse_feature_layers(kd_feature_layers) if kd_feature_weight > 0.0 else []
+        self._projectors: Dict[str, FeatureProjector] = {}
+        self.kd_projectors = nn.ModuleList()          # the non-identity ones, for parameters()
+        if self._pairs:
+            seq_len = int(getattr(model, "model_config", {}).get("max_seq_len", 512))
+            shapes = probe_feature_shapes(model, teacher, self._pairs, seq_len)
+            for label, (s_shape, t_shape) in shapes.items():
+                proj = FeatureProjector((1, *s_shape), (1, *t_shape))
+                self._projectors[label] = proj
+                if not proj.is_identity:
+                    self.kd_projectors.append(proj)
+            device = trainer_kwargs.get("device") or get_device()
+            self.kd_projectors.to(device)
+
         super().__init__(model=model, train_loader=train_loader, val_loader=val_loader,
                          loss_fn=loss_fn, **trainer_kwargs)
 
@@ -302,23 +452,37 @@ class KDTrainer(Trainer):
         for p in self.teacher.parameters():
             p.requires_grad_(False)
 
+        n_student = sum(p.numel() for p in self.model.parameters())
+        n_teacher = sum(p.numel() for p in self.teacher.parameters())
+        print(f"[KD] Student {n_student:,} params / teacher {n_teacher:,} "
+              f"({n_student / n_teacher:.1%} of the teacher"
+              + (", same size" if n_student == n_teacher else f", {n_teacher / n_student:.2f}x smaller")
+              + ")")
+
         output_loss = build_loss(kd_output_loss or loss_fn).to(self.device)
         self.kd_criterion = DistillationLoss(
             task_loss=self.criterion, output_loss=output_loss,
             alpha=kd_alpha, feature_weight=kd_feature_weight, feature_loss=kd_feature_loss,
         ).to(self.device)
 
-        # Feature taps are only installed when the feature term is active
-        layers = tuple(kd_feature_layers) if kd_feature_weight > 0.0 else ()
-        self._student_tap = FeatureTap(self.model, layers) if layers else None
-        self._teacher_tap = FeatureTap(self.teacher, layers) if layers else None
+        pairs = self._pairs
+        self._student_tap = FeatureTap(self.model, [s for _, s, _ in pairs]) if pairs else None
+        self._teacher_tap = FeatureTap(self.teacher, [t for _, _, t in pairs]) if pairs else None
 
         print(f"[KD] alpha={kd_alpha} (teacher output) / {1 - kd_alpha:g} (ground truth), "
               f"output_loss={kd_output_loss or loss_fn}, feature_weight={kd_feature_weight}"
-              + (f" on {list(layers)} ({kd_feature_loss})" if layers else ""))
+              + (f" on {[label for label, _, _ in pairs]} ({kd_feature_loss})" if pairs else ""))
+        for label, proj in self._projectors.items():
+            if not proj.is_identity:
+                n = sum(p.numel() for p in proj.parameters())
+                print(f"[KD] Feature projector for '{label}': {proj.extra_repr()}  ({n:,} params, not saved)")
 
         for key in ("kd_task", "kd_output", "kd_feature"):
             self.history[key] = []
+        self.history["student"] = {
+            "variant": self.model.model_config.get("variant") if hasattr(self.model, "model_config") else None,
+            "n_params": n_student,
+        }
 
         # Teacher reference on the same validation split (once, up front)
         print("[KD] Teacher on the validation split:")
@@ -326,8 +490,24 @@ class KDTrainer(Trainer):
         self.history["teacher"] = {
             "checkpoint": teacher_ckpt,
             "variant": teacher.model_config.get("variant") if hasattr(teacher, "model_config") else None,
+            "n_params": n_teacher,
             "val_loss": t_loss, **t_metrics,
         }
+
+    def _extra_trainable(self):
+        return list(self.kd_projectors.parameters())
+
+    def _student_features(self) -> Optional[Dict[str, torch.Tensor]]:
+        """Tapped student features, projected onto the teacher's shapes, keyed by label."""
+        if not self._student_tap:
+            return None
+        return {label: self._projectors[label](self._student_tap.features[s])
+                for label, s, _ in self._pairs}
+
+    def _teacher_features(self) -> Optional[Dict[str, torch.Tensor]]:
+        if not self._teacher_tap:
+            return None
+        return {label: self._teacher_tap.features[t] for label, _, t in self._pairs}
 
     def _train_one_epoch(self, epoch: int):
         """One pass over the training set with the distillation loss."""
@@ -344,10 +524,10 @@ class KDTrainer(Trainer):
             # Teacher sees the same window with future context; no gradient
             with torch.no_grad():
                 teacher_out = self.teacher(noisy)
-            teacher_feats = dict(self._teacher_tap.features) if self._teacher_tap else None
+            teacher_feats = self._teacher_features()
 
             pred = self.model(noisy)
-            student_feats = dict(self._student_tap.features) if self._student_tap else None
+            student_feats = self._student_features()
 
             loss, parts = self.kd_criterion(pred, teacher_out, clean, student_feats, teacher_feats)
 

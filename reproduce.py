@@ -15,7 +15,8 @@ What it verifies
   6. Per-SNR evaluation pipeline runs and produces valid metrics
   7. Metrics are sane (perfect-prediction sanity check)
   8. Bidirectional teachers see the future, and knowledge distillation
-     (teacher → causal student) trains end-to-end
+     (teacher → causal student) trains end-to-end, including a smaller
+     student with feature projectors
   9. The optional BottleneckSkip (skip_bottleneck_ratio) builds, replaces
      the identity skip, and keeps the model causal
  10. Seeding is deterministic: same master_seed → same weights, same
@@ -566,6 +567,31 @@ def test_kd_training_loop(tmpdir: str, data_dir: str):
                f"past_diff={past_diff:.2e}, variant={ckpt['model_config']['variant']}")
     except Exception as e:
         report("distilled student is causal", False, str(e))
+
+    # Optional compression: a narrower, shallower student with feature KD through projectors
+    small_dir = os.path.join(tmpdir, "runs", "kd_student_small")
+    try:
+        small_kw = dict(hidden_channels=16, bottleneck_ratio=0.5, kv_lora_rank=2, n_attn_layers=1)
+        kd = KDTrainer(
+            model=build_model("tcn_mla", **small_kw), teacher=teacher,
+            train_loader=train_loader, val_loader=val_loader,
+            kd_alpha=0.5, kd_feature_weight=0.1,
+            kd_feature_layers=["decoder", "decoder.blocks.0:decoder.blocks.1"],
+            init_from_teacher=True,
+            save_dir=small_dir, learning_rate=1e-3, max_epochs=1,
+            log_every=999, device=DEVICE, loss_fn="mse",
+        )
+        kd.fit()
+        n_s, n_t = kd.history["student"]["n_params"], kd.history["teacher"]["n_params"]
+        ckpt = torch.load(os.path.join(small_dir, "best.pt"), map_location="cpu", weights_only=False)
+        rebuilt = build_model("tcn_mla", **small_kw)
+        rebuilt.load_state_dict(ckpt["model_state"], strict=True)     # no projector keys
+        ok = n_s < n_t and len(kd.kd_projectors) == 2 and ckpt["model_config"]["hidden_channels"] == 16
+        report("KD compressed student", ok,
+               f"student {n_s:,} / teacher {n_t:,} params ({n_t / n_s:.1f}x smaller), "
+               f"{len(kd.kd_projectors)} feature projectors, checkpoint clean")
+    except Exception as e:
+        report("KD compressed student", False, str(e))
 
 
 # =====================================================================

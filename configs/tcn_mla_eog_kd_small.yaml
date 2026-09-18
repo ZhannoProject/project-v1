@@ -1,0 +1,64 @@
+# ============================================================
+# KD student, COMPRESSED — 32-channel causal TCN + MLA distilled from the
+# 64-channel bidirectional teacher (42.6k vs 166.6k params, 3.9x smaller)
+#
+# Train the teacher first:
+#     python -m trainer --config configs/tcn_mla_bi_eog.yaml
+# then this preset:
+#     python -m trainer --config configs/tcn_mla_eog_kd_small.yaml
+#
+# Same recipe as tcn_mla_eog_kd.yaml, but the student's model keys are
+# halved. The feature term then trains a small projector (32 -> 64
+# channels on the decoder output, discarded after training) and
+# init_from_teacher copies the leading 32 channels of every teacher
+# tensor. Compare against a 32-channel student trained without KD
+# (this preset with teacher_ckpt: null) to see what the teacher adds.
+# ============================================================
+
+# --- Model (student) ---
+variant: "tcn_mla"
+hidden_channels: 32          # teacher: 64
+n_heads: 4
+n_attn_layers: 2
+max_seq_len: 512
+kv_lora_rank: 8              # teacher: 16 (attn_dim 16 -> rank 8 keeps the 2x KV compression)
+
+# --- Knowledge distillation (see trainer/distillation.py) ---
+teacher_ckpt: "./runs/tcn_mla_bi_eog/best.pt"
+kd_alpha: 0.5                # 0.5 * loss(student, teacher) + 0.5 * loss(student, clean)
+kd_feature_weight: 0.1       # + 0.1 * MSE(proj(student.decoder), teacher.decoder); 0 disables
+kd_feature_layers: ["decoder"]   # student:teacher pairs for different depths, e.g. decoder.blocks.1:decoder.blocks.9
+kd_output_loss: null         # null → same as loss_fn
+kd_feature_loss: "mse"
+init_from_teacher: true      # leading 32 of the teacher's 64 channels
+
+# --- Data ---
+artifact: "EOG"
+data_dir: "./data/EEGdenoisenet/data/"
+batch_size: 32
+snr_range_db: [-7.0, 2.0]
+master_seed: 42
+
+# --- Training ---
+learning_rate: 5.0e-4
+attn_lr_scale: 3.0           # attention gets 3x base LR
+weight_decay: 0.0
+max_epochs: 100
+log_every: 20
+
+# --- Scheduler (CosineAnnealing + linear warmup) ---
+sched_warmup_epochs: 5
+eta_min: 1.0e-6
+
+# --- Staged training (two-phase) ---
+staged: false
+warmup_epochs: 20
+warmup_lr: 1.0e-3
+finetune_lr: 5.0e-4
+
+# --- Loss function ---
+loss_fn: "l1_combined"              # "l1_combined", "l2_combined", "mse", "l1", or "stft"
+
+# --- Output ---
+save_dir: "./runs/tcn_mla_eog_kd_small"
+tensorboard: false

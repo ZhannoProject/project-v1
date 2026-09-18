@@ -66,7 +66,8 @@ Not to be confused with `bottleneck_ratio`, which is the channel squeeze between
 │   ├── mla_rank_sweep_eog.yaml #   KV rank sweep
 │   ├── tcn_mla_eog_bskip.yaml  #   MLA sandwich with the optional BottleneckSkip
 │   ├── tcn_{mha,mla}_bi_eog.yaml   # bidirectional teachers (non-causal)
-│   └── tcn_{mha,mla}_eog_kd.yaml   # causal students distilled from them
+│   ├── tcn_{mha,mla}_eog_kd.yaml   # causal students distilled from them (same size)
+│   └── tcn_mla_eog_kd_small.yaml   # a 32-channel student distilled from the 64-channel teacher
 ├── data/
 │   ├── Dataloader.py           # Leak-free train/val/test splits + SNR mixing (seeded)
 │   └── EEGdenoisenet/data/     # .npy files (not in repo, see Data below)
@@ -78,7 +79,7 @@ Not to be confused with `bottleneck_ratio`, which is the channel squeeze between
 ├── trainer/
 │   ├── __main__.py             # CLI entry point: python -m trainer
 │   ├── training.py             # Trainer class (fit / staged_fit)
-│   ├── distillation.py         # KDTrainer + DistillationLoss: bidirectional teacher → causal student
+│   ├── distillation.py         # KDTrainer + DistillationLoss: bidirectional teacher → causal student (optionally smaller)
 │   ├── optimizer.py            # Per-component LR groups, freeze/unfreeze
 │   ├── losses.py               # MSE, L1, STFT, L1+STFT, L2+STFT
 │   ├── checkpoint.py           # Save/load checkpoints + history
@@ -293,6 +294,38 @@ python -m trainer --config configs/tcn_mha_eog.yaml \
 presets use α = 0.5, β = 0.1 and `init_from_teacher: true` as starting points —
 they are experiment choices, not validated optima. `--staged` works with KD.
 
+#### Compressing the student (optional)
+
+By default the student is the teacher's causal twin — same size, only the
+attention mask differs — so KD transfers *hindsight*, not capacity. The
+student can also be **smaller**: its size comes from its own model keys
+(`hidden_channels`, `n_attn_layers`, `kv_lora_rank`, `bottleneck_ratio`,
+even the variant), so a KD preset simply stops mirroring the teacher.
+`configs/tcn_mla_eog_kd_small.yaml` distils the 64-channel teacher into a
+32-channel student (42.6k vs 166.6k params, 3.9× smaller):
+
+```bash
+python -m trainer --config configs/tcn_mla_bi_eog.yaml            # teacher, 64 ch
+python -m trainer --config configs/tcn_mla_eog_kd_small.yaml      # student, 32 ch
+# or shrink any KD run from the CLI
+python -m trainer --config configs/tcn_mla_eog_kd.yaml --hidden_channels 32 \
+       --kv_lora_rank 8 --save_dir runs/tcn_mla_eog_kd_32
+```
+
+What changes when the sizes differ:
+
+| Term | Behaviour with a smaller student |
+|------|----------------------------------|
+| output (α) | Unchanged — both models emit `(B, 1, T)` |
+| feature (β) | A learnable **projector** (one `Linear` along the channel axis, pointwise in time, hence causal) maps each tapped student feature to the teacher's width. It is trained with the student in its own optimizer group (also through `--staged`) and is **not** saved in the checkpoint. Depth mismatch: name `student:teacher` pairs, e.g. `kd_feature_layers: ["decoder", "decoder.blocks.1:decoder.blocks.9"]` |
+| `init_from_teacher` | Same-name tensors of different shape receive the teacher's **leading slice** (first C_s of C_t channels, first n of N blocks); the rest keeps its random init. The log reports how many tensors were copied whole, sliced, or skipped |
+
+The trainer prints the student/teacher parameter ratio, and `history.json`
+records both under `student` and `teacher`. `best.pt` is an ordinary
+student checkpoint (its `model_config` is the small architecture), so
+`eval.py` and the ONNX exporter need nothing extra. The natural control is
+the same small architecture trained without KD (`teacher_ckpt: null`).
+
 The student is validated and checkpointed exactly like a normal run (against
 the clean signal), so `runs/tcn_mla_eog_kd/best.pt` is a drop-in for `eval.py`
 and `deploy/export_onnx.py`. Its `history.json` additionally records the
@@ -495,7 +528,7 @@ python reproduce.py
 python reproduce.py --quick
 ```
 
-This runs **71 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future, and that the optional BottleneckSkip stays causal), seeding (same `master_seed` → same init and batch order), losses, metrics, training, checkpointing, evaluation, and knowledge distillation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
+This runs **73 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future, and that the optional BottleneckSkip stays causal), seeding (same `master_seed` → same init and batch order), losses, metrics, training, checkpointing, evaluation, and knowledge distillation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
 
 The same script runs in GitHub Actions on every push — see the badge at the top.
 
@@ -571,5 +604,6 @@ checks packing, quantization error, QJL averaging, disabled compatibility,
 
 `python -m unittest discover -s tests -p 'test_distillation.py'` covers the
 bidirectional attention flag, teacher/student state-dict compatibility, the
-distillation loss terms, teacher loading, the export refusal, and a full
-`KDTrainer` run.
+distillation loss terms, teacher loading, the export refusal, a full
+`KDTrainer` run, and the compressed-student path (sliced initialisation,
+feature projectors, `student:teacher` layer pairs, clean checkpoints).

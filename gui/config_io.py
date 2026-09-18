@@ -135,12 +135,13 @@ SCHEMA: List[Section] = [
         Field("kd_feature_weight", "float", 0.0, min=0.0, step=0.05, show_if="kd",
               help="Weight of MSE(student features, teacher features); 0 = off"),
         Field("kd_feature_layers", "list_str", ["decoder"], show_if="kd",
-              help="Submodules to match, comma-separated (e.g. decoder, decoder.blocks.0)"),
+              help="Submodules to match, comma-separated; student:teacher pairs for different depths "
+                   "(e.g. decoder, decoder.blocks.1:decoder.blocks.9)"),
         Field("kd_output_loss", "select", None, choices="losses", nullable=True, show_if="kd",
               help="Loss vs teacher output; empty → same as loss_fn"),
         Field("kd_feature_loss", "select", "mse", choices="feature_losses", show_if="kd"),
         Field("init_from_teacher", "bool", False, show_if="kd",
-              help="Copy the teacher's weights into the student first"),
+              help="Copy the teacher's weights into the student first (leading slice if the student is smaller)"),
     ]),
 ]
 

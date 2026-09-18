@@ -21,6 +21,7 @@ def build_param_groups(
     base_lr: float,
     attn_lr_scale: float,
     weight_decay: float,
+    extra_params=None,
 ):
     """
     Split model parameters into optimizer groups with different learning rates.
@@ -31,7 +32,19 @@ def build_param_groups(
       - 'attn' : the decoder                    -> lr = base_lr * attn_lr_scale
 
     Otherwise returns a single group with base_lr for all parameters.
+
+    ``extra_params`` are trainable tensors that live outside the model but
+    must be optimised alongside it (the KD feature projectors); they form
+    a third group 'extra' at base_lr.
     """
+    groups = _model_param_groups(model, base_lr, attn_lr_scale, weight_decay)
+    extra = [p for p in (extra_params or []) if p.requires_grad]
+    if extra:
+        groups.append({"params": extra, "lr": base_lr, "weight_decay": weight_decay, "name": "extra"})
+    return groups
+
+
+def _model_param_groups(model, base_lr, attn_lr_scale, weight_decay):
     if hasattr(model, "decoder") and attn_lr_scale != 1.0:
         decoder_ids = {id(p) for p in model.decoder.parameters()}
         tcn_params = [p for p in model.parameters() if id(p) not in decoder_ids]
@@ -65,6 +78,7 @@ def build_optimizer_and_scheduler(
     max_epochs: int,
     warmup_epochs: int = 5,
     eta_min: float = 1e-6,
+    extra_params=None,
 ):
     """
     Create a fresh AdamW optimizer + CosineAnnealingLR with linear warmup.
@@ -87,7 +101,7 @@ def build_optimizer_and_scheduler(
     eta_min : float
         Minimum learning rate at the end of cosine decay.
     """
-    param_groups = build_param_groups(model, lr, attn_lr_scale, weight_decay)
+    param_groups = build_param_groups(model, lr, attn_lr_scale, weight_decay, extra_params)
     optimizer = torch.optim.AdamW(param_groups)
 
     # Guard against edge cases

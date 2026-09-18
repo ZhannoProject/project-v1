@@ -68,8 +68,7 @@ class Trainer:
         self.log_every = log_every
 
         # Build AdamW + CosineAnnealingLR with linear warmup
-        self.optimizer, self.scheduler = build_optimizer_and_scheduler(
-            model,
+        self.optimizer, self.scheduler = self._build_optimizer(
             lr=learning_rate,
             attn_lr_scale=attn_lr_scale,
             weight_decay=weight_decay,
@@ -88,6 +87,15 @@ class Trainer:
 
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"[Trainer] Trainable params: {n_params:,}")
+
+    def _extra_trainable(self):
+        """Trainable tensors outside ``self.model`` (none here; KDTrainer adds its projectors)."""
+        return []
+
+    def _build_optimizer(self, **kwargs):
+        """Fresh optimizer + scheduler over the model and ``_extra_trainable()``."""
+        return build_optimizer_and_scheduler(
+            self.model, extra_params=self._extra_trainable(), **kwargs)
 
     # ------------------------------------------------------------------
     # Core loops
@@ -271,8 +279,8 @@ class Trainer:
         print(f"Phase 1: TCN warm-up ({warmup_epochs} epochs)")
         print(f"{'='*60}")
         freeze_decoder(self.model)
-        self.optimizer, self.scheduler = build_optimizer_and_scheduler(
-            self.model, lr=warmup_lr, attn_lr_scale=1.0,
+        self.optimizer, self.scheduler = self._build_optimizer(
+            lr=warmup_lr, attn_lr_scale=1.0,
             weight_decay=weight_decay,
             max_epochs=warmup_epochs,
             warmup_epochs=min(sched_warmup_epochs, warmup_epochs // 2),
@@ -285,8 +293,8 @@ class Trainer:
         print(f"Phase 2: Joint fine-tuning ({phase2_epochs} epochs)")
         print(f"{'='*60}")
         unfreeze_all(self.model)
-        self.optimizer, self.scheduler = build_optimizer_and_scheduler(
-            self.model, lr=finetune_lr, attn_lr_scale=attn_lr_scale,
+        self.optimizer, self.scheduler = self._build_optimizer(
+            lr=finetune_lr, attn_lr_scale=attn_lr_scale,
             weight_decay=weight_decay,
             max_epochs=phase2_epochs,
             warmup_epochs=sched_warmup_epochs,

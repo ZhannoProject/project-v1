@@ -13,8 +13,9 @@ from models.AttentionBlocks.attention import CausalMHA, CausalMLA, CausalTransfo
 from models.variants import (BIDIRECTIONAL_VARIANTS, build_model, build_model_from_config,
                              variant_is_causal)
 from trainer.checkpoint import save_checkpoint
-from trainer.distillation import (DistillationLoss, FeatureTap, KDTrainer,
-                                  init_student_from_teacher, load_teacher)
+from trainer.distillation import (DistillationLoss, FeatureProjector, FeatureTap, KDTrainer,
+                                  init_student_from_teacher, load_teacher,
+                                  parse_feature_layers, probe_feature_shapes)
 from trainer.losses import build_loss
 
 T = 128
@@ -159,7 +160,7 @@ class DistillationLossTests(unittest.TestCase):
 
     def test_feature_shape_mismatch_is_reported(self):
         crit = DistillationLoss(build_loss("mse"), build_loss("mse"), feature_weight=1.0)
-        with self.assertRaisesRegex(ValueError, "matching shapes"):
+        with self.assertRaisesRegex(ValueError, "shapes must match"):
             crit(self.s, self.t, self.c, {"decoder": torch.zeros(2, 8, T)},
                  {"decoder": torch.zeros(2, 16, T)})
         with self.assertRaisesRegex(ValueError, "no features"):
@@ -272,6 +273,91 @@ class TeacherStudentTests(unittest.TestCase):
             self.assertIsNone(kd._student_tap)
             kd.fit()
             self.assertEqual(kd.history["kd_feature"], [0.0])
+
+
+class CompressedStudentTests(unittest.TestCase):
+    """The student may be narrower / shallower than the teacher."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.teacher = _small("tcn_mla_bi", hidden_channels=32, n_attn_layers=3, kv_lora_rank=4).eval()
+        self.student = _small("tcn_mla", hidden_channels=16, n_attn_layers=2, kv_lora_rank=2)
+        self.loader = DataLoader(_SyntheticEEG(), batch_size=8, shuffle=True)
+
+    def test_parse_feature_layers(self):
+        self.assertEqual(parse_feature_layers(["decoder", " decoder.blocks.0 : decoder.blocks.2 "]),
+                         [("decoder", "decoder", "decoder"),
+                          (" decoder.blocks.0 : decoder.blocks.2 ", "decoder.blocks.0", "decoder.blocks.2")])
+        with self.assertRaisesRegex(ValueError, "empty student path"):
+            parse_feature_layers([":decoder"])
+
+    def test_init_from_teacher_copies_leading_slices(self):
+        n_copied, n_skipped = init_student_from_teacher(self.student, self.teacher)
+        self.assertEqual(n_skipped, 0)                 # every student tensor has a teacher twin
+        s_sd, t_sd = self.student.state_dict(), self.teacher.state_dict()
+        k = "tcn_pt1.network.0.conv_block.0.conv.weight"        # (H, 1, 3): H differs
+        self.assertTrue(torch.equal(s_sd[k], t_sd[k][:16]))
+        k = "decoder.blocks.1.attn.q_proj.weight"                # (d, d): both axes differ
+        self.assertTrue(torch.equal(s_sd[k], t_sd[k][:8, :8]))
+        self.assertNotIn("decoder.blocks.2.attn.q_proj.weight", s_sd)   # deeper teacher block skipped
+
+    def test_projector_bridges_channel_axis_and_stays_causal(self):
+        pairs = parse_feature_layers(["decoder", "decoder.blocks.0:decoder.blocks.2"])
+        shapes = probe_feature_shapes(self.student, self.teacher, pairs, T)
+        self.assertEqual(shapes["decoder"], ((8, T), (16, T)))                      # (B, C, T) tap
+        self.assertEqual(shapes["decoder.blocks.0:decoder.blocks.2"], ((T, 8), (T, 16)))  # (B, T, C) tap
+        for label, (s_shape, t_shape) in shapes.items():
+            proj = FeatureProjector((1, *s_shape), (1, *t_shape))
+            self.assertFalse(proj.is_identity)
+            x = torch.randn(2, *s_shape)
+            self.assertEqual(tuple(proj(x).shape), (2, *t_shape))
+            # pointwise in time: perturbing t only changes output at t
+            t_axis = s_shape.index(T)
+            x2 = x.clone()
+            x2.select(t_axis + 1, T // 2).add_(10.0)
+            delta = (proj(x) - proj(x2)).abs().sum(dim=[d for d in range(3) if d != t_axis + 1])
+            self.assertEqual((delta > 0).nonzero().flatten().tolist(), [T // 2])
+        self.assertTrue(FeatureProjector((1, 8, T), (1, 8, T)).is_identity)
+        with self.assertRaisesRegex(ValueError, "more than one axis"):
+            FeatureProjector((1, 8, T), (1, 16, T // 2))
+
+    def test_kd_trainer_trains_a_smaller_student(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            kd = KDTrainer(model=self.student, teacher=self.teacher, train_loader=self.loader,
+                           val_loader=self.loader, kd_alpha=0.5, kd_feature_weight=0.1,
+                           kd_feature_layers=["decoder", "decoder.blocks.0:decoder.blocks.2"],
+                           init_from_teacher=True, save_dir=tmp, max_epochs=2, log_every=999,
+                           device=torch.device("cpu"), loss_fn="mse")
+            self.assertEqual(len(kd.kd_projectors), 2)
+            proj_ids = {id(p) for p in kd.kd_projectors.parameters()}
+            in_opt = {id(p) for g in kd.optimizer.param_groups for p in g["params"]}
+            self.assertTrue(proj_ids <= in_opt, "projector params must be optimised")
+            before = [p.detach().clone() for p in kd.kd_projectors.parameters()]
+            kd.staged_fit(warmup_epochs=1, sched_warmup_epochs=0)       # rebuilds the optimizer twice
+            in_opt = {id(p) for g in kd.optimizer.param_groups for p in g["params"]}
+            self.assertTrue(proj_ids <= in_opt, "projectors must survive the staged rebuild")
+            self.assertTrue(any(not torch.equal(a, b) for a, b in
+                                zip(before, kd.kd_projectors.parameters())), "projectors did not train")
+            self.assertEqual(len(kd.history["kd_feature"]), 2)
+            self.assertEqual(kd.history["student"]["n_params"],
+                             sum(p.numel() for p in self.student.parameters()))
+            self.assertLess(kd.history["student"]["n_params"], kd.history["teacher"]["n_params"])
+            ckpt = torch.load(Path(tmp) / "best.pt", map_location="cpu", weights_only=False)
+            self.assertEqual(ckpt["model_config"]["hidden_channels"], 16)
+            self.assertEqual(set(ckpt["model_state"]), set(self.student.state_dict()))
+            rebuilt = build_model_from_config(ckpt["model_config"])
+            rebuilt.load_state_dict(ckpt["model_state"], strict=True)   # no projector keys leaked
+        self.assertLess(_past_diff(self.student), 1e-5)
+
+    def test_same_size_student_gets_identity_projectors(self):
+        twin = _small("tcn_mla", hidden_channels=32, n_attn_layers=3, kv_lora_rank=4)
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            kd = KDTrainer(model=twin, teacher=self.teacher, train_loader=self.loader,
+                           val_loader=self.loader, kd_feature_weight=0.1, save_dir=tmp,
+                           max_epochs=1, log_every=999, device=torch.device("cpu"), loss_fn="mse")
+            self.assertEqual(len(kd.kd_projectors), 0)
+            self.assertTrue(kd._projectors["decoder"].is_identity)
+            self.assertEqual([g["name"] for g in kd.optimizer.param_groups], ["all"])
 
 
 if __name__ == "__main__":
