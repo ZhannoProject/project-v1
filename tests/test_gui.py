@@ -308,9 +308,13 @@ class NativeAndBundleTests(unittest.TestCase):
             self.assertEqual(app.name, "EEG Training GUI.app")
             launch = app / "Contents" / "MacOS" / "launch"
             self.assertTrue(launch.stat().st_mode & 0o111)
-            text = launch.read_text()
-            self.assertIn("cd '/proj/ect'", text)
-            self.assertIn("exec '/venv/bin/python' -m gui --native", text)
+            cfg = (app / "Contents" / "Resources" / "launch.cfg").read_text()
+            self.assertEqual(cfg, "root=/proj/ect\npython=/venv/bin/python\n")
+            if shutil.which("cc"):
+                self.assertTrue(launch.read_bytes()[:4] in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"),
+                                "expected a Mach-O launcher when a compiler is available")
+            else:
+                self.assertIn("exec '/venv/bin/python' -m gui --native", launch.read_text())
             with open(app / "Contents" / "Info.plist", "rb") as f:
                 info = plistlib.load(f)
             self.assertEqual(info["CFBundleExecutable"], "launch")
@@ -321,7 +325,7 @@ class NativeAndBundleTests(unittest.TestCase):
                 self.assertEqual(info["CFBundleIconFile"], "icon")
             # rebuilding replaces the previous bundle
             build_app(Path(tmp))
-            self.assertIn("-m gui --native", launch.read_text())
+            self.assertIn("root=", (app / "Contents" / "Resources" / "launch.cfg").read_text())
 
 
 if __name__ == "__main__":

@@ -157,13 +157,20 @@ python -m gui --browser           # serve http://127.0.0.1:8765/ and open a brow
 python -m gui.make_app            # macOS: build a double-clickable "EEG Training GUI.app"
 ```
 
-`make_app` writes a thin launcher bundle (with icon) into the project root
-that runs *this* venv's Python with `-m gui --native`, so it always uses the
-current code; rebuild it if you move the project or the venv. On first launch
-macOS asks for access to the folder that holds the project (Desktop /
-Documents) — allow it. The bundle is git-ignored; its output goes to
-`~/Library/Logs/eeg-training-gui.log`. Closing the window stops the server
-(and asks first if a training run is still going).
+`make_app` writes a launcher bundle (with icon) into the project root that
+runs *this* venv's Python with `-m gui --native`, so it always uses the
+current code; the paths live in `Contents/Resources/launch.cfg`, so rebuild
+(or edit that file) if you move the project or the venv. The launcher is
+`gui/launcher.c` compiled with the system `cc` (Xcode Command Line Tools):
+it has to be a real binary that keeps Python as a child process, because
+macOS attributes Desktop/Documents folder permissions to the launched app —
+a script that `exec`'d Python would hand that identity away and the venv
+would be unreadable without any prompt. On first launch macOS asks for
+access to the folder that holds the project — allow it (System Settings ›
+Privacy & Security › Files and Folders if you need to change it later).
+Failures show an alert pointing at `~/Library/Logs/eeg-training-gui.log`.
+The bundle is git-ignored. Closing the window stops the server (and asks
+first if a training run is still going).
 
 - **Form ↔ YAML.** Every key of `trainer/__main__.py` is a field, grouped as in
   the preset files (Model, Data, Training, Scheduler, Staged, Loss, Output,
