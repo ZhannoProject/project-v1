@@ -567,6 +567,34 @@ def variant_is_causal(variant: str) -> bool:
     return not variant.endswith(BIDIRECTIONAL_SUFFIX)
 
 
+def pinned_kwargs(variant: str) -> dict:
+    """
+    Constructor arguments that the variant NAME itself fixes.
+
+    ``tcn_mla_r8`` pins ``kv_lora_rank=8``; every ``*_bi`` twin pins
+    ``causal=False``; the five base variants pin nothing.  These are the
+    registry's ``functools.partial`` keywords, and they are authoritative:
+    a caller must not be able to override them, or a checkpoint saved as
+    ``tcn_mla_r8`` could silently hold a rank-16 model.
+    """
+    entry = VARIANT_REGISTRY[variant]
+    return dict(entry.keywords) if isinstance(entry, partial) else {}
+
+
+def base_variant(variant: str) -> str:
+    """
+    The architecture behind a variant name: ``tcn_mla_r8`` and ``tcn_mla_bi``
+    are both ``tcn_mla``; a base name maps to itself.  Aliases share the
+    base's class and state-dict layout, so anything that identifies a model
+    from its weights (deploy/export_onnx.py) can only ever recover the base.
+    """
+    if variant not in VARIANT_REGISTRY:
+        raise ValueError(f"Unknown variant '{variant}'. Available: {list(VARIANT_REGISTRY.keys())}")
+    entry = VARIANT_REGISTRY[variant]
+    cls = entry.func if isinstance(entry, partial) else entry   # nested partials flatten
+    return next(name for name, e in VARIANT_REGISTRY.items() if e is cls)
+
+
 def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
                 turboquant_key_mode="prod", turboquant_train_mode="off",
                 turboquant_seed=42, **kwargs) -> nn.Module:
@@ -582,6 +610,10 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
 
     The Trainer and eval scripts only need this function.
     They never import TCNOnly / TCNWithMHA / TCNWithMLA directly.
+
+    Anything the variant name pins (``kv_lora_rank`` for ``tcn_mla_r{N}``,
+    ``causal`` for ``*_bi``) cannot be overridden: passing a different value
+    raises rather than silently building a model that its name misdescribes.
     """
     if variant not in VARIANT_REGISTRY:
         raise ValueError(
@@ -596,11 +628,23 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
         raise ValueError(
             f"causal={kwargs['causal']} contradicts variant '{variant}'; use '{want}' instead"
         )
+    # Same rule for the rank aliases.  functools.partial lets a call-time kwarg
+    # override its keywords, so without this check build_model("tcn_mla_r8",
+    # kv_lora_rank=16) would quietly return a rank-16 model.
+    pinned = pinned_kwargs(variant)
+    for key, value in pinned.items():
+        if key in kwargs and kwargs[key] != value:
+            raise ValueError(
+                f"{key}={kwargs[key]} contradicts variant '{variant}' (which fixes {key}={value}); "
+                f"drop {key} or use the generic variant with {key}={kwargs[key]}"
+            )
     from models.AttentionBlocks.turboquant import attach_turboquant
     model = VARIANT_REGISTRY[variant](**kwargs)
     attach_turboquant(model, turboquant, turboquant_bits, turboquant_key_mode,
                      turboquant_train_mode, turboquant_seed)
-    model.model_config = dict(variant=variant, **kwargs, turboquant=turboquant,
+    # Record the pinned values too, so the checkpoint states its rank / causality
+    # explicitly instead of leaving eval, export and the GUI to decode the name.
+    model.model_config = dict(variant=variant, **{**pinned, **kwargs}, turboquant=turboquant,
                               turboquant_bits=turboquant_bits,
                               turboquant_key_mode=turboquant_key_mode,
                               turboquant_train_mode=turboquant_train_mode,
@@ -694,12 +738,25 @@ if __name__ == "__main__":
 
 
 def build_model_from_config(config):
-    """Forward supported architecture and quantization options from a run config."""
+    """
+    Forward supported architecture and quantization options from a run config.
+
+    Run configs are layered (trainer defaults < YAML < CLI < checkpoint
+    ``model_config``) and routinely carry a generic ``kv_lora_rank`` meant for
+    ``tcn_mla``.  For a rank alias such as ``tcn_mla_r8`` the name wins: the
+    config value is dropped (with a note if it differed) instead of being
+    forwarded, which is what used to turn every sweep run into rank 16.
+    """
     import inspect
     variant = config.get("variant", "tcn_mla")
     signature = inspect.signature(VARIANT_REGISTRY[variant])
     kwargs = {key: value for key, value in config.items()
               if key in signature.parameters and value is not None}
+    for key, value in pinned_kwargs(variant).items():
+        if key in kwargs and kwargs[key] != value:
+            print(f"[build_model] variant '{variant}' fixes {key}={value}; "
+                  f"ignoring {key}={kwargs[key]} from the config")
+        kwargs.pop(key, None)
     for key in ("turboquant", "turboquant_bits", "turboquant_key_mode",
                 "turboquant_train_mode", "turboquant_seed"):
         if key in config:

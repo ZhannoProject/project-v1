@@ -513,7 +513,7 @@ python -m deploy.make_testdata --data_dir data/EEGdenoisenet/data --artifact EMG
   MLA is therefore not exercised by this deployment path.
 
 Validation: `python -m unittest discover -s tests -p 'test_export_onnx.py'`
-covers architecture inference (including legacy checkpoints), export,
+covers architecture inference (including legacy checkpoints and `tcn_mla_r{N}` labels), export,
 agreement, causality, and the Pi-side epoch/streaming contract.
 
 ## Reproducibility
@@ -528,7 +528,7 @@ python reproduce.py
 python reproduce.py --quick
 ```
 
-This runs **73 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future, and that the optional BottleneckSkip stays causal), seeding (same `master_seed` → same init and batch order), losses, metrics, training, checkpointing, evaluation, and knowledge distillation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
+This runs **78 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future, and that the optional BottleneckSkip stays causal), seeding (same `master_seed` → same init and batch order), losses, metrics, training, checkpointing, evaluation, and knowledge distillation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
 
 The same script runs in GitHub Actions on every push — see the badge at the top.
 

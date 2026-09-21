@@ -68,6 +68,25 @@ class ExportOnnxTests(unittest.TestCase):
             with torch.no_grad():
                 self.assertTrue(torch.allclose(model.eval()(x), loaded(x)))
 
+    def test_rank_alias_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # A tcn_mla_r4 checkpoint has tcn_mla's weight layout; it must load, keep
+            # its own label, and the rank the label promises must match the weights.
+            model, ckpt = _checkpoint(tmp, "tcn_mla_r4", n_attn_layers=2)
+            loaded, arch, _ = load_checkpoint_model(ckpt)
+            self.assertEqual((arch["variant"], arch["kv_lora_rank"]), ("tcn_mla_r4", 4))
+            x = torch.randn(2, 1, 512)
+            with torch.no_grad():
+                self.assertTrue(torch.allclose(model.eval()(x), loaded(x)))
+
+            # What the old rank-sweep bug produced: labelled r8, weights rank 16.
+            _, bad = _checkpoint(tmp, "tcn_mla", kv_lora_rank=16)
+            raw = torch.load(bad, map_location="cpu", weights_only=False)
+            raw["model_config"]["variant"] = "tcn_mla_r8"
+            torch.save(raw, bad)
+            with self.assertRaisesRegex(ValueError, "labelled 'tcn_mla_r8'.*kv_lora_rank=8.*imply kv_lora_rank=16"):
+                load_checkpoint_model(bad)
+
     def test_mla_2layer_export_verify_and_pi_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             model, ckpt = _checkpoint(tmp, "tcn_mla", n_attn_layers=2, kv_lora_rank=8)

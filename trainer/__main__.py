@@ -23,7 +23,8 @@ project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 
 from data.Dataloader import build_dataloaders
-from models.variants import build_model_from_config, VARIANT_REGISTRY, variant_is_causal
+from models.variants import (build_model_from_config, VARIANT_REGISTRY, variant_is_causal,
+                             pinned_kwargs)
 from configs import load_config, merge_cli_overrides
 from trainer.training import Trainer
 from trainer.distillation import KDTrainer, load_teacher
@@ -67,7 +68,8 @@ def main():
                         choices=["mse", "l1", "stft", "l2_combined", "l1_combined"],
                         help="Loss function: 'l1_combined' (default), 'l2_combined', 'mse', 'l1', or 'stft'")
     parser.add_argument("--kv_lora_rank", type=int, default=None,
-                        help="KV low-rank bottleneck dim for MLA variants (default: attn_dim // 4)")
+                        help="KV low-rank bottleneck dim for MLA variants (default 16). "
+                             "Ignored for the tcn_mla_r{N} aliases, which fix the rank themselves.")
     parser.add_argument("--bottleneck_ratio", type=float, default=None,
                         help="Channel squeeze ratio between TCN and attention "
                              "(e.g. 0.5 → attn_dim = hidden_channels * 0.5). "
@@ -157,6 +159,15 @@ def main():
     cfg.setdefault("n_attn_layers", 2)
     if type(cfg["n_attn_layers"]) is not int or cfg["n_attn_layers"] < 1:
         parser.error("n_attn_layers must be a positive integer")
+
+    # A rank alias (tcn_mla_r8 → kv_lora_rank=8) outranks the generic
+    # kv_lora_rank that the YAML / the default above carry for tcn_mla, so the
+    # printed config, the checkpoint and the model built from it all agree.
+    for key, value in pinned_kwargs(cfg["variant"]).items():
+        if cfg.get(key) not in (None, value):
+            print(f"[Config] variant '{cfg['variant']}' fixes {key}={value}; "
+                  f"overriding {key}={cfg[key]}")
+        cfg[key] = value
 
     distil = cfg["teacher_ckpt"] is not None
     if cfg.get("save_dir") is None:

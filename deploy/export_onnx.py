@@ -27,7 +27,10 @@ weights are the ground truth, so every shape-determined hyperparameter
 (hidden_channels, bottleneck_ratio, skip_bottleneck_ratio, n_attn_layers,
 kv_lora_rank, max_seq_len, variant) is inferred from the state dict.  ``n_heads`` is the one setting that
 leaves no trace in the weights: it comes from --n_heads, then the checkpoint's
-model_config, then --config, then the project default of 4.
+model_config, then --config, then the project default of 4.  A rank alias
+(tcn_mla_r4) has the same weights layout as tcn_mla; its checkpoint is accepted
+when the rank its name promises matches the weights, and the alias is kept as
+the ``variant`` in the sidecar.
 
 Deployment contract (also written to the sidecar JSON)
 ------------------------------------------------------
@@ -61,7 +64,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.variants import build_model, variant_is_causal  # noqa: E402
+from models.variants import build_model, variant_is_causal, base_variant, pinned_kwargs  # noqa: E402
 from models.AttentionBlocks.attention import CausalMHA, CausalMLA  # noqa: E402
 
 INPUT_NAME = "noisy_eeg"
@@ -157,13 +160,30 @@ def load_checkpoint_model(ckpt_path: str | Path, config_path: str | Path | None 
     if arch["variant"] == "tcn":
         arch.pop("n_heads")
 
-    # Sanity: anything the checkpoint claims about itself must agree with the weights
-    for key in ("variant", "hidden_channels", "n_attn_layers", "kv_lora_rank", "max_seq_len"):
+    # Sanity: anything the checkpoint claims about itself must agree with the weights.
+    # The weights can only reveal the base architecture, so a rank alias such as
+    # tcn_mla_r4 is compared as tcn_mla — and what its name promises (rank 4) is
+    # then checked against the weights explicitly.
+    label = stored.get("variant")
+    if label is not None and base_variant(label) != arch["variant"]:
+        raise ValueError(
+            f"Checkpoint model_config says variant={label} but the weights imply "
+            f"{arch['variant']}; refusing to guess."
+        )
+    for key, value in (pinned_kwargs(label) if label is not None else {}).items():
+        if key in arch and arch[key] != value:
+            raise ValueError(
+                f"Checkpoint is labelled '{label}', which fixes {key}={value}, but the weights "
+                f"imply {key}={arch[key]}; refusing to export a model under a name that misdescribes it."
+            )
+    for key in ("hidden_channels", "n_attn_layers", "kv_lora_rank", "max_seq_len"):
         if key in stored and key in arch and stored[key] != arch[key]:
             raise ValueError(
                 f"Checkpoint model_config says {key}={stored[key]} but the weights imply "
                 f"{key}={arch[key]}; refusing to guess."
             )
+    if label is not None:
+        arch["variant"] = label          # keep the run's own name in the sidecar
     if stored.get("turboquant"):
         print("[export] Checkpoint was trained with TurboQuant enabled; exporting the "
               "full-precision network (TurboQuant is a fake-quant experiment only).")

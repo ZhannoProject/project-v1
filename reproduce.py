@@ -47,7 +47,8 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.variants import build_model, VARIANT_REGISTRY, MLA_RANK_SWEEP, BIDIRECTIONAL_VARIANTS
+from models.variants import (build_model, build_model_from_config, VARIANT_REGISTRY,
+                             MLA_RANK_SWEEP, BIDIRECTIONAL_VARIANTS)
 from models.TCN_backbone import CausalTCNBackbone, CausalConv1d
 from models.AttentionBlocks.attention import (
     CausalMHA, CausalMLA, CausalTransformerBlock, CausalTransformerDecoder,
@@ -108,6 +109,24 @@ def test_model_builds():
             )
         except Exception as e:
             report(f"{name:<16s} build + forward", False, str(e))
+
+    # Rank sweep: the alias must win over the generic kv_lora_rank that every
+    # run config carries (trainer default / YAML preset), or the four sweep
+    # runs silently come out identical.  This is the path the trainer uses.
+    for r in MLA_RANK_SWEEP:
+        name = f"tcn_mla_r{r}"
+        try:
+            m = build_model_from_config({"variant": name, "hidden_channels": 64, "kv_lora_rank": 16})
+            rank_built = m.decoder.blocks[0].attn.kv_down_proj.weight.shape[0]
+            report(f"{name:<16s} rank via config", rank_built == r and m.model_config["kv_lora_rank"] == r,
+                   f"config kv_lora_rank=16 → built rank {rank_built}, model_config={m.model_config['kv_lora_rank']}")
+        except Exception as e:
+            report(f"{name:<16s} rank via config", False, str(e))
+    try:
+        build_model("tcn_mla_r8", hidden_channels=64, kv_lora_rank=16)
+        report("tcn_mla_r8 rejects kv_lora_rank=16", False, "no error raised")
+    except ValueError as e:
+        report("tcn_mla_r8 rejects kv_lora_rank=16", "contradicts" in str(e), str(e))
 
     # Optional BottleneckSkip: off by default, a real module when requested
     for name in ["tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
