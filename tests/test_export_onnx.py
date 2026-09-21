@@ -18,7 +18,8 @@ from deploy.export_onnx import (export_checkpoint, infer_arch_from_state_dict,
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy"))
 import raspi_infer  # noqa: E402
-from raspi_infer import EEGDenoiser, StreamingDenoiser  # noqa: E402
+from raspi_infer import (EEGDenoiser, LatencyMonitor, StreamingDenoiser,  # noqa: E402
+                         duty_cycle_check, save_duty_rows, stream_realtime)
 import metrics as torch_metrics  # noqa: E402
 
 
@@ -113,6 +114,84 @@ class ExportOnnxTests(unittest.TestCase):
             online = np.concatenate([streamer.push(sig[i:i + 45]) for i in range(0, len(sig), 45)])
             np.testing.assert_array_equal(offline, online)
             np.testing.assert_array_equal(offline[:512], d.denoise_epochs(sig[:512]))
+
+    def test_latency_monitor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ckpt = _checkpoint(tmp, "tcn_mla", n_attn_layers=2, kv_lora_rank=8)
+            with contextlib.redirect_stdout(io.StringIO()):
+                export_checkpoint(ckpt, out_dir=tmp, name="m")
+            d = EEGDenoiser(Path(tmp) / "m.onnx", n_threads=1)
+            hop, n_hops = 32, 6
+            sig = np.random.default_rng(1).standard_normal(512 + hop * n_hops).astype(np.float32)
+            ref = d.denoise_stream(sig, hop)
+
+            # Push path: one record per hop, output untouched, budget arithmetic right.
+            m = LatencyMonitor(hop, d.sample_rate)
+            s = StreamingDenoiser(d, hop, m)
+            out = np.concatenate([s.push(sig[i:i + 50]) for i in range(0, len(sig), 50)])
+            np.testing.assert_array_equal(out, ref)
+            self.assertEqual(len(m.total_ms), n_hops)
+            self.assertIsNotNone(m.first_window_ms)
+            summ = m.summary()
+            self.assertEqual((summ["n_hops"], summ["hop"], summ["hop_budget_ms"]), (n_hops, hop, 125.0))
+            self.assertTrue(all(i <= t for i, t in zip(m.infer_ms, m.total_ms)))   # run time is part of the hop
+            self.assertEqual(summ["deadline_misses"], 0)
+            for key in ("infer_ms", "total_ms", "overhead_ms", "interval_ms"):
+                self.assertEqual(set(summ[key]), {"median", "mean", "p95", "p99", "max", "min", "std"})
+            self.assertNotIn("e2e_latency_ms", summ)                            # no schedule attached
+
+            # Offline path records the same hops; an impossible budget makes every hop a miss.
+            m2 = LatencyMonitor(hop, sample_rate=1e9)                           # budget ~0 ms
+            np.testing.assert_array_equal(d.denoise_stream(sig, hop, m2), ref)
+            self.assertEqual((len(m2.total_ms), m2.summary()["deadline_misses"], m2.summary()["miss_rate"]),
+                             (n_hops, n_hops, 1.0))
+
+            # Paced replay (fast fake sample rate): identical output, e2e latency reported, files written.
+            d.sample_rate = 200_000.0
+            m3 = LatencyMonitor(hop, d.sample_rate, report_every=3)
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                np.testing.assert_array_equal(stream_realtime(d, sig, hop, m3), ref)
+                summ3 = m3.print_summary()
+            self.assertEqual(log.getvalue().count("[latency] hop"), n_hops // 3)   # rolling lines
+            self.assertIn("e2e_latency_ms", summ3)
+            self.assertIn("e2e_drift_ms", summ3)
+            self.assertGreaterEqual(summ3["e2e_latency_ms"]["min"], summ3["total_ms"]["min"] * 0.99)
+            expect = summ3["total_ms"]["mean"] / summ3["hop_budget_ms"]        # both sides are rounded
+            self.assertAlmostEqual(summ3["duty_cycle"]["mean"], expect, delta=1e-3 * expect + 1e-3)
+            js, csv = m3.save(Path(tmp) / "lat" / "run")
+            self.assertEqual(json.loads(js.read_text())["n_hops"], n_hops)
+            rows = csv.read_text().strip().splitlines()
+            self.assertEqual(rows[0], "hop,infer_ms,total_ms,t_s,temp_c,e2e_latency_ms")
+            self.assertEqual(len(rows) - 1, n_hops)
+            self.assertEqual(rows[1].split(",")[0], "1")
+
+    def test_duty_cycle_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ckpt = _checkpoint(tmp, "tcn_mla", n_attn_layers=2, kv_lora_rank=8)
+            with contextlib.redirect_stdout(io.StringIO()):
+                export_checkpoint(ckpt, out_dir=tmp, name="m")
+            d = EEGDenoiser(Path(tmp) / "m.onnx", n_threads=1)
+            d.sample_rate = 2000.0                    # fake fs keeps the paced replay short
+            sig = np.random.default_rng(2).standard_normal(1000).astype(np.float32)
+            # hop 128 -> 64 ms period, far above one forward pass: OK.
+            # hop 1   -> 0.5 ms period, far below it: must be flagged, with misses and a growing backlog.
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                rows = duty_cycle_check(d, sig, hops=(128, 1), seconds=0.5)
+            by_hop = {r["hop"]: r for r in rows}
+            self.assertEqual(set(by_hop), {128, 1})
+            self.assertEqual(by_hop[128]["verdict"], "OK")
+            self.assertEqual(by_hop[1]["verdict"], "FAIL")
+            self.assertGreater(by_hop[1]["deadline_misses"], 0)
+            self.assertGreater(by_hop[1]["duty_mean"], 1.0)
+            self.assertGreater(by_hop[1]["e2e_drift_ms"], by_hop[1]["hop_budget_ms"])
+            self.assertAlmostEqual(by_hop[128]["total_latency_median_ms"],
+                                   by_hop[128]["hop_budget_ms"] + by_hop[128]["e2e_median_ms"], places=1)
+            self.assertIn("smallest hop that is comfortably real-time: 128", log.getvalue())
+            js, csv = save_duty_rows(rows, Path(tmp) / "duty")
+            self.assertEqual([r["hop"] for r in json.loads(js.read_text())], [128, 1])
+            lines = csv.read_text().strip().splitlines()
+            self.assertEqual(len(lines), 3)
+            self.assertTrue(lines[0].startswith("hop,hop_budget_ms,") and lines[0].endswith(",verdict"))
 
     def test_numpy_metrics_match_torch(self):
         rng = np.random.default_rng(0)

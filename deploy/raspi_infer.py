@@ -7,6 +7,9 @@ Pi; nothing else from the repo is needed.
     python raspi_infer.py tcn_mla_eog.onnx --testdata EOG_test100.npz
     python raspi_infer.py tcn_mla_eog.onnx --input noisy.npy --output clean.npy
     python raspi_infer.py tcn_mla_eog.onnx --input noisy.npy --output clean.npy --stream --hop 32
+    python raspi_infer.py tcn_mla_eog.onnx --testdata EOG_test100.npz --latency --latency_out lat
+    python raspi_infer.py tcn_mla_eog.onnx --input rec.npy --stream --realtime --latency --latency_every 50
+    python raspi_infer.py tcn_mla_eog.onnx --testdata EOG_test100.npz --duty_cycle 64,32,16,8,4
 
 Two ways to use the model
 -------------------------
@@ -26,6 +29,19 @@ denoise_stream(x)   x is an arbitrarily long 1-D signal.  Because the network
 
 StreamingDenoiser   the same thing as an object you push chunks into, for a
                     live acquisition loop.
+
+LatencyMonitor      per-hop timing for either streaming path: onnxruntime time,
+                    total hop time, deadline misses against the hop budget
+                    (hop / fs), throughput, SoC temperature, and -- when the
+                    signal is replayed at the sample rate with --realtime /
+                    stream_realtime() -- the true end-to-end latency from a
+                    sample being available to its denoised value being emitted.
+                    --latency turns it on; --latency_out writes .json + .csv.
+
+--duty_cycle        real-time applicability check: paced replay for a list of
+                    hop sizes, reporting compute / period (duty cycle), e2e
+                    latency and its drift, deadline misses and an OK / MARGINAL /
+                    FAIL verdict per hop, plus the smallest hop that is safe.
 
 --testdata          scores a .npz cut by deploy/make_testdata.py (noisy, clean,
                     snr_db) with the EEGdenoiseNet metrics, in both epoch and
@@ -67,11 +83,16 @@ class EEGDenoiser:
         self.meta = json.loads(sidecar.read_text()) if sidecar.exists() else {}
         self.sample_rate = self.meta.get("preprocessing", {}).get("sample_rate_hz", 256)
 
+        self.last_run_s = 0.0        # wall time of the most recent sess.run (read by LatencyMonitor)
+
     # ---- core call: (N, 1, T) normalised -> (N, 1, T) normalised ----
     def _run(self, x: np.ndarray) -> np.ndarray:
         if not self.dynamic_batch and x.shape[0] != 1:
             return np.concatenate([self._run(row[None]) for row in x])
-        return self.sess.run([self.output_name], {self.input_name: x})[0]
+        t0 = time.perf_counter()
+        y = self.sess.run([self.output_name], {self.input_name: x})[0]
+        self.last_run_s = time.perf_counter() - t0
+        return y
 
     def denoise_epochs(self, x: np.ndarray) -> np.ndarray:
         """(T,) or (N, T) raw-scale windows -> same shape, denoised, raw scale."""
@@ -82,8 +103,12 @@ class EEGDenoiser:
         y = self._run((x / sigma)[:, None, :])[:, 0, :] * sigma
         return y[0] if squeeze else y
 
-    def denoise_stream(self, signal: np.ndarray, hop: int = 32) -> np.ndarray:
-        """Causally denoise a long 1-D signal; output is sample-aligned with the input."""
+    def denoise_stream(self, signal: np.ndarray, hop: int = 32,
+                       monitor: "LatencyMonitor | None" = None) -> np.ndarray:
+        """
+        Causally denoise a long 1-D signal; output is sample-aligned with the input.
+        ``monitor`` (a LatencyMonitor) records the cost of every hop.
+        """
         signal = np.asarray(signal, dtype=np.float32)
         T = self.window
         if len(signal) < T:
@@ -94,11 +119,188 @@ class EEGDenoiser:
             xn[0, 0, : len(signal)] = signal / sigma
             return self._run(xn)[0, 0, : len(signal)] * sigma
         out = np.empty_like(signal)
+        t0 = time.perf_counter()
         out[:T] = self.denoise_epochs(signal[:T])
+        if monitor is not None:
+            monitor.record_first_window(time.perf_counter() - t0)
         for end in range(T + hop, len(signal) + hop, hop):
             end = min(end, len(signal))
+            t0 = time.perf_counter()
             out[end - hop:end] = self.denoise_epochs(signal[end - T:end])[-hop:]
+            if monitor is not None:
+                monitor.record_hop(self.last_run_s, time.perf_counter() - t0)
         return out
+
+
+class LatencyMonitor:
+    """
+    Per-hop latency recorder for the streaming path -- what a live BCI loop
+    on the Pi needs to know about itself.
+
+    For every hop it stores
+        infer_ms   the onnxruntime call alone (EEGDenoiser.last_run_s)
+        total_ms   the whole hop: buffer roll + normalise + run + rescale + slice
+        t_s        when the hop finished (perf_counter), for cadence / e2e latency
+        temp_c     SoC temperature from /sys/class/thermal (Raspberry Pi OS; NaN elsewhere)
+    and derives median / p95 / p99 / max, jitter, deadline misses against the
+    hop budget (hop / fs), real-time headroom and throughput.  With a schedule
+    attached (see stream_realtime) it also reports end-to-end latency: the
+    time from the last sample of a hop being *available* to its denoised
+    samples being *emitted*, which is the number that matters for a live loop.
+
+    Pass one to StreamingDenoiser(..., monitor=m) or denoise_stream(..., monitor=m);
+    ``report_every=N`` prints a rolling-window line every N hops; ``summary()``
+    returns a dict; ``save("stem")`` writes stem.json + stem.csv.
+    """
+
+    THERMAL = Path("/sys/class/thermal/thermal_zone0/temp")
+
+    def __init__(self, hop: int, sample_rate: float, report_every: int = 0,
+                 window: int = 64, label: str = "latency"):
+        self.hop, self.fs = int(hop), float(sample_rate)
+        self.budget_ms = 1e3 * self.hop / self.fs
+        self.report_every, self.window, self.label = int(report_every), int(window), label
+        self.infer_ms: list[float] = []
+        self.total_ms: list[float] = []
+        self.t_s: list[float] = []
+        self.temp_c: list[float] = []
+        self.first_window_ms: float | None = None
+        self.available_s: np.ndarray | None = None     # set by attach_schedule()
+        self.t_start: float | None = None              # start of the first recorded forward pass
+        self._thermal_ok = self.THERMAL.exists()
+
+    # ---- recording ----
+    def _temp(self) -> float:
+        if not self._thermal_ok:
+            return float("nan")
+        try:
+            return int(self.THERMAL.read_text()) / 1000.0
+        except (OSError, ValueError):
+            self._thermal_ok = False
+            return float("nan")
+
+    def record_first_window(self, seconds: float) -> None:
+        """The one whole-window forward pass that ends warm-up (not a hop)."""
+        self.first_window_ms = 1e3 * seconds
+        if self.t_start is None:
+            self.t_start = time.perf_counter() - seconds
+
+    def record_hop(self, infer_s: float, total_s: float) -> None:
+        now = time.perf_counter()
+        if self.t_start is None:
+            self.t_start = now - total_s
+        self.infer_ms.append(1e3 * infer_s)
+        self.total_ms.append(1e3 * total_s)
+        self.t_s.append(now)
+        self.temp_c.append(self._temp())
+        n = len(self.total_ms)
+        if self.report_every and n % self.report_every == 0:
+            print(self.live_line())
+
+    def attach_schedule(self, t0_s: float, window: int) -> None:
+        """
+        Declare when each hop's data became available: sample i arrived at
+        t0_s + i / fs, so hop k (k = 1, 2, ...) was complete at
+        t0_s + (window + k * hop) / fs.  Enables the e2e_latency_ms summary.
+        """
+        k = np.arange(1, len(self.total_ms) + 1)
+        self.available_s = t0_s + (window + k * self.hop) / self.fs
+
+    # ---- reporting ----
+    @staticmethod
+    def _stats(x) -> dict:
+        x = np.asarray(x, dtype=np.float64)
+        if x.size == 0:
+            return {}
+        return {"median": round(float(np.median(x)), 3), "mean": round(float(x.mean()), 3),
+                "p95": round(float(np.percentile(x, 95)), 3), "p99": round(float(np.percentile(x, 99)), 3),
+                "max": round(float(x.max()), 3), "min": round(float(x.min()), 3),
+                "std": round(float(x.std()), 3)}
+
+    def live_line(self) -> str:
+        n = len(self.total_ms)
+        w = np.asarray(self.total_ms[-self.window:])
+        misses = int(np.sum(np.asarray(self.total_ms) > self.budget_ms))
+        temp = f" | {self.temp_c[-1]:.1f}°C" if not np.isnan(self.temp_c[-1]) else ""
+        return (f"[{self.label}] hop {n:6d} | last {self.total_ms[-1]:6.2f} ms (run {self.infer_ms[-1]:6.2f}) | "
+                f"last {len(w)}: median {np.median(w):6.2f}  p95 {np.percentile(w, 95):6.2f}  max {w.max():6.2f} ms | "
+                f"misses {misses}/{n} of {self.budget_ms:.1f} ms budget{temp}")
+
+    def summary(self) -> dict:
+        total = np.asarray(self.total_ms)
+        n = len(total)
+        wall = (self.t_s[-1] - self.t_start) if n else 0.0     # first forward start -> last hop end
+        s = {"hop": self.hop, "sample_rate_hz": self.fs, "hop_budget_ms": round(self.budget_ms, 3),
+             "n_hops": n, "wall_s": round(wall, 3),
+             "first_window_ms": None if self.first_window_ms is None else round(self.first_window_ms, 3),
+             "infer_ms": self._stats(self.infer_ms), "total_ms": self._stats(total),
+             "overhead_ms": self._stats(total - np.asarray(self.infer_ms)) if n else {}}
+        if n:
+            p95 = float(np.percentile(total, 95))
+            s.update(deadline_misses=int(np.sum(total > self.budget_ms)),
+                     miss_rate=round(float(np.mean(total > self.budget_ms)), 4),
+                     realtime_headroom_x=round(self.budget_ms / p95, 2) if p95 > 0 else None,
+                     throughput_hops_per_s=round(n / wall, 2) if wall > 0 else None,
+                     jitter_ms=round(p95 - float(np.median(total)), 3),
+                     # Fraction of each hop period spent computing; > 1 cannot keep up.
+                     duty_cycle={"mean": round(float(total.mean()) / self.budget_ms, 4),
+                                 "p95": round(p95 / self.budget_ms, 4),
+                                 "p99": round(float(np.percentile(total, 99)) / self.budget_ms, 4)})
+        if n > 1:
+            s["interval_ms"] = self._stats(1e3 * np.diff(self.t_s))
+        if self.available_s is not None and n:
+            e2e = 1e3 * (np.asarray(self.t_s) - self.available_s)
+            s["e2e_latency_ms"] = self._stats(e2e)
+            # Backlog detector: a loop that cannot keep up emits later and later.
+            q = max(1, n // 4)
+            s["e2e_drift_ms"] = round(float(np.median(e2e[-q:]) - np.median(e2e[:q])), 3)
+        temps = np.asarray(self.temp_c)
+        if n and not np.all(np.isnan(temps)):
+            s["temp_c"] = {"start": round(float(temps[0]), 1), "end": round(float(temps[-1]), 1),
+                           "max": round(float(np.nanmax(temps)), 1)}
+        return s
+
+    def print_summary(self) -> dict:
+        s = self.summary()
+        if not s["n_hops"]:
+            print(f"[{self.label}] no hops recorded")
+            return s
+        t, r = s["total_ms"], s["infer_ms"]
+        print(f"[{self.label}] {s['n_hops']} hops of {s['hop']} samples ({s['hop_budget_ms']} ms budget each), "
+              f"{s['wall_s']} s wall, first window {s['first_window_ms']} ms")
+        print(f"           per hop   : median {t['median']} | p95 {t['p95']} | p99 {t['p99']} | max {t['max']} ms  "
+              f"(jitter p95-median {s['jitter_ms']} ms)")
+        print(f"           of which  : onnxruntime {r['median']} ms median / {r['p95']} p95;  "
+              f"pre/post-processing {s['overhead_ms']['median']} ms median")
+        dc = s["duty_cycle"]
+        print(f"           real time : {s['deadline_misses']} deadline misses ({100 * s['miss_rate']:.2f}%), "
+              f"{s['realtime_headroom_x']}x headroom at p95, {s['throughput_hops_per_s']} hops/s, "
+              f"duty cycle {100 * dc['mean']:.1f}% mean / {100 * dc['p99']:.1f}% p99")
+        if "e2e_latency_ms" in s:
+            e = s["e2e_latency_ms"]
+            print(f"           end-to-end: sample available -> output emitted  median {e['median']} | "
+                  f"p95 {e['p95']} | max {e['max']} ms  (drift over run {s['e2e_drift_ms']:+.2f} ms)")
+        if "temp_c" in s:
+            c = s["temp_c"]
+            print(f"           SoC temp  : {c['start']} -> {c['end']} °C (peak {c['max']})")
+        return s
+
+    def save(self, stem: str | Path) -> tuple[Path, Path]:
+        """Write <stem>.json (summary) and <stem>.csv (one row per hop)."""
+        stem = Path(stem)
+        stem.parent.mkdir(parents=True, exist_ok=True)
+        js, csv = stem.with_suffix(".json"), stem.with_suffix(".csv")
+        js.write_text(json.dumps(self.summary(), indent=2))
+        n = len(self.total_ms)
+        t0 = self.t_start if self.t_start is not None else 0.0
+        cols = [np.arange(1, n + 1), self.infer_ms, self.total_ms, np.asarray(self.t_s) - t0, self.temp_c]
+        header, fmt = "hop,infer_ms,total_ms,t_s,temp_c", ["%d", "%.4f", "%.4f", "%.4f", "%.1f"]
+        if self.available_s is not None:
+            cols.append(1e3 * (np.asarray(self.t_s) - self.available_s))
+            header, fmt = header + ",e2e_latency_ms", fmt + ["%.4f"]
+        np.savetxt(csv, np.column_stack(cols) if n else np.zeros((0, len(cols))),
+                   delimiter=",", header=header, comments="", fmt=fmt)
+        return js, csv
 
 
 class StreamingDenoiser:
@@ -114,8 +316,8 @@ class StreamingDenoiser:
     not what the network saw in training (attention would attend to padding).
     """
 
-    def __init__(self, denoiser: EEGDenoiser, hop: int = 32):
-        self.d, self.hop = denoiser, hop
+    def __init__(self, denoiser: EEGDenoiser, hop: int = 32, monitor: LatencyMonitor | None = None):
+        self.d, self.hop, self.monitor = denoiser, hop, monitor
         self.buf = np.zeros(denoiser.window, dtype=np.float32)
         self.filled = 0                                   # real samples in buf
         self.pending = np.zeros(0, dtype=np.float32)      # not yet processed
@@ -131,13 +333,124 @@ class StreamingDenoiser:
             self.pending, self.filled = self.pending[take:], self.filled + take
             if self.filled < W:
                 return np.zeros(0, dtype=np.float32)
+            t0 = time.perf_counter()
             out.append(self.d.denoise_epochs(self.buf))
+            if self.monitor is not None:
+                self.monitor.record_first_window(time.perf_counter() - t0)
 
-        while len(self.pending) >= self.hop:              # steady state
+        while len(self.pending) >= self.hop:              # steady state: one forward pass per hop
+            t0 = time.perf_counter()
             self.buf = np.roll(self.buf, -self.hop)
             self.buf[-self.hop:], self.pending = self.pending[:self.hop], self.pending[self.hop:]
             out.append(self.d.denoise_epochs(self.buf)[-self.hop:])
+            if self.monitor is not None:
+                self.monitor.record_hop(self.d.last_run_s, time.perf_counter() - t0)
         return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
+
+
+def stream_realtime(d: EEGDenoiser, signal: np.ndarray, hop: int = 32,
+                    monitor: LatencyMonitor | None = None, chunk: int | None = None) -> np.ndarray:
+    """
+    Replay ``signal`` through a StreamingDenoiser at the sample rate, the way
+    an acquisition loop would deliver it: a chunk of ``chunk`` samples
+    (default: one hop) is pushed only once its last sample "has arrived".
+    Takes len(signal) / fs seconds of wall time.  The monitor then measures
+    what a live loop would see -- including scheduler jitter -- and its
+    e2e_latency_ms is the real sample-available -> output-emitted delay.
+    Output is identical to denoise_stream(signal, hop).
+    """
+    signal = np.asarray(signal, dtype=np.float32)
+    chunk = chunk or hop
+    s = StreamingDenoiser(d, hop, monitor)
+    out = []
+    t0 = time.perf_counter()
+    for i in range(0, len(signal), chunk):
+        due = t0 + min(i + chunk, len(signal)) / d.sample_rate     # last sample of this chunk arrives
+        now = time.perf_counter()
+        if due > now:
+            time.sleep(due - now)
+        out.append(s.push(signal[i:i + chunk]))
+    if monitor is not None:
+        monitor.attach_schedule(t0, d.window)
+    return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
+
+
+def duty_cycle_check(d: EEGDenoiser, signal: np.ndarray, hops=(64, 32, 16, 8, 4), seconds: float = 20.0,
+                     report_every: int = 0) -> list[dict]:
+    """
+    Real-time applicability sweep.  For each hop size the first ``seconds`` of
+    ``signal`` are replayed at the sample rate (stream_realtime), so every row
+    is what a live loop would see on this board:
+
+        duty cycle   compute per hop / hop period (hop / fs).  Each hop costs a
+                     full-window forward pass, so halving the hop doubles it.
+        e2e latency  sample available -> output emitted, plus its drift over the
+                     run: a loop that cannot keep up emits later and later.
+        verdict      OK        p99 duty cycle <= 0.7, no misses, no drift
+                     MARGINAL  no misses but p99 duty cycle > 0.7, or drift > one hop period / 4
+                     FAIL      deadline misses, or drift > one hop period (backlog)
+
+    The total algorithmic latency of the causal stream is the buffering delay
+    (hop / fs) plus the compute; the table reports both so the hop can be
+    chosen against a latency target with a known safety margin.
+    """
+    signal = np.asarray(signal, dtype=np.float32)
+    n = int(seconds * d.sample_rate)
+    if len(signal) < n:
+        signal = np.tile(signal, int(np.ceil(n / len(signal))))
+    signal = signal[:n]
+    rows = []
+    print(f"[duty] {seconds:.0f} s paced replay per hop at {d.sample_rate:.0f} Hz, window {d.window}, "
+          f"{d.sess.get_session_options().intra_op_num_threads} onnxruntime threads")
+    print(f"       {'hop':>4s} {'period':>8s} {'hops/s':>6s} | {'compute ms':>21s} | {'duty %':>15s} | "
+          f"{'e2e ms':>15s} {'drift':>7s} | {'misses':>6s} | verdict")
+    print(f"       {'':>4s} {'ms':>8s} {'':>6s} | {'median':>6s} {'p99':>6s} {'max':>6s} | {'mean':>6s} {'p99':>7s} | "
+          f"{'median':>7s} {'max':>7s} {'ms':>7s} | {'':>6s} |")
+    for hop in hops:
+        m = LatencyMonitor(hop, d.sample_rate, report_every, label=f"duty/hop{hop}")
+        stream_realtime(d, signal, hop, m)
+        s = m.summary()
+        if not s["n_hops"]:
+            continue
+        dc, e2e, drift = s["duty_cycle"], s["e2e_latency_ms"], s["e2e_drift_ms"]
+        if s["deadline_misses"] or drift > s["hop_budget_ms"]:
+            verdict = "FAIL"
+        elif dc["p99"] > 0.7 or drift > s["hop_budget_ms"] / 4:
+            verdict = "MARGINAL"
+        else:
+            verdict = "OK"
+        row = {"hop": hop, "hop_budget_ms": s["hop_budget_ms"], "hops_per_s": round(d.sample_rate / hop, 1),
+               "n_hops": s["n_hops"], "compute_median_ms": s["total_ms"]["median"],
+               "compute_p99_ms": s["total_ms"]["p99"], "compute_max_ms": s["total_ms"]["max"],
+               "duty_mean": dc["mean"], "duty_p99": dc["p99"], "e2e_median_ms": e2e["median"],
+               "e2e_max_ms": e2e["max"], "e2e_drift_ms": drift, "deadline_misses": s["deadline_misses"],
+               "total_latency_median_ms": round(s["hop_budget_ms"] + e2e["median"], 2),
+               "temp_c": s.get("temp_c"), "verdict": verdict}
+        rows.append(row)
+        print(f"       {hop:>4d} {row['hop_budget_ms']:>8.2f} {row['hops_per_s']:>6.1f} | "
+              f"{row['compute_median_ms']:>6.2f} {row['compute_p99_ms']:>6.2f} {row['compute_max_ms']:>6.2f} | "
+              f"{100 * dc['mean']:>6.1f} {100 * dc['p99']:>7.1f} | "
+              f"{e2e['median']:>7.2f} {e2e['max']:>7.2f} {drift:>+7.2f} | {s['deadline_misses']:>6d} | {verdict}")
+    ok = [r for r in rows if r["verdict"] == "OK"]
+    if ok:
+        best = min(ok, key=lambda r: r["hop"])
+        print(f"[duty] smallest hop that is comfortably real-time: {best['hop']} samples = "
+              f"{best['hop_budget_ms']:.1f} ms buffering + {best['e2e_median_ms']:.1f} ms compute "
+              f"= {best['total_latency_median_ms']:.1f} ms total latency at {100 * best['duty_mean']:.0f}% duty cycle")
+    else:
+        print("[duty] no hop in the sweep is comfortably real-time on this board")
+    return rows
+
+
+def save_duty_rows(rows: list[dict], stem: str | Path) -> tuple[Path, Path]:
+    stem = Path(stem)
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    js, csv = stem.with_suffix(".json"), stem.with_suffix(".csv")
+    js.write_text(json.dumps(rows, indent=2))
+    keys = [k for k in rows[0] if k != "temp_c"] if rows else []
+    lines = [",".join(keys)] + [",".join(str(r[k]) for k in keys) for r in rows]
+    csv.write_text("\n".join(lines) + "\n")
+    return js, csv
 
 
 # ============================================================
@@ -171,7 +484,8 @@ def metrics(pred, clean):
             "acc": acc(pred, clean)}
 
 
-def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_snr: bool = True) -> dict:
+def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_snr: bool = True,
+                      monitor: LatencyMonitor | None = None) -> dict:
     data = np.load(npz_path)
     noisy, clean, snr = data["noisy"], data["clean"], data["snr_db"]
     n, T = noisy.shape
@@ -182,7 +496,7 @@ def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_s
     y_epoch = d.denoise_epochs(noisy)
     t_epoch = time.perf_counter() - t0
     t0 = time.perf_counter()
-    y_stream = d.denoise_stream(noisy.reshape(-1), hop).reshape(n, T)
+    y_stream = d.denoise_stream(noisy.reshape(-1), hop, monitor).reshape(n, T)
     t_stream = time.perf_counter() - t0
 
     modes = {"noisy input (no model)": noisy, "epoch mode": y_epoch, f"stream mode (hop {hop})": y_stream}
@@ -236,11 +550,37 @@ def main(argv=None):
     p.add_argument("--threads", type=int, default=2, help="onnxruntime intra-op threads (2 is best on a Pi 5)")
     p.add_argument("--benchmark", action="store_true")
     p.add_argument("--testdata", help=".npz from deploy/make_testdata.py; prints benchmark metrics")
+    p.add_argument("--latency", action="store_true",
+                   help="per-hop latency monitor for --stream / --testdata: onnxruntime time, total hop time, "
+                        "deadline misses against hop/fs, temperature; prints a summary")
+    p.add_argument("--latency_every", type=int, default=0, metavar="N",
+                   help="with --latency: print a rolling-window line every N hops (default: summary only)")
+    p.add_argument("--latency_out", metavar="STEM",
+                   help="with --latency: write STEM.json (summary) and STEM.csv (one row per hop)")
+    p.add_argument("--realtime", action="store_true",
+                   help="with --stream: replay the input at the sample rate through StreamingDenoiser "
+                        "(takes len/fs seconds) so --latency reports true end-to-end latency")
+    p.add_argument("--duty_cycle", metavar="HOPS",
+                   help="real-time applicability sweep over comma-separated hop sizes, e.g. 64,32,16,8,4: "
+                        "paced replay per hop, duty cycle + e2e latency + verdict. --input / --testdata "
+                        "then only supply the signal (no scoring / denoising output)")
+    p.add_argument("--duty_seconds", type=float, default=20.0, help="paced seconds per hop in --duty_cycle")
     a = p.parse_args(argv)
 
     d = EEGDenoiser(a.onnx, a.threads)
     print(f"[raspi] {a.onnx}: window={d.window} fs={d.sample_rate} Hz  "
           f"providers={d.sess.get_providers()}  threads={a.threads}")
+
+    def new_monitor(label):
+        return LatencyMonitor(a.hop, d.sample_rate, a.latency_every, label=label) if a.latency else None
+
+    def finish_monitor(m, stem_suffix):
+        if m is None:
+            return
+        m.print_summary()
+        if a.latency_out:
+            js, csv = m.save(a.latency_out + stem_suffix)
+            print(f"[{m.label}] wrote {js} and {csv}")
 
     if a.benchmark:
         r = benchmark(d, hop=a.hop)
@@ -248,12 +588,37 @@ def main(argv=None):
               f"{r['window']}-sample window;  hop {r['hop']} = {r['hop_budget_ms']} ms budget "
               f"-> {r['realtime_headroom_x']}x real-time headroom")
 
+    if a.duty_cycle:
+        if a.input:
+            sig = np.load(a.input).reshape(-1)
+        elif a.testdata:
+            sig = np.load(a.testdata)["noisy"].reshape(-1)
+        else:
+            p.error("--duty_cycle needs --input (1-D .npy) or --testdata (.npz) as the signal")
+        hops = [int(h) for h in a.duty_cycle.split(",")]
+        rows = duty_cycle_check(d, sig, hops, a.duty_seconds, a.latency_every)
+        if a.latency_out and rows:
+            js, csv = save_duty_rows(rows, a.latency_out + "_duty")
+            print(f"[duty] wrote {js} and {csv}")
+        return                       # --input / --testdata were only the signal source
+
     if a.testdata:
-        evaluate_testdata(d, a.testdata, a.hop)
+        m = new_monitor("latency/testdata")
+        evaluate_testdata(d, a.testdata, a.hop, monitor=m)
+        finish_monitor(m, "_testdata" if a.input and a.stream else "")
 
     if a.input:
         x = np.load(a.input)
-        y = d.denoise_stream(x.reshape(-1), a.hop) if a.stream else d.denoise_epochs(x)
+        if a.stream:
+            m = new_monitor("latency/realtime" if a.realtime else "latency/stream")
+            if a.realtime:
+                print(f"[raspi] replaying {x.size / d.sample_rate:.1f} s of signal at {d.sample_rate} Hz ...")
+                y = stream_realtime(d, x.reshape(-1), a.hop, m)
+            else:
+                y = d.denoise_stream(x.reshape(-1), a.hop, m)
+            finish_monitor(m, "_stream" if a.testdata else "")
+        else:
+            y = d.denoise_epochs(x)
         print(f"[raspi] denoised {x.shape} -> {y.shape}")
         if a.output:
             np.save(a.output, y.astype(np.float32))

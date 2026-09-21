@@ -11,9 +11,21 @@
 #   2. copies them to ~/$REMOTE_DIR on the Pi
 #   3. on the Pi: creates a venv on first run, installs numpy + onnxruntime,
 #      prints the board / Python / onnxruntime versions, then runs
-#      raspi_infer.py --benchmark --testdata, recording SoC temperature,
+#      raspi_infer.py --benchmark --testdata --latency, recording SoC temperature,
 #      ARM clock and the throttle flag before/after (peak temp during)
+#   4. optionally (REALTIME_S=30) replays a 30 s continuous signal cut from the
+#      test set at the sample rate through StreamingDenoiser -- the live-loop
+#      test: paced per-hop cost, end-to-end latency, interval jitter
+#   5. optionally (DUTY_HOPS=64,32,16,8,4) runs the duty-cycle check: a paced
+#      replay per hop size with compute / period, e2e latency, drift and an
+#      OK / MARGINAL / FAIL verdict -- is real-time processing applicable, and
+#      down to which hop
+#   6. copies the per-hop latency traces back to deploy/artifacts/pi_latency/
+#      (<model>_hop<hop>[_realtime|_duty].json + .csv)
 # Re-running is cheap: the venv is reused and only the copy + test repeat.
+#   LATENCY_EVERY=200 prints a rolling latency line every N hops (0 = summary only).
+#   REALTIME_S=30 adds the paced replay (takes that many seconds; 0 = skip).
+#   DUTY_HOPS=64,32,16,8,4 DUTY_S=20 adds the duty-cycle sweep (DUTY_S seconds per hop).
 #
 # Needs: ssh access to the Pi (key or password -- asked once thanks to connection
 # sharing), python3 with venv on the Pi (Raspberry Pi OS ships it; otherwise
@@ -27,6 +39,11 @@ REMOTE_DIR="${REMOTE_DIR:-eeg}"          # relative to the Pi user's home
 TESTDATA="${TESTDATA:-EOG_test100.npz}"  # file in deploy/testdata/
 HOP="${HOP:-32}"
 THREADS="${THREADS:-2}"                  # 2 measured best on a Pi 5 (4 gives a 2x worse p95)
+LATENCY_EVERY="${LATENCY_EVERY:-400}"    # rolling per-hop latency line every N hops (1600 hops in the bundled set)
+LATENCY_STEM="latency_${MODEL}_hop${HOP}" # per-hop trace written on the Pi, copied back below
+REALTIME_S="${REALTIME_S:-0}"            # seconds of paced live-loop replay (0 = skip)
+DUTY_HOPS="${DUTY_HOPS:-}"               # e.g. 64,32,16,8,4 -> duty-cycle sweep (empty = skip)
+DUTY_S="${DUTY_S:-20}"                   # paced seconds per hop in the sweep
 
 DEPLOY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FILES=(
@@ -56,7 +73,7 @@ ssh "${SSH_OPTS[@]}" "$PI" "mkdir -p ~/$REMOTE_DIR"
 scp -q "${SSH_OPTS[@]}" "${FILES[@]}" "$PI:~/$REMOTE_DIR/"
 
 echo "==> running on $PI"
-ssh "${SSH_OPTS[@]}" "$PI" "REMOTE_DIR='$REMOTE_DIR' MODEL='$MODEL' TESTDATA='$TESTDATA' HOP='$HOP' THREADS='$THREADS' bash -s" <<'REMOTE'
+ssh "${SSH_OPTS[@]}" "$PI" "REMOTE_DIR='$REMOTE_DIR' MODEL='$MODEL' TESTDATA='$TESTDATA' HOP='$HOP' THREADS='$THREADS' LATENCY_EVERY='$LATENCY_EVERY' LATENCY_STEM='$LATENCY_STEM' REALTIME_S='$REALTIME_S' DUTY_HOPS='$DUTY_HOPS' DUTY_S='$DUTY_S' bash -s" <<'REMOTE'
 set -euo pipefail
 cd ~/"$REMOTE_DIR"
 if [[ ! -x env/bin/python ]]; then
@@ -79,10 +96,38 @@ PEAK_FILE="$(mktemp)"; echo "$(temp)" > "$PEAK_FILE"
 SAMPLER=$!
 echo "--> before: $(temp)°C  $(clock)  throttled=$(thr)"
 
-env/bin/python raspi_infer.py "$MODEL.onnx" --threads "$THREADS" --hop "$HOP" --benchmark --testdata "$TESTDATA"
+env/bin/python raspi_infer.py "$MODEL.onnx" --threads "$THREADS" --hop "$HOP" --benchmark --testdata "$TESTDATA" \
+    --latency --latency_every "$LATENCY_EVERY" --latency_out "$LATENCY_STEM"
+
+if [[ "$REALTIME_S" -gt 0 ]]; then
+  # A continuous recording for the live-loop test: the first REALTIME_S seconds
+  # of the test epochs laid end to end (content is irrelevant for timing).
+  env/bin/python - "$TESTDATA" "$REALTIME_S" <<'PY'
+import sys, numpy as np
+d = np.load(sys.argv[1]); fs = int(d["fs"]); n = int(float(sys.argv[2]) * fs)
+sig = d["noisy"].reshape(-1)[:n].astype(np.float32)
+np.save("realtime_rec.npy", sig)
+print(f"--> realtime replay: {len(sig)} samples = {len(sig) / fs:.1f} s at {fs} Hz")
+PY
+  echo "--> $(temp)°C  $(clock) before paced replay"
+  env/bin/python raspi_infer.py "$MODEL.onnx" --threads "$THREADS" --hop "$HOP" \
+      --input realtime_rec.npy --stream --realtime \
+      --latency --latency_every "$(( LATENCY_EVERY > 0 ? LATENCY_EVERY / 8 : 0 ))" --latency_out "${LATENCY_STEM}_realtime"
+fi
+
+if [[ -n "$DUTY_HOPS" ]]; then
+  echo "--> $(temp)°C  $(clock) before duty-cycle sweep"
+  env/bin/python raspi_infer.py "$MODEL.onnx" --threads "$THREADS" --testdata "$TESTDATA" \
+      --duty_cycle "$DUTY_HOPS" --duty_seconds "$DUTY_S" --latency_out "$LATENCY_STEM"
+fi
 
 kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null || true
 echo "--> after:  $(temp)°C  $(clock)  throttled=$(thr)   (peak during test: $(cat "$PEAK_FILE")°C)"
 rm -f "$PEAK_FILE"
 REMOTE
+
+LAT_DIR="$DEPLOY/artifacts/pi_latency"
+mkdir -p "$LAT_DIR"
+scp -q "${SSH_OPTS[@]}" "$PI:~/$REMOTE_DIR/${LATENCY_STEM}*.json" "$PI:~/$REMOTE_DIR/${LATENCY_STEM}*.csv" "$LAT_DIR/"
+echo "==> per-hop latency traces:"; ls -1 "$LAT_DIR/${LATENCY_STEM}"*
 echo "==> done"

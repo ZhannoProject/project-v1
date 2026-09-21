@@ -92,7 +92,7 @@ Not to be confused with `bottleneck_ratio`, which is the channel squeeze between
 ├── deploy/
 │   ├── export_onnx.py          # checkpoint → verified ONNX (+ sidecar JSON) for Raspberry Pi 5
 │   ├── run_on_pi.sh            # one command: copy to the Pi over SSH, set up, benchmark, score
-│   ├── raspi_infer.py          # numpy + onnxruntime inference (epoch + causal streaming) + --testdata scoring
+│   ├── raspi_infer.py          # numpy + onnxruntime inference (epoch + causal streaming), --testdata scoring, per-hop latency monitor
 │   ├── make_testdata.py        # cut a small raw-scale test set from the leak-free test split
 │   ├── testdata/EOG_test100.npz#   100 EOG test epochs, 10 per SNR level, ready for the Pi
 │   └── requirements-raspi.txt  # the only two packages the Pi needs
@@ -501,6 +501,102 @@ To cut a different subset (other artifact, more epochs) on the host:
 python -m deploy.make_testdata --data_dir data/EEGdenoisenet/data --artifact EMG --n 200
 ```
 
+### Per-hop latency monitor
+
+`--benchmark` times one window in a tight loop. `--latency` instead watches
+the streaming path hop by hop — what a live loop on the Pi actually
+experiences — and works with `--testdata` and with `--stream`:
+
+```bash
+python raspi_infer.py tcn_mla_eog.onnx --testdata EOG_test100.npz --latency --latency_every 400
+python raspi_infer.py tcn_mla_eog.onnx --input rec.npy --stream --realtime --latency --latency_out lat/rec
+```
+
+For every hop it records the onnxruntime call (`infer_ms`), the whole hop
+including buffer roll, normalisation and rescaling (`total_ms`), the
+completion time and — on Raspberry Pi OS — the SoC temperature. The summary
+gives median / p95 / p99 / max, jitter (p95 − median), **deadline misses**
+against the hop budget (`hop / fs`, 125 ms at hop 32), real-time headroom,
+throughput and the temperature drift over the run:
+
+```
+[latency/testdata] 1584 hops of 32 samples (125.0 ms budget each), 4.5 s wall, first window 3.1 ms
+           per hop   : median 2.821 | p95 2.973 | p99 3.565 | max 16.474 ms  (jitter p95-median 0.152 ms)
+           of which  : onnxruntime 2.806 ms median / 2.936 p95;  pre/post-processing 0.015 ms median
+           real time : 0 deadline misses (0.00%), 42.04x headroom at p95, 317.19 hops/s
+```
+
+`--latency_every N` prints a rolling-window line every N hops (useful for
+spotting thermal throttling during a long run); `--latency_out STEM` writes
+`STEM.json` (the summary) and `STEM.csv` (one row per hop: `hop, infer_ms,
+total_ms, t_s, temp_c`) for plotting.
+
+**`--realtime`** replays a `--stream` input at the sample rate through
+`StreamingDenoiser`, pushing one hop of samples only once it "has arrived"
+(so it takes as long as the recording). The monitor then also reports
+**end-to-end latency** — from a hop's last sample being available to its
+denoised samples being emitted, scheduler jitter included — and the CSV gains
+an `e2e_latency_ms` column. Expect the paced per-hop cost to be higher than
+the back-to-back number (the cores idle between hops, so caches are cold and
+the clock has dropped): on an Apple-silicon host the same model measures
+2.8 ms back-to-back but 12 ms paced, with 17 ms end-to-end. The paced figure
+is the honest one for a live loop; both are far inside the 125 ms budget.
+
+`deploy/run_on_pi.sh` runs `--latency` as part of the standard Pi test and
+copies the trace back to `deploy/artifacts/pi_latency/<model>_hop<hop>.{json,csv}`
+(`LATENCY_EVERY=200` changes the reporting cadence). From Python:
+
+```python
+from raspi_infer import EEGDenoiser, StreamingDenoiser, LatencyMonitor, stream_realtime
+d = EEGDenoiser("tcn_mla_eog.onnx")
+m = LatencyMonitor(hop=32, sample_rate=d.sample_rate, report_every=100)
+s = StreamingDenoiser(d, hop=32, monitor=m)     # live acquisition loop
+for chunk in acquire():
+    out = s.push(chunk)
+m.print_summary(); m.save("lat/session")        # dict + .json/.csv
+
+clean = stream_realtime(d, recording, hop=32, monitor=m)   # paced replay of a recording
+```
+
+### Duty-cycle check: is real-time processing applicable?
+
+Every hop costs one full-window forward pass (~16 ms on a Pi 5) regardless of
+the hop size, so the **duty cycle** — compute per hop ÷ hop period
+(`hop / fs`) — doubles each time the hop is halved. `--duty_cycle` sweeps hop
+sizes with a paced replay and reports, per hop, the duty cycle, the end-to-end
+latency and its drift over the run (a loop that cannot keep up emits later and
+later), deadline misses and a verdict: **OK** (p99 duty ≤ 70 %, no misses,
+no drift), **MARGINAL**, or **FAIL** (misses, or a backlog of more than one
+period).
+
+```bash
+python raspi_infer.py tcn_mla_eog.onnx --testdata EOG_test100.npz --duty_cycle 64,32,16,8,4,2 --duty_seconds 20
+DUTY_HOPS=64,32,16,8,4,2 DUTY_S=20 deploy/run_on_pi.sh pi@raspberrypi.local     # same, over SSH, results copied back
+```
+
+Measured on the Raspberry Pi 5 (Model B Rev 1.1, Python 3.13.5, onnxruntime
+1.30, 2 threads, 20 s paced replay per hop, never throttled, 52 → 58 °C):
+
+| hop | period | forwards/s | compute median / p99 | duty cycle mean / p99 | e2e latency median / max | drift over 20 s | misses | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 64 | 250 ms | 4 | 16.1 / 20.9 ms | 6.8 % / 8.4 % | 16.2 / 21.0 ms | +0.0 ms | 0 | **OK** |
+| 32 | 125 ms | 8 | 18.0 / 18.7 ms | 14.0 % / 14.9 % | 18.1 / 20.0 ms | +2.1 ms | 0 | **OK** |
+| 16 | 62.5 ms | 16 | 16.1 / 16.5 ms | 25.7 % / 26.5 % | 16.1 / 20.6 ms | +0.1 ms | 0 | **OK** |
+| 8 | 31.3 ms | 32 | 16.0 / 17.6 ms | 51.5 % / 56.3 % | 16.1 / 18.5 ms | +0.1 ms | 0 | **OK** |
+| 4 | 15.6 ms | 64 | 16.1 / 17.7 ms | 103 % / 113 % | 368 / 759 ms | +565 ms | 1152 (all) | FAIL |
+| 2 | 7.8 ms | 128 | 16.1 / 17.7 ms | 206 % / 227 % | 9.7 / 19.5 s | +14.6 s | 2304 (all) | FAIL |
+
+So real-time processing is applicable down to **hop 8**: 31 ms of buffering
+plus 16 ms of compute gives **≈ 47 ms total algorithmic latency at a 52 %
+duty cycle**, with no drift over the run. Hop 4 needs 64 forward passes per
+second and the board delivers ~62, so the loop falls behind at ~28 ms per
+second of signal; hop 2 is twice as bad. The default hop 32 (≈ 143 ms total
+latency, 14 % duty) leaves ample margin for an acquisition driver and a
+downstream classifier on the same board. Pushing below hop 8 would need a
+KV cache / incremental attention so that the per-hop cost scales with the hop
+instead of the window (see below), not more threads: 3–4 threads do not make
+one 512-sample forward faster than ~15 ms on this SoC.
+
 ### What the export does not do
 
 - **No INT8.** Dynamic INT8 quantisation was tried and rejected: it derives
@@ -513,7 +609,7 @@ python -m deploy.make_testdata --data_dir data/EEGdenoisenet/data --artifact EMG
   MLA is therefore not exercised by this deployment path.
 
 Validation: `python -m unittest discover -s tests -p 'test_export_onnx.py'`
-covers architecture inference (including legacy checkpoints and `tcn_mla_r{N}` labels), export,
+covers architecture inference (including legacy checkpoints and `tcn_mla_r{N}` labels), export, the per-hop latency monitor,
 agreement, causality, and the Pi-side epoch/streaming contract.
 
 ## Reproducibility
