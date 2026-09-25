@@ -674,11 +674,19 @@
       renderRuns();
     } catch (e) { banner(e.message); }
   }
-  const HEAD = `<tr><th>run</th><th class="num">params</th><th class="num">epochs</th><th class="num">best</th><th class="num">val loss</th><th class="num">RRMSE_t</th><th class="num">RRMSE_s</th><th class="num">ACC</th><th></th></tr>`;
+  const HEAD = `<tr><th>run</th><th class="num">params</th><th class="num" title="master_seed: the one seed this project has. It drives the data splits, the SNR pairing, weight init, dropout and batch order together, so runs that differ only in it are independent repeats of the same experiment.">seed</th><th class="num">epochs</th><th class="num">best</th><th class="num">val loss</th><th class="num">RRMSE_t</th><th class="num">RRMSE_s</th><th class="num">ACC</th><th></th></tr>`;
 
   // The same figure the Params tab calls the checkpoint count: every tensor in
   // model_state except the causal masks.  Rounded here because the column is
   // for scanning; the exact number is one hover away.
+  // Blank rather than 42 when a run never wrote its seed down: an error bar is
+  // exactly the place where an assumed value does real damage, and every run
+  // from before the trainer recorded run_config is in that position.
+  function seedCell(v) {
+    if (v == null) return '<td class="num muted" title="this run predates the trainer recording its config, so its seed is not known — do not assume the default">—</td>';
+    return `<td class="num" title="master_seed = ${v}">${v}</td>`;
+  }
+
   function paramCell(n) {
     if (n == null) return '<td class="num muted" title="the checkpoint could not be read">—</td>';
     const short = n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1000 ? Math.round(n / 1000) + "k" : String(n);
@@ -726,6 +734,7 @@
     return `<tr>
       <td>${when}${r.name}${badges}${plot}</td>
       ${paramCell(r.params)}
+      ${seedCell(r.master_seed)}
       <td class="num">${r.epochs ?? "—"}</td><td class="num">${r.best_epoch ?? "—"}</td>
       <td class="num">${fmt(r.val_loss, 4)}</td><td class="num">${fmt(r.rrmse_t)}</td><td class="num">${fmt(r.rrmse_s)}</td><td class="num">${fmt(r.acc)}</td>
       <td><button data-ckpt="${r.checkpoint}">Use as teacher</button></td></tr>`;
@@ -745,11 +754,11 @@
                       d.betas ? `betas ${d.betas.join("/")}` : null,
                       d.lr_exact === false ? "configured LR not recorded — value shown is the decayed rate" : null]
                      .filter(Boolean).join(" · ");
-        return `<tr class="group${d.lr_exact === false ? " warn" : ""}"><td colspan="9">${g.label}`
+        return `<tr class="group${d.lr_exact === false ? " warn" : ""}"><td colspan="10">${g.label}`
           + `<span class="sub">${g.n} run${g.n === 1 ? "" : "s"}${bits ? " · " + bits : ""}</span></td></tr>`
-          + g.runs.map(runRow).join("");
+          + g.runs.map(r => runRow(r)).join("");
       }).join("");
-      t.innerHTML = HEAD + (body || '<tr><td colspan="9" class="muted">no complete runs yet</td></tr>');
+      t.innerHTML = HEAD + (body || '<tr><td colspan="10" class="muted">no complete runs yet</td></tr>');
     } else if (state.runsView === "loss") {
       const shown = losses.reduce((n, g) => n + g.n, 0);
       const known = losses.filter(g => g.comparable).length;
@@ -765,11 +774,11 @@
               ? (g.sources.includes("recorded") ? "recorded + recovered from weights" : "recovered from weights")
               : "recorded by the run")
           : "run python -m trainer.identify_loss to recover it";
-        return `<tr class="group${g.comparable ? "" : " warn"}"><td colspan="9">${label}`
+        return `<tr class="group${g.comparable ? "" : " warn"}"><td colspan="10">${label}`
           + `<span class="sub">${g.n} run${g.n === 1 ? "" : "s"} · ${note}</span></td></tr>`
-          + g.runs.map(runRow).join("");
+          + g.runs.map(r => runRow(r)).join("");
       }).join("");
-      t.innerHTML = HEAD + (body || '<tr><td colspan="9" class="muted">no complete runs yet</td></tr>');
+      t.innerHTML = HEAD + (body || '<tr><td colspan="10" class="muted">no complete runs yet</td></tr>');
     } else if (state.runsView === "time") {
       const times = state.meta.times || [];
       const guessed = times.some(g => g.sources.some(x => x !== "recorded"));
@@ -779,12 +788,12 @@
         + (guessed ? ` · <b>times marked ~ are file timestamps</b>, not recorded by the run` : "");
       const body = times.map(g => {
         const stale = g.sources.some(x => x !== "recorded");
-        return `<tr class="group"><td colspan="9">${dayLabel(g.date)}`
+        return `<tr class="group"><td colspan="10">${dayLabel(g.date)}`
           + `<span class="sub">${g.n} run${g.n === 1 ? "" : "s"}`
           + `${stale ? " · times read off the files" : ""}</span></td></tr>`
           + g.runs.map(r => runRow(r, clock(r))).join("");
       }).join("");
-      t.innerHTML = HEAD + (body || '<tr><td colspan="9" class="muted">no runs yet</td></tr>');
+      t.innerHTML = HEAD + (body || '<tr><td colspan="10" class="muted">no runs yet</td></tr>');
     } else if (state.runsView === "kind") {
       const shown = kinds.reduce((n, g) => n + g.n, 0);
       $("#runsNote").textContent = `${shown} complete run${shown === 1 ? "" : "s"} in ${kinds.length} kind${kinds.length === 1 ? "" : "s"}`
@@ -796,13 +805,13 @@
                       same("kv_lora_rank") != null ? "rank " + same("kv_lora_rank") : null,
                       params != null ? (params / 1000).toFixed(0) + "k params" : null]
                      .filter(Boolean).join(" · ");
-        return `<tr class="group"><td colspan="9">${g.kind}<span class="sub">${g.n} run${g.n === 1 ? "" : "s"}${spec ? " · " + spec : ""}</span></td></tr>`
-          + g.runs.map(runRow).join("");
+        return `<tr class="group"><td colspan="10">${g.kind}<span class="sub">${g.n} run${g.n === 1 ? "" : "s"}${spec ? " · " + spec : ""}</span></td></tr>`
+          + g.runs.map(r => runRow(r)).join("");
       }).join("");
-      t.innerHTML = HEAD + (body || '<tr><td colspan="9" class="muted">no complete runs yet</td></tr>');
+      t.innerHTML = HEAD + (body || '<tr><td colspan="10" class="muted">no complete runs yet</td></tr>');
     } else {
       $("#runsNote").textContent = `${all.length} checkpoint director${all.length === 1 ? "y" : "ies"} in runs/ · best epoch by val loss · “Use as teacher” fills teacher_ckpt`;
-      t.innerHTML = HEAD + (all.map(runRow).join("") || '<tr><td colspan="9" class="muted">no runs/*/best.pt yet</td></tr>');
+      t.innerHTML = HEAD + (all.map(r => runRow(r)).join("") || '<tr><td colspan="10" class="muted">no runs/*/best.pt yet</td></tr>');
     }
     t.querySelectorAll("button[data-ckpt]").forEach(b => b.addEventListener("click", () => {
       setField(fieldByKey("teacher_ckpt"), b.dataset.ckpt); onChange(); showTab("yaml");

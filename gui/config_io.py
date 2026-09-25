@@ -481,6 +481,7 @@ def _checkpoint_info(path: Path) -> dict:
         ck = torch.load(path, map_location="cpu", weights_only=False)
         info = {"epoch": ck.get("epoch"), "saved_at": ck.get("saved_at"),
                 "model_config": dict(ck.get("model_config") or {}),
+                "run_config": dict(ck.get("run_config") or {}),
                 "params": sum(v.numel() for k, v in (ck.get("model_state") or {}).items()
                               if not k.endswith("causal_mask")),
                 "optimizer": optimizer_info(ck)}
@@ -606,6 +607,7 @@ def list_runs() -> List[dict]:
                "n_attn_layers": mc.get("n_attn_layers"),
                "kv_lora_rank": mc.get("kv_lora_rank"),
                "params": info.get("params"),
+               "master_seed": (info.get("run_config") or {}).get("master_seed"),
                "last_epoch": (_checkpoint_info(d / "last.pt") or info).get("epoch"),
                **_run_time(d, info),
                "loss_fn": None, "loss_source": "unknown",
@@ -624,6 +626,10 @@ def list_runs() -> List[dict]:
                     row.update(epochs=len(vl), best_epoch=i + 1, val_loss=vl[i],
                                rrmse_t=h["rrmse_t"][i], rrmse_s=h["rrmse_s"][i], acc=h["acc"][i],
                                kd="kd_output" in h)
+                    # Same value as the checkpoint's run_config, readable
+                    # without torch; only fall back when it is missing.
+                    if (h.get("config") or {}).get("master_seed") is not None:
+                        row["master_seed"] = h["config"]["master_seed"]
                     # last.pt should sit at the final epoch of that history; if it
                     # does not, the directory was re-used by a later, shorter run.
                     last = row["last_epoch"]

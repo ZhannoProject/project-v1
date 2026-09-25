@@ -237,6 +237,16 @@ first if a training run is still going).
   saved by every checkpoint, so it works on runs of any age. Each row also shows
   an `Adam`/`AdamW` badge whose tooltip carries the full recipe.
 
+  Every row also shows the **seed** the run used, which is what makes a set of
+  rows an error bar rather than a list: runs of the same `variant × artifact`
+  that differ only in `master_seed` are independent repeats, and *Complete by
+  kind* already groups them together. Note that this project has one seed, not
+  several — `master_seed` drives the data splits, the SNR pairing, weight init,
+  dropout and batch order together, so varying it varies all of them at once and
+  the spread you measure is total run-to-run variance. Runs from before the
+  trainer recorded its config show `—`; their seed is genuinely unknown and
+  filling in the default would put invented points in an error bar.
+
   Every row carries its **parameter count** — the same figure the Params tab
   calls the checkpoint count, read from the weights rather than recomputed, with
   the exact number on hover. The grouped views still print it in the group

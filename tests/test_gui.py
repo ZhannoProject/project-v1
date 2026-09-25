@@ -321,6 +321,7 @@ class RunsListingTests(unittest.TestCase):
                 self.assertEqual(dead["status"], "interrupted")
                 self.assertEqual(dead["finished_at_source"], "file")
                 self.assertEqual(dead["finished_at"][:10], "2026-09-23")
+                self.assertIsNone(dead["master_seed"])          # never recorded one
                 # every run appears exactly once
                 self.assertEqual(sum(g["n"] for g in groups), 3)
         finally:
@@ -343,6 +344,29 @@ class RunsListingTests(unittest.TestCase):
                 ck = torch.load(tmp / name, map_location="cpu", weights_only=False)
                 self.assertIn("saved_at", ck, name)
                 self.assertGreaterEqual(datetime.fromisoformat(ck["saved_at"]), before)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @unittest.skipIf(torch is None, "needs a real checkpoint")
+    def test_the_seed_is_read_from_either_place_the_trainer_writes_it(self):
+        """history.json is the cheap source and works without torch; the
+        checkpoint's run_config is the only one an interrupted run has."""
+        tmp = Path(tempfile.mkdtemp(prefix="gui_seed_"))
+        runs = tmp / "runs"; runs.mkdir()
+        both = self._run_dir(runs, "tcn_mla_eog", hist_epochs=2, last_epoch=2)
+        h = json.loads((both / "history.json").read_text())
+        h["config"] = {"loss_fn": "mse", "master_seed": 7}
+        (both / "history.json").write_text(json.dumps(h))
+        # no history at all: the checkpoint has to answer
+        ckpt_only = self._run_dir(runs, "tcn_mla_emg", last_epoch=1)
+        for f in ("best.pt", "last.pt"):
+            torch.save({"epoch": 1, "model_state": {}, "model_config": {},
+                        "run_config": {"master_seed": 13}}, ckpt_only / f)
+        try:
+            with mock.patch.object(config_io, "RUNS_DIR", runs):
+                rows = {r["name"]: r for r in config_io.list_runs()}
+                self.assertEqual(rows["tcn_mla_eog"]["master_seed"], 7)
+                self.assertEqual(rows["tcn_mla_emg"]["master_seed"], 13)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -807,9 +831,25 @@ class RunsTablePageTests(unittest.TestCase):
         head = re.search(r"const HEAD = `(.*?)`;", self.PAGE, re.S)
         columns = len(re.findall(r"<th", head.group(1)))
         # <td ...> written inline, plus the helpers that each contribute one cell
-        cells = len(re.findall(r"<td", body.group(1))) + len(re.findall(r"\$\{paramCell\(", body.group(1)))
+        helpers = len(re.findall(r"\$\{(?:paramCell|seedCell)\(", body.group(1)))
+        cells = len(re.findall(r"<td", body.group(1))) + helpers
         self.assertEqual(cells, columns,
                          f"runRow emits {cells} cells for {columns} columns")
+
+    def test_run_rows_are_not_built_with_a_bare_map(self):
+        """``.map(runRow)`` hands runRow the array index as its second
+        argument, which is the time-stamp slot — every row in the four
+        non-time views then rendered its index in front of the run name.
+        The views that pass no stamp must call it explicitly."""
+        self.assertNotRegex(self.PAGE, r"\.map\(runRow\)")
+
+    def test_an_unrecorded_seed_is_blank_not_assumed(self):
+        """Runs from before the trainer wrote its config down have no seed.
+        Filling the default in would put invented points into an error bar,
+        which is the one place that does real damage."""
+        self.assertIn("seedCell(r.master_seed)", self.PAGE)
+        self.assertRegex(self.PAGE, r"function seedCell\(v\) \{\s*\n\s*if \(v == null\)")
+        self.assertNotRegex(self.PAGE, r"master_seed\s*(\?\?|\|\|)\s*42")
 
     def test_the_params_column_is_served_to_the_page(self):
         """The cell reads r.params, which list_runs has to keep providing."""
