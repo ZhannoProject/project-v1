@@ -6,6 +6,7 @@ Five groups of variants, one file:
   - TCNWithMHA  : TCN_pt1 + Causal MHA + TCN_pt2 (sandwich)
   - TCNWithMLA  : TCN_pt1 + Causal MLA + TCN_pt2 (sandwich)
   - tcn_mla_rN  : MLA with explicit kv_lora_rank=N (rank sweep ablation)
+  - tcn_bi      : the baseline with non-causal convolutions (offline control)
   - tcn_*_bi    : the same models with BIDIRECTIONAL attention — non-causal
                   teachers for knowledge distillation (see below)
 
@@ -117,7 +118,12 @@ Bidirectional teachers and knowledge distillation
   (``decoder`` output, (B, H', T)) can be matched directly.  The training
   side lives in trainer/distillation.py (DistillationLoss, KDTrainer).
 
-  TCNOnly has no attention, hence no bidirectional twin.
+  TCNOnly has no attention to unmask, so its twin ``tcn_bi`` drops
+  causality in the convolutions instead: every position sees the whole
+  window, the TCN stages included.  That makes it the control for the
+  question the ``_bi`` teachers cannot answer on their own — how much of
+  their advantage is seeing the future at all, rather than attending to
+  it.  It is also the teacher a distilled ``tcn`` student needs.
 
 ============================================================================
 """
@@ -148,19 +154,30 @@ class TCNOnly(nn.Module):
 
     This is functionally equivalent to the original EEGCausualAllCNN,
     but uses the refactored CausalTCNBackbone with explicit dilations.
+
+    ``causal=False`` centres the padding in every convolution instead of
+    putting it all on the left (registry: ``tcn_bi``).  Unlike the
+    attention twins — where only attention stops being causal and the TCN
+    stages still cannot see ahead — this makes the model non-causal
+    throughout: it is the offline counterpart of the baseline, and the
+    control that separates "seeing the future helps" from "attention
+    helps".  Same weights and shapes as ``tcn``, so it distils into it.
     """
 
-    def __init__(self, hidden_channels: int = 64, dropout: float = 0.1):
+    def __init__(self, hidden_channels: int = 64, dropout: float = 0.1, causal: bool = True):
         super().__init__()
+        self.causal = causal
 
         self.backbone = CausalTCNBackbone(
             in_channels=1,
             hidden_channels=hidden_channels,
             dilations=[1, 2, 4, 8, 16],
             dropout=dropout,
+            causal=causal,
         )
 
-        # 1×1 conv maps hidden_channels back to 1 channel (the denoised signal)
+        # 1×1 conv maps hidden_channels back to 1 channel (the denoised signal).
+        # Kernel 1 has no temporal extent, so causality does not apply here.
         self.head = nn.Sequential(
             CausalConv1d(hidden_channels, hidden_channels, kernel_size=1),
             nn.PReLU(),
@@ -551,12 +568,15 @@ MLA_RANK_SWEEP = [4, 8, 16, 32]
 for _rank in MLA_RANK_SWEEP:
     VARIANT_REGISTRY[f"tcn_mla_r{_rank}"] = partial(TCNWithMLA, kv_lora_rank=_rank)
 
-# Bidirectional twins: tcn_mha_bi, tcn_mla_bi, tcn_mha_par_bi, tcn_mla_par_bi
-# Same weights and shapes as the causal model, attention mask removed.
-# Non-deployable; they are the teachers for knowledge distillation.
+# Non-causal twins: tcn_bi, tcn_mha_bi, tcn_mla_bi, tcn_mha_par_bi, tcn_mla_par_bi
+# Same weights and shapes as the causal model; what is dropped differs by
+# family.  For the attention variants it is the causal mask, and the TCN
+# stages stay causal.  For tcn_bi there is no attention to unmask, so the
+# convolutions themselves become non-causal and the model sees ahead
+# everywhere.  All of them are non-deployable teachers for distillation.
 BIDIRECTIONAL_SUFFIX = "_bi"
 BIDIRECTIONAL_VARIANTS = []
-for _base in ["tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
+for _base in ["tcn", "tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
     _name = _base + BIDIRECTIONAL_SUFFIX
     VARIANT_REGISTRY[_name] = partial(VARIANT_REGISTRY[_base], causal=False)
     BIDIRECTIONAL_VARIANTS.append(_name)

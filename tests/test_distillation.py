@@ -19,12 +19,20 @@ from trainer.distillation import (DistillationLoss, FeatureProjector, FeatureTap
 from trainer.losses import build_loss
 
 T = 128
-SMALL = dict(hidden_channels=16, max_seq_len=T)
+SMALL = dict(hidden_channels=16)
 
 
 def _small(variant, **kwargs):
-    """Tiny model of any variant; MLA variants get a rank-2 KV bottleneck."""
+    """
+    Tiny model of any variant; MLA variants get a rank-2 KV bottleneck.
+
+    ``max_seq_len`` sizes the causal mask, so only the attention variants take
+    it — ``tcn`` and its non-causal twin ``tcn_bi`` have no attention and would
+    reject it.
+    """
     kw = {**SMALL, **kwargs}
+    if "mha" in variant or "mla" in variant:
+        kw.setdefault("max_seq_len", T)
     if "mla" in variant:
         kw.setdefault("kv_lora_rank", 2)
     return build_model(variant, **kw)

@@ -32,14 +32,28 @@ class CausalConv1d(nn.Module):
     It pads the input sequence on the left side only, ensuring that the model
     cannot "look into the future" when predicting the current time step.
 
+    ``causal=False`` moves the same amount of padding to both sides, so
+    position t sees a window centred on itself instead of ending at it.  The
+    kernel, the channel counts and the output length are untouched — only
+    where the padding goes changes — so a causal layer and its non-causal
+    twin have identical weights and interchangeable state dicts.  The name
+    stays ``CausalConv1d`` for the same reason ``CausalMHA`` does: the
+    causal form is the deployable one, and the switch exists to build the
+    offline teacher (see the ``*_bi`` variants in models/variants.py).
+
     Input  : (B, C_in, T)
     Output : (B, C_out, T)
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, **kwargs):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, causal=True, **kwargs):
         super().__init__()
-        # Calculate padding needed to maintain sequence length while remaining causal
-        self.pad_left = (kernel_size - 1) * dilation
+        # Padding that keeps the sequence length; all of it on the left keeps
+        # the layer causal, split evenly it does not.  An odd kernel (this
+        # project uses 3) splits exactly; an even one puts the extra tap ahead.
+        total = (kernel_size - 1) * dilation
+        self.causal = causal
+        self.pad_left = total if causal else total // 2
+        self.pad_right = 0 if causal else total - total // 2
         self.conv = nn.Conv1d(
             in_channels,
             out_channels,
@@ -50,8 +64,8 @@ class CausalConv1d(nn.Module):
         )
 
     def forward(self, x):
-        # Pad the temporal dimension strictly on the left
-        x = F.pad(x, (self.pad_left, 0))
+        # Pad the temporal dimension: left only when causal, both sides otherwise
+        x = F.pad(x, (self.pad_left, self.pad_right))
         return self.conv(x)
 
 
@@ -67,20 +81,23 @@ class ResidualBlock(nn.Module):
           → CausalConv → PReLU → BN → Dropout → (+shortcut) → out
 
     If in_channels != out_channels, a 1×1 conv aligns the skip path.
+    ``causal`` is passed straight to both convolutions; the 1×1 shortcut
+    has no temporal extent and is unaffected.
 
     Input  : (B, C_in, T)
     Output : (B, C_out, T)
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.1):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.1,
+                 causal=True):
         super().__init__()
         # Main convolutional pathway
         self.conv_block = nn.Sequential(
-            CausalConv1d(in_channels, out_channels, kernel_size, dilation),
+            CausalConv1d(in_channels, out_channels, kernel_size, dilation, causal=causal),
             nn.PReLU(),
             nn.BatchNorm1d(out_channels),
             nn.Dropout(dropout),
-            CausalConv1d(out_channels, out_channels, kernel_size, dilation),
+            CausalConv1d(out_channels, out_channels, kernel_size, dilation, causal=causal),
             nn.PReLU(),
             nn.BatchNorm1d(out_channels),
             nn.Dropout(dropout),
@@ -116,6 +133,13 @@ class CausalTCNBackbone(nn.Module):
     All subsequent blocks are hidden_channels → hidden_channels.
     No output head here — that belongs in the variant model.
 
+    ``causal=False`` centres every convolution's padding instead of putting
+    it all on the left, which makes the whole stack non-causal: with
+    dilations [1, 2, 4, 8, 16] and kernel 3 each position then sees 31
+    samples ahead as well as behind.  Weights and output shape are
+    unchanged, so the two forms share a state dict.  Used for the offline
+    ``tcn_bi`` teacher; the deployable models leave it at True.
+
     Input  : (B, in_channels, T)
     Output : (B, hidden_channels, T)
     """
@@ -127,6 +151,7 @@ class CausalTCNBackbone(nn.Module):
         dilations: List[int],
         kernel_size: int = 3,
         dropout: float = 0.1,
+        causal: bool = True,
     ):
         super().__init__()
 
@@ -137,13 +162,15 @@ class CausalTCNBackbone(nn.Module):
             # All subsequent blocks: hidden_channels → hidden_channels
             c_in = in_channels if i == 0 else hidden_channels
             layers.append(
-                ResidualBlock(c_in, hidden_channels, kernel_size, dilation=dilation_rate, dropout=dropout)
+                ResidualBlock(c_in, hidden_channels, kernel_size, dilation=dilation_rate,
+                              dropout=dropout, causal=causal)
             )
         self.network = nn.Sequential(*layers)
 
         # Store for external inspection (receptive field calculation, etc.)
         self.dilations = dilations
         self.hidden_channels = hidden_channels
+        self.causal = causal
 
     def forward(self, x):
         return self.network(x)

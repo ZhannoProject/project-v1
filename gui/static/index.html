@@ -392,7 +392,7 @@
   function visibility() {
     const v = k => getField(fieldByKey(k));
     const variant = v("variant") || "";
-    const attention = variant !== "tcn";
+    const attention = variant.includes("mha") || variant.includes("mla");
     const ctx = {
       attention,
       mla: attention && variant.includes("mla"),
@@ -824,7 +824,7 @@
             f ? `L${f.n_layers}` : "no attention",
             f ? `d_model ${f.d_model}` : null,
             f && f.kv_lora_rank != null ? `rank ${f.kv_lora_rank}` : null,
-            f && !f.causal ? "bidirectional" : null,
+            r.causal ? null : "non-causal",
             `${fmtN(r.trainable)} trainable`].filter(Boolean).join(" · ");
   }
 
@@ -892,10 +892,15 @@
 
     const f = a.attention;
     const facts = [];
+    // Two different ways a model can be non-causal, and they cost the same
+    // (nothing): the attention twins drop the mask, tcn_bi centres the
+    // convolution padding.  Say which one this is.
+    facts.push(a.causal
+      ? `this model is <b>causal</b> — position t sees [0..t], deployable online`
+      : f
+        ? `attention is <b>bidirectional</b> — every position sees the whole window while the TCN stages stay causal; teacher only, and it costs no parameters (the mask is dropped, nothing is added)`
+        : `the convolutions are <b>non-causal</b> — padding is centred rather than left-only, so every position sees ahead as well as behind; teacher only, and it costs no parameters (the weights are the causal twin's)`);
     if (f) {
-      facts.push(`attention is <b>${f.causal ? "causal" : "bidirectional"}</b> — `
-        + (f.causal ? "position t sees [0..t], deployable online"
-                    : "every position sees the whole window; teacher only, and it costs no parameters (the mask is dropped, nothing is added)"));
       const mha = 2 * f.d_model * f.n_layers;
       facts.push(`KV state to cache per new sample: <b>${fmtN(f.kv_per_step)}</b> fp32 values (<b>${fmtBytes(f.kv_bytes_per_step)}</b>)`
         + (f.kv_lora_rank != null

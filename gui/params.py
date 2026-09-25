@@ -287,6 +287,9 @@ def report(values: Optional[dict] = None, *, config: Optional[dict] = None,
         "variant": cfg.get("variant"),
         "config": {k: v for k, v in cfg.items() if not k.startswith("turboquant")},
         "notes": notes,
+        # Causality is a property of the whole model: the attention twins keep
+        # causal convolutions, tcn_bi has no attention to unmask at all.
+        "causal": bool(getattr(model, "causal", True)),
         "trainable": trainable,
         "frozen": total - trainable,
         "checkpoint": saved,

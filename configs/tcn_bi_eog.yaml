@@ -1,0 +1,40 @@
+# ============================================================
+# KD teacher / offline control — non-causal TCN (EOG artifact)
+# ============================================================
+# The baseline with the padding centred instead of left-only, so every
+# position sees ahead as well as behind.  Same weights and shapes as
+# configs/tcn_eog.yaml, so it teaches that model directly.
+#
+# It is also the control the *_bi attention teachers cannot be on their
+# own: they drop the attention mask but keep causal convolutions, so a
+# gain over `tcn` mixes "sees the future" with "attends to it".  This
+# variant separates the two.  Not deployable — the exporter refuses it.
+
+# --- Model ---
+variant: "tcn_bi"            # non-causal: centred padding in every convolution
+hidden_channels: 64
+
+# --- Data ---
+artifact: "EOG"
+data_dir: "./data/EEGdenoisenet/data/"
+batch_size: 32
+snr_range_db: [-7.0, 2.0]
+master_seed: 42
+
+# --- Training ---
+learning_rate: 5.0e-4
+attn_lr_scale: 1.0          # ignored for TCN-only
+weight_decay: 0.0
+max_epochs: 100
+log_every: 20
+
+# --- Scheduler (CosineAnnealing + linear warmup) ---
+sched_warmup_epochs: 5
+eta_min: 1.0e-6
+
+# --- Loss function ---
+loss_fn: "l1_combined"              # "l1_combined", "l2_combined", "mse", "l1", or "stft"
+
+# --- Output ---
+save_dir: "./runs/tcn_bi_eog"
+tensorboard: false
