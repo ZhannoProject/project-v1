@@ -12,7 +12,7 @@ from unittest import mock
 
 import yaml
 
-from gui import config_io, server
+from gui import config_io, params, server
 from gui.config_io import (coerce, coerce_all, config_path, create_config, read_config,
                            save_config, update_yaml_text, yaml_scalar)
 from gui.server import GUIServer, TrainingJob, build_train_command
@@ -538,6 +538,19 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("invalid run name", err["error"])
 
+    @unittest.skipIf(torch is None, "parameter counting builds a real model")
+    def test_params_endpoints(self):
+        status, r = self.call("/api/params", {"values": {"variant": "tcn_mla_par",
+                                                         "n_attn_layers": 2}})
+        self.assertEqual(status, 200)
+        self.assertEqual(r["variant"], "tcn_mla_par")
+        self.assertEqual(sum(g["params"] for g in r["groups"]), r["trainable"])
+        status, r = self.call("/api/params", {"values": {"variant": "nope"}})
+        self.assertEqual(status, 400)
+        self.assertIn("Unknown variant", r["error"])
+        status, r = self.call("/api/params/run?name=../etc")
+        self.assertEqual(status, 400)
+
     def test_config_preview_save_new(self):
         status, cfg = self.call("/api/config?name=tcn_eog.yaml")
         self.assertEqual(status, 200)
@@ -589,6 +602,65 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(s["stopped"])
         time.sleep(0.3)
         self.assertFalse(self.call("/api/train/status")[1]["running"])
+
+
+@unittest.skipIf(torch is None, "parameter counting builds a real model")
+class ParamReportTests(unittest.TestCase):
+    """The Params tab: the breakdown has to add up and reconcile with the Runs tab."""
+
+    def test_groups_sum_to_the_total_and_items_sum_to_their_group(self):
+        r = params.report({"variant": "tcn_mla_par", "hidden_channels": 64,
+                           "n_attn_layers": 4, "kv_lora_rank": 16})
+        self.assertEqual(sum(g["params"] for g in r["groups"]), r["trainable"])
+        for g in r["groups"]:
+            if g["items"]:
+                self.assertEqual(sum(i["params"] for i in g["items"]), g["params"], g["key"])
+
+    def test_checkpoint_count_matches_what_the_runs_tab_reports(self):
+        """Both numbers are state_dict-minus-causal_mask; they must not drift apart."""
+        from models.variants import build_model_from_config
+        cfg = {"variant": "tcn_mla", "hidden_channels": 64, "n_attn_layers": 2}
+        model = build_model_from_config(params.resolve(cfg))
+        listed = sum(v.numel() for k, v in model.state_dict().items()
+                     if not k.endswith("causal_mask"))
+        self.assertEqual(params.report(cfg)["checkpoint"], listed)
+
+    def test_bidirectional_twin_costs_nothing(self):
+        """*_bi only drops the mask; a teacher and its student are the same size."""
+        base = {"hidden_channels": 64, "n_attn_layers": 4, "kv_lora_rank": 16}
+        student = params.report({**base, "variant": "tcn_mla_par"})
+        teacher = params.report({**base, "variant": "tcn_mla_par_bi"})
+        self.assertEqual(student["trainable"], teacher["trainable"])
+        self.assertTrue(student["attention"]["causal"])
+        self.assertFalse(teacher["attention"]["causal"])
+
+    def test_sandwich_runs_attention_at_the_bottleneck_width(self):
+        """bottleneck_ratio shrinks d_model for the sandwich and is absent from
+        the parallel models, which is where their size difference comes from."""
+        base = {"hidden_channels": 64, "n_attn_layers": 4, "kv_lora_rank": 16}
+        sandwich = params.report({**base, "variant": "tcn_mla", "bottleneck_ratio": 0.25})
+        parallel = params.report({**base, "variant": "tcn_mla_par", "bottleneck_ratio": 0.25})
+        self.assertEqual(sandwich["attention"]["d_model"], 16)
+        self.assertEqual(parallel["attention"]["d_model"], 64)
+        self.assertLess(sandwich["trainable"], parallel["trainable"])
+        self.assertIn("bottleneck_ratio", " ".join(parallel["notes"]))
+
+    def test_a_pinned_rank_is_reported_not_obeyed(self):
+        r = params.report({"variant": "tcn_mla_r8", "hidden_channels": 64, "kv_lora_rank": 32})
+        self.assertEqual(r["attention"]["kv_lora_rank"], 8)
+        self.assertIn("fixes kv_lora_rank = 8", " ".join(r["notes"]))
+
+    def test_an_impossible_shape_is_a_message_not_a_traceback(self):
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            params.report({"variant": "tcn_mla", "hidden_channels": 64, "n_heads": 7})
+        with self.assertRaisesRegex(ValueError, "Unknown variant"):
+            params.report({"variant": "tcn_nonesuch"})
+
+    def test_run_lookup_is_sandboxed_and_needs_a_recorded_architecture(self):
+        with self.assertRaises(ValueError):
+            params.report_for_run("../secrets")
+        with self.assertRaises(FileNotFoundError):
+            params.report_for_run("no_such_run")
 
 
 class NativeAndBundleTests(unittest.TestCase):

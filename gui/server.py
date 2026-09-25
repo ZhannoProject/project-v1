@@ -12,6 +12,8 @@ Local HTTP server behind the training GUI (stdlib only).
     GET  /api/runs/losses        complete runs only, grouped by loss_fn x artifact
     GET  /api/runs/optimizers    complete runs only, grouped by optimizer recipe
     GET  /api/runs/history?name=X    one finished run's per-epoch curve, for the chart
+    POST /api/params             {values} → parameter breakdown of that model
+    GET  /api/params/run?name=X  the same breakdown for a finished run's checkpoint
     POST /api/train              {name, extra_args} → start `python -m trainer --config configs/X`
     POST /api/train/stop
     GET  /api/train/status?since=N   incremental log lines from index N, plus the
@@ -37,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from gui import config_io
+from gui import config_io, params
 from gui.config_io import PROJECT_ROOT, RUNS_DIR
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -304,6 +306,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"optimizers": config_io.runs_by_optimizer()})
             if url.path == "/api/runs/history":
                 return self._json(config_io.read_run_history(q.get("name", "")))
+            if url.path == "/api/params/run":
+                return self._json(params.report_for_run(q.get("name", "")))
             if url.path == "/api/train/status":
                 return self._json(JOB.status(int(q.get("since", 0))))
             return self._error("not found", 404)
@@ -324,6 +328,8 @@ class Handler(BaseHTTPRequestHandler):
                 text = config_io.create_config(body["name"], body.get("template") or None)
                 return self._json({"name": body["name"], "text": text,
                                    "configs": config_io.list_configs()})
+            if url.path == "/api/params":
+                return self._json(params.report(body.get("values", {})))
             if url.path == "/api/train":
                 if JOB.running:
                     return self._error("a training run is already in progress", 409)

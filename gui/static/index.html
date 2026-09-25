@@ -116,6 +116,29 @@
   .legend { display: inline-flex; gap: 12px; flex-wrap: wrap; font-size: 12px; font-variant-numeric: tabular-nums; }
   .legend span.item { display: inline-flex; align-items: center; gap: 5px; }
   .legend i { width: 10px; height: 2px; border-radius: 1px; display: inline-block; }
+  /* Params tab: one row per stage, indented rows per projection inside it.
+     The bar is the row's share of the trainable total, so the eye lands on
+     the FFN / attention split without reading the numbers. */
+  .stats { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .stat { border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; flex: 1 1 118px; }
+  .stat b { display: block; font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .k { font-size: 11px; color: var(--muted); }
+  .stat .d { font-size: 11px; font-variant-numeric: tabular-nums; }
+  .d.up { color: var(--warn); } .d.down { color: var(--ok); } .d.same { color: var(--muted); }
+  #params td.name, #params td.sub { white-space: normal; }
+  #params td.sub { padding-left: 24px; color: var(--muted); font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #params th, #params td { padding: 5px 6px; }
+  #params tr.grp td { font-weight: 600; }
+  #params tr.grp .note { font-weight: 400; color: var(--muted); font-size: 11.5px; margin-left: 8px; }
+  #params tr.total td { font-weight: 600; border-top: 2px solid var(--border); border-bottom: 0; }
+  /* width:1% on the number columns shrinks them to their content, which
+     leaves the rest of the table to the component names. */
+  #params td.num, #params th.num { white-space: nowrap; width: 1%; }
+  #params td.bar { width: 60px; }
+  #params .track { height: 6px; border-radius: 3px; background: var(--code); border: 1px solid var(--border); overflow: hidden; }
+  #params .track i { display: block; height: 100%; background: var(--accent); }
+  .facts { font-size: 12px; color: var(--muted); display: grid; gap: 3px; margin-top: 10px; }
+  .facts b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
   #chart { overflow: hidden; }
   #chart svg { display: block; width: 100%; height: auto; max-height: 260px; }
   footer { padding: 6px 16px 16px; color: var(--muted); font-size: 12px; text-align: center; }
@@ -150,6 +173,7 @@
     <div class="tabs">
       <button data-tab="yaml" class="active">YAML</button>
       <button data-tab="train">Train</button>
+      <button data-tab="params" title="Parameter count of the model the form describes, broken down by stage">Params</button>
       <button data-tab="runs">Runs</button>
     </div>
 
@@ -180,6 +204,17 @@
       </div>
       <pre id="log"></pre>
       <div class="muted" style="margin-top:6px" id="logNote"></div>
+    </div>
+
+    <div class="tab" id="tab-params">
+      <div class="row">
+        <span class="muted" id="paramTitle">…</span>
+        <span class="grow"></span>
+        <label class="muted" for="paramCmp">compare with</label>
+        <select id="paramCmp" title="A second model to diff against — any variant at the form's other settings, or the architecture a finished run recorded"></select>
+      </div>
+      <div class="row" style="margin-top:-4px"><span class="muted" id="paramCmpNote"></span></div>
+      <div id="paramBody"></div>
     </div>
 
     <div class="tab" id="tab-runs">
@@ -216,8 +251,8 @@
 <script>
 (() => {
   const $ = (s, r = document) => r.querySelector(s);
-  const state = { meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {}, job: { running: false, next: 0, metrics: [], maxEpochs: null }, runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0 };
-  let previewTimer = null, pollTimer = null;
+  const state = { meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {}, job: { running: false, next: 0, metrics: [], maxEpochs: null }, runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0, params: { a: null, b: null, error: null }, paramCmp: "" };
+  let previewTimer = null, pollTimer = null, paramTimer = null, paramSeq = 0;
 
   // ---------- helpers ----------
   const api = async (path, body) => {
@@ -392,6 +427,7 @@
   function onChange() {
     state.dirty = true; visibility(); markChanged(); updatePills(); updateCmd();
     clearTimeout(previewTimer); previewTimer = setTimeout(preview, 250);
+    clearTimeout(paramTimer); paramTimer = setTimeout(refreshParams, 250);
   }
 
   // ---------- config I/O ----------
@@ -404,6 +440,7 @@
     const extra = Object.keys(c.extra);
     $("#yamlNote").textContent = (extra.length ? `Other keys kept as-is: ${extra.join(", ")}. ` : "") + "Highlighted lines change on save.";
     visibility(); markChanged(); renderYaml(c.text); updatePills(); updateCmd(); banner("");
+    refreshParams();
     try { localStorage.setItem("trainGui.config", name); } catch (e) {}
   }
 
@@ -625,6 +662,7 @@
       state.meta.runs = runs; state.meta.kinds = kinds || [];
       state.meta.datalists.checkpoints = runs.map(r => r.checkpoint);
       const dl = $("#dl_teacher_ckpt"); if (dl) { dl.innerHTML = ""; for (const r of runs) dl.appendChild(new Option(r.checkpoint)); }
+      fillParamCmp();
       renderRuns();
     } catch (e) { banner(e.message); }
   }
@@ -723,12 +761,174 @@
     } catch (e) { banner(e.message); }
   }
 
+  // ---------- parameter breakdown ----------
+  // The server builds the model the form describes and counts it; this only
+  // lays the numbers out.  Two totals come back and they differ on purpose:
+  // "trainable" is what the optimiser sees, "checkpoint" is what the Runs tab
+  // counts (the same weights plus the BatchNorm running statistics).
+  const fmtN = n => n == null ? "—" : n.toLocaleString("en-US");
+  const fmtK = n => n == null ? "—" : n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
+  const fmtBytes = n => n == null ? "—" : n >= 1 << 20 ? (n / (1 << 20)).toFixed(2) + " MB" : n >= 1024 ? (n / 1024).toFixed(1) + " kB" : n + " B";
+  const pct = (n, tot) => tot ? (100 * n / tot).toFixed(1) + "%" : "—";
+  const escHtml = t => String(t).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  function deltaCell(a, b) {
+    if (a == null || b == null) return '<td class="num muted">—</td>';
+    const d = a - b;
+    const cls = d > 0 ? "up" : d < 0 ? "down" : "same";
+    return `<td class="num d ${cls}">${d > 0 ? "+" : ""}${fmtN(d)}</td>`;
+  }
+
+  function fillParamCmp() {
+    const sel = $("#paramCmp"), keep = sel.value || state.paramCmp || "";
+    sel.innerHTML = "";
+    sel.appendChild(new Option("(nothing)", ""));
+    const gv = document.createElement("optgroup"); gv.label = "variant, at the form's other settings";
+    for (const v of state.meta.choices.variants) gv.appendChild(new Option(v, "v:" + v));
+    sel.appendChild(gv);
+    const named = (state.meta.runs || []).filter(r => r.variant);
+    if (named.length) {
+      const gr = document.createElement("optgroup"); gr.label = "architecture recorded by a run";
+      for (const r of named) gr.appendChild(new Option(r.name, "r:" + r.name));
+      sel.appendChild(gr);
+    }
+    sel.value = [...sel.options].some(o => o.value === keep) ? keep : "";
+    state.paramCmp = sel.value;
+  }
+
+  async function refreshParams(force) {
+    if (!force && !$("#tab-params").classList.contains("active")) return;
+    if (!state.name) return;
+    const cmp = state.paramCmp || "";
+    const values = collectValues();
+    const jobs = [api("/api/params", { values })];
+    if (cmp.startsWith("v:")) jobs.push(api("/api/params", { values: { ...values, variant: cmp.slice(2) } }));
+    else if (cmp.startsWith("r:")) jobs.push(api(`/api/params/run?name=${encodeURIComponent(cmp.slice(2))}`));
+    // Typing fires one of these per keystroke and they can land out of order;
+    // a stale answer must not overwrite a newer one.
+    const seq = ++paramSeq;
+    try {
+      const [a, b] = await Promise.all(jobs);
+      if (seq !== paramSeq) return;
+      state.params = { a, b: b || null, error: null };
+    } catch (e) {
+      if (seq !== paramSeq) return;
+      state.params = { a: state.params.a, b: state.params.b, error: e.message };
+    }
+    renderParams();
+  }
+
+  function describeArch(r) {
+    const f = r.attention;
+    return [r.variant,
+            f ? `L${f.n_layers}` : "no attention",
+            f ? `d_model ${f.d_model}` : null,
+            f && f.kv_lora_rank != null ? `rank ${f.kv_lora_rank}` : null,
+            f && !f.causal ? "bidirectional" : null,
+            `${fmtN(r.trainable)} trainable`].filter(Boolean).join(" · ");
+  }
+
+  function renderParams() {
+    const box = $("#paramBody"), { a, b, error } = state.params;
+    $("#paramTitle").textContent = state.name ? `${a ? a.variant : "…"} — built from the form, not from a checkpoint` : "…";
+    if (!a) {
+      box.innerHTML = error ? `<div class="banner err show">${escHtml(error)}</div>`
+                            : '<div class="muted">nothing to count yet</div>';
+      return;
+    }
+
+    // A run's column is the architecture its checkpoint recorded, which may
+    // differ from the form in more than the variant name — say so rather than
+    // letting the reader assume only one thing changed.
+    $("#paramCmpNote").textContent = b ? `${b.run || b.variant}: ${describeArch(b)}` : "";
+
+    const tot = a.trainable;
+    // Stage rows first, then the projections inside each one.  A stage that
+    // only the compared model has (squeeze/expand exist in the sandwich and
+    // not in the parallel models) still gets a row, with "—" on this side.
+    const bg = new Map((b ? b.groups : []).map(g => [g.key, g]));
+    const rows = [];
+    const groupRow = (g, other) => {
+      const share = tot ? Math.max(1, Math.round(100 * (g ? g.params : 0) / tot)) : 0;
+      const label = g ? g.label : other.label, note = (g || other).note;
+      rows.push(`<tr class="grp"><td class="name">${label}<span class="note">${note || ""}</span></td>`
+        + `<td class="num">${g ? fmtN(g.params) : "—"}</td>`
+        + (b ? `<td class="num">${other ? fmtN(other.params) : "—"}</td>` + deltaCell(g && g.params, other && other.params)
+             : `<td class="num muted">${g ? pct(g.params, tot) : "—"}</td>`
+               + `<td class="bar"><div class="track"><i style="width:${g ? share : 0}%"></i></div></td>`)
+        + `</tr>`);
+      const items = (g ? g.items : other.items) || [];
+      const oi = new Map(((other ? other.items : []) || []).map(i => [i.key, i]));
+      const ai = new Map(((g ? g.items : []) || []).map(i => [i.key, i]));
+      for (const key of [...new Set([...ai.keys(), ...oi.keys()])]) {
+        const x = ai.get(key), y = oi.get(key), ref = x || y;
+        const per = x && x.per_layer != null ? ` <span class="muted">(${fmtN(x.per_layer)} / layer)</span>` : "";
+        rows.push(`<tr><td class="sub">${ref.label}${per}</td>`
+          + `<td class="num">${x ? fmtN(x.params) : "—"}</td>`
+          + (b ? `<td class="num">${y ? fmtN(y.params) : "—"}</td>` + deltaCell(x && x.params, y && y.params)
+               : `<td class="num muted">${x ? pct(x.params, tot) : "—"}</td><td></td>`)
+          + `</tr>`);
+      }
+    };
+    for (const g of a.groups) groupRow(g, bg.get(g.key));
+    for (const g of (b ? b.groups : [])) if (!a.groups.some(x => x.key === g.key)) groupRow(null, g);
+    rows.push(`<tr class="total"><td>trainable total</td><td class="num">${fmtN(a.trainable)}</td>`
+      + (b ? `<td class="num">${fmtN(b.trainable)}</td>` + deltaCell(a.trainable, b.trainable) : "<td></td><td></td>")
+      + `</tr>`);
+
+    const head = `<tr><th>component</th><th class="num">${a.variant}</th>`
+      + (b ? `<th class="num">${escHtml(b.run || b.variant)}</th><th class="num">Δ</th>`
+           : `<th class="num">share</th><th></th>`) + `</tr>`;
+
+    const cmpNote = b ? `<span class="d ${a.trainable > b.trainable ? "up" : a.trainable < b.trainable ? "down" : "same"}">`
+      + `${a.trainable >= b.trainable ? "+" : ""}${fmtN(a.trainable - b.trainable)} vs ${b.run || b.variant}</span>` : "";
+    const stats = `<div class="stats">
+      <div class="stat"><b>${fmtK(a.trainable)}</b><span class="k">trainable params</span><div class="d">${cmpNote}</div></div>
+      <div class="stat"><b>${fmtK(a.checkpoint)}</b><span class="k">checkpoint count — what the Runs tab shows</span></div>
+      <div class="stat"><b>${fmtBytes(a.bytes_fp32)}</b><span class="k">weights, fp32</span></div>
+      ${a.attention ? `<div class="stat"><b>${a.attention.d_model}</b><span class="k">attention width (d_model)</span></div>
+      <div class="stat"><b>${a.attention.n_layers} × ${a.attention.attention_type.toUpperCase()}</b><span class="k">${a.attention.n_heads} heads · head_dim ${a.attention.head_dim}</span></div>` : ""}
+    </div>`;
+
+    const f = a.attention;
+    const facts = [];
+    if (f) {
+      facts.push(`attention is <b>${f.causal ? "causal" : "bidirectional"}</b> — `
+        + (f.causal ? "position t sees [0..t], deployable online"
+                    : "every position sees the whole window; teacher only, and it costs no parameters (the mask is dropped, nothing is added)"));
+      const mha = 2 * f.d_model * f.n_layers;
+      facts.push(`KV state to cache per new sample: <b>${fmtN(f.kv_per_step)}</b> fp32 values (<b>${fmtBytes(f.kv_bytes_per_step)}</b>)`
+        + (f.kv_lora_rank != null
+            ? ` — the latent, ${f.kv_compression}× smaller than the K+V an MHA of this width would cache (2·${f.d_model}·${f.n_layers} = ${fmtN(mha)})`
+            : " — full K and V")
+        + (f.turboquant_bits ? `; TurboQuant would quantise these to ${f.turboquant_bits} bits and is not folded in` : ""));
+      facts.push(`the causal masks add <b>${fmtBytes(a.mask_elements * 4)}</b> of constant ones to every saved checkpoint; they are buffers, not weights, and the counts above exclude them`);
+    }
+    if (a.buffers) facts.push(`checkpoint − trainable = <b>${fmtN(a.buffers)}</b> BatchNorm running statistics (saved, never optimised)`);
+
+    const notes = (a.notes || []).map(n => `<div class="banner info show" style="margin:0 0 8px">${escHtml(n)}</div>`).join("");
+    const errLine = error
+      ? `<div class="banner err show" style="margin:0 0 8px">${escHtml(error)} — the breakdown below is the last model that built.</div>`
+      : "";
+    box.innerHTML = errLine + notes + stats
+      + `<div style="overflow:auto"><table id="params">${head}${rows.join("")}</table></div>`
+      + `<div class="facts">${facts.map(x => `<div>${x}</div>`).join("")}</div>`;
+  }
+
   // ---------- tabs / wiring ----------
   function showTab(id) {
     document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === id));
     document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.id === "tab-" + id));
   }
-  document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
+  document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click", () => {
+    showTab(b.dataset.tab);
+    if (b.dataset.tab === "params") refreshParams(true);
+  }));
+  $("#paramCmp").addEventListener("change", e => {
+    state.paramCmp = e.target.value;
+    try { localStorage.setItem("trainGui.paramCmp", state.paramCmp); } catch (err) {}
+    refreshParams(true);
+  });
   $("#configSel").addEventListener("change", async e => {
     const target = e.target.value;
     if (state.dirty) {
@@ -763,6 +963,8 @@
       fillConfigList(state.meta.configs);
       try { const v = localStorage.getItem("trainGui.runsView"); if (["all", "kind", "loss", "optim"].includes(v)) state.runsView = v; } catch (e) {}
       $("#runsView").querySelectorAll("button").forEach(x => x.classList.toggle("active", x.dataset.view === state.runsView));
+      try { const c = localStorage.getItem("trainGui.paramCmp"); if (c) state.paramCmp = c; } catch (e) {}
+      fillParamCmp();
       renderRuns();
       renderChart();
       $("#envNote").textContent = `${state.meta.env.project_root} · ${state.meta.env.python} · device ${state.meta.env.device} · ⌘S saves`;

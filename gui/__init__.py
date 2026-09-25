@@ -7,6 +7,7 @@ and launches ``python -m trainer`` from them.
 
 Stdlib only (http.server + the pyyaml the project already needs).
     config_io.py   schema of the YAML keys + comment-preserving writer
+    params.py      parameter breakdown of the model a config describes
     server.py      JSON API and the training-job runner
     static/        the single-page front end
 """
