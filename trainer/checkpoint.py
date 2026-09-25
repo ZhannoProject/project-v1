@@ -5,6 +5,7 @@ the best model can be loaded for evaluation.
 """
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -20,6 +21,10 @@ def save_checkpoint(save_dir: Path, epoch, model, optimizer, scheduler, val_loss
     """
     ckpt = {
         "epoch": epoch,
+        # When this epoch was written.  A file mtime answers the same question
+        # until the directory is copied, restored or synced, and then it quietly
+        # answers a different one.
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
         "model_state": model.state_dict(),
         "model_config": getattr(model, "model_config", {}),
         # What produced this number — without it val_loss cannot be compared across runs.

@@ -9,6 +9,7 @@ Local HTTP server behind the training GUI (stdlib only).
     POST /api/config/new         {name, template} → create a preset
     GET  /api/runs               runs/ table (refreshed on demand)
     GET  /api/runs/kinds         complete runs only, grouped by variant x artifact
+    GET  /api/runs/times         every run, newest first, grouped by day
     GET  /api/runs/losses        complete runs only, grouped by loss_fn x artifact
     GET  /api/runs/optimizers    complete runs only, grouped by optimizer recipe
     GET  /api/runs/history?name=X    one finished run's per-epoch curve, for the chart
@@ -208,6 +209,7 @@ def meta() -> dict:
     runs = config_io.list_runs()
     return {
         "kinds": config_io.runs_by_kind(runs),
+        "times": config_io.runs_by_time(runs),
         "losses": config_io.runs_by_loss(runs),
         "optimizers": config_io.runs_by_optimizer(runs),
         "schema": config_io.schema_as_json(),
@@ -296,10 +298,13 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/runs":
                 runs = config_io.list_runs()
                 return self._json({"runs": runs, "kinds": config_io.runs_by_kind(runs),
+                                   "times": config_io.runs_by_time(runs),
                                    "losses": config_io.runs_by_loss(runs),
                                    "optimizers": config_io.runs_by_optimizer(runs)})
             if url.path == "/api/runs/kinds":
                 return self._json({"kinds": config_io.runs_by_kind()})
+            if url.path == "/api/runs/times":
+                return self._json({"times": config_io.runs_by_time()})
             if url.path == "/api/runs/losses":
                 return self._json({"losses": config_io.runs_by_loss()})
             if url.path == "/api/runs/optimizers":

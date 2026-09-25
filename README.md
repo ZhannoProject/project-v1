@@ -220,7 +220,7 @@ first if a training run is still going).
   the bulk of the run — epoch 1 is often several times worse than the rest and
   would otherwise flatten everything; the caption says when early epochs run
   off the top.
-- **Runs** has four views. *Complete by kind* groups finished runs by
+- **Runs** has five views. *Complete by kind* groups finished runs by
   `variant × artifact` (the thing an ablation row compares), best RRMSE_t first,
   with the depth, KV rank and parameter count read from the checkpoint itself.
   *Complete by loss* groups them by `loss_fn × artifact` instead, ranked by
@@ -236,6 +236,15 @@ first if a training run is still going).
   has to be recomputed for this: `optimizer_state` and `scheduler_state` are
   saved by every checkpoint, so it works on runs of any age. Each row also shows
   an `Adam`/`AdamW` badge whose tooltip carries the full recipe.
+
+  *By time* is the other kind of question: not which run is best but what you
+  ran, and when. Every run, newest first, grouped by the day it last wrote, with
+  the clock time on each row — and unlike the three views above it keeps the
+  interrupted and stale runs, because a run that died is the main thing you come
+  here looking for. Checkpoints written since September 2026 record their own
+  `saved_at`; older runs fall back to the mtime of `last.pt`, which is the same
+  answer until the directory is copied or restored. Those rows are marked with a
+  `~` so a surprising order can be explained rather than puzzled over.
 
   *All runs* lists every `runs/*/best.pt` and marks the ones the grouped views
   leave out:

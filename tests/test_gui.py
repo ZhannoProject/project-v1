@@ -1,5 +1,6 @@
 """Run: python -m unittest discover -s tests -p 'test_gui.py'."""
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -264,15 +266,20 @@ class RunsListingTests(unittest.TestCase):
     """complete / stale / interrupted, and the grouping the Runs tab shows."""
 
     def _run_dir(self, root, name, hist_epochs=None, last_epoch=None, model_config=None,
-                 loss_fn=None, sidecar_loss=None):
+                 loss_fn=None, sidecar_loss=None, saved_at=None, mtime=None):
         d = root / name
         d.mkdir()
         (d / "best.pt").write_bytes(b"")
         if last_epoch is not None and torch is not None:
-            torch.save({"epoch": last_epoch, "model_state": {},
-                        "model_config": model_config or {}}, d / "last.pt")
-            torch.save({"epoch": last_epoch, "model_state": {},
-                        "model_config": model_config or {}}, d / "best.pt")
+            ck = {"epoch": last_epoch, "model_state": {}, "model_config": model_config or {}}
+            if saved_at:
+                ck["saved_at"] = saved_at
+            torch.save(ck, d / "last.pt")
+            torch.save(ck, d / "best.pt")
+        if mtime is not None:
+            for f in ("best.pt", "last.pt"):
+                if (d / f).is_file():
+                    os.utime(d / f, (mtime, mtime))
         if hist_epochs:
             n = hist_epochs
             h = {"train_loss": [1.0] * n, "val_loss": [1.0 - i / 100 for i in range(n)],
@@ -284,6 +291,76 @@ class RunsListingTests(unittest.TestCase):
             (d / "loss_fn.json").write_text(json.dumps(
                 {"run": name, "status": "recovered", "loss_fn": sidecar_loss}))
         return d
+
+    @unittest.skipIf(torch is None, "needs real checkpoints to carry a timestamp")
+    def test_runs_by_time_is_newest_first_and_keeps_the_dead_ones(self):
+        """The time view is the log, not the results: a run that died is the
+        main thing you come here to find, so unlike the other groupings it must
+        not filter by status."""
+        tmp = Path(tempfile.mkdtemp(prefix="gui_time_"))
+        runs = tmp / "runs"; runs.mkdir()
+        day = datetime(2026, 9, 25, 14, 30)
+        older = datetime(2026, 9, 23, 9, 0)
+        self._run_dir(runs, "tcn_mla_eog", hist_epochs=3, last_epoch=3,
+                      saved_at=day.isoformat(timespec="seconds"))
+        self._run_dir(runs, "tcn_mha_eog", hist_epochs=3, last_epoch=3,
+                      saved_at=day.replace(hour=8).isoformat(timespec="seconds"))
+        # no history: interrupted, and the mtime is all there is to go on
+        self._run_dir(runs, "tcn_eog", last_epoch=1, mtime=older.timestamp())
+        try:
+            with mock.patch.object(config_io, "RUNS_DIR", runs):
+                groups = config_io.runs_by_time()
+                self.assertEqual([g["date"] for g in groups], ["2026-09-25", "2026-09-23"])
+                self.assertEqual([r["name"] for r in groups[0]["runs"]],
+                                 ["tcn_mla_eog", "tcn_mha_eog"])       # newest first
+                self.assertEqual(groups[0]["sources"], ["recorded"])
+                # the interrupted run is kept, and its time is flagged as a guess
+                dead = groups[1]["runs"][0]
+                self.assertEqual(dead["name"], "tcn_eog")
+                self.assertEqual(dead["status"], "interrupted")
+                self.assertEqual(dead["finished_at_source"], "file")
+                self.assertEqual(dead["finished_at"][:10], "2026-09-23")
+                # every run appears exactly once
+                self.assertEqual(sum(g["n"] for g in groups), 3)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @unittest.skipIf(torch is None, "needs a real checkpoint")
+    def test_the_trainer_writes_the_timestamp_the_view_reads(self):
+        """The two halves of this feature live in different files; if
+        save_checkpoint ever stops writing saved_at, every new run silently
+        falls back to mtimes and nothing else notices."""
+        from trainer.checkpoint import save_checkpoint
+        tmp = Path(tempfile.mkdtemp(prefix="gui_stamp_"))
+        try:
+            model = torch.nn.Linear(2, 2)
+            opt = torch.optim.SGD(model.parameters(), lr=0.1)
+            sched = torch.optim.lr_scheduler.StepLR(opt, 1)
+            before = datetime.now().replace(microsecond=0)
+            save_checkpoint(tmp, 1, model, opt, sched, 0.5, {}, is_best=True)
+            for name in ("best.pt", "last.pt"):
+                ck = torch.load(tmp / name, map_location="cpu", weights_only=False)
+                self.assertIn("saved_at", ck, name)
+                self.assertGreaterEqual(datetime.fromisoformat(ck["saved_at"]), before)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @unittest.skipIf(torch is None, "needs a real checkpoint")
+    def test_a_recorded_time_beats_the_file_mtime(self):
+        """A copied or restored directory has a truthful-looking mtime that
+        describes the copy.  When the run wrote its own time, use that."""
+        tmp = Path(tempfile.mkdtemp(prefix="gui_time2_"))
+        runs = tmp / "runs"; runs.mkdir()
+        self._run_dir(runs, "tcn_mla_eog", hist_epochs=2, last_epoch=2,
+                      saved_at="2026-01-02T03:04:05",
+                      mtime=datetime(2026, 9, 25).timestamp())
+        try:
+            with mock.patch.object(config_io, "RUNS_DIR", runs):
+                row = config_io.list_runs()[0]
+                self.assertEqual(row["finished_at"], "2026-01-02T03:04:05")
+                self.assertEqual(row["finished_at_source"], "recorded")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_status_classification_and_kinds(self):
         tmp = Path(tempfile.mkdtemp(prefix="gui_runs_"))
@@ -513,6 +590,11 @@ class ApiTests(unittest.TestCase):
     def test_runs_endpoints_expose_kinds_and_history(self):
         status, payload = self.call("/api/runs")
         self.assertEqual(status, 200)
+        self.assertIn("times", payload)
+        status, times = self.call("/api/runs/times")
+        self.assertEqual(status, 200)
+        self.assertEqual(sum(g["n"] for g in times["times"]), 1)
+        self.assertTrue(all("date" in g and "sources" in g for g in times["times"]))
         self.assertEqual([r["name"] for r in payload["runs"]], ["demo_bi_eog"])
         self.assertIn("kinds", payload)
         self.assertEqual(sum(g["n"] for g in payload["kinds"]), 1)

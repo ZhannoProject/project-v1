@@ -95,6 +95,7 @@
   button.link { border: 0; background: transparent; color: var(--accent); padding: 0 4px; font-size: 11.5px; }
   button.link:hover { text-decoration: underline; background: transparent; }
   .badge.partial { color: var(--muted); }
+  .stamp { display: inline-block; width: 44px; margin-right: 8px; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11.5px; }
   .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
   .seg button { border: 0; border-radius: 0; padding: 4px 10px; color: var(--muted); background: transparent; }
   .seg button + button { border-left: 1px solid var(--border); }
@@ -223,6 +224,7 @@
           <button data-view="kind" class="active">Complete by kind</button>
           <button data-view="loss" title="Grouped by the loss function and artifact the run was trained with — val loss is only comparable inside one group">Complete by loss</button>
           <button data-view="optim" title="Grouped by the optimizer recipe recorded in each checkpoint — family, configured LR, decoder/TCN LR ratio and schedule">Complete by optimizer</button>
+          <button data-view="time" title="Every run, newest first, grouped by the day it last wrote — including the ones that died">By time</button>
           <button data-view="all">All runs</button>
         </span>
         <span class="grow"></span>
@@ -658,8 +660,14 @@
   const fmt = (x, d = 3) => x == null ? "—" : Number(x).toFixed(d);
   async function refreshRuns() {
     try {
-      const { runs, kinds } = await api("/api/runs");
-      state.meta.runs = runs; state.meta.kinds = kinds || [];
+      // /api/runs returns every grouping; take them all. Picking out only two
+      // left the loss and optimizer views showing whatever the page loaded with,
+      // so a run that finished while the page was open never appeared in them.
+      const payload = await api("/api/runs");
+      const runs = payload.runs;
+      for (const key of ["runs", "kinds", "times", "losses", "optimizers"]) {
+        state.meta[key] = payload[key] || [];
+      }
       state.meta.datalists.checkpoints = runs.map(r => r.checkpoint);
       const dl = $("#dl_teacher_ckpt"); if (dl) { dl.innerHTML = ""; for (const r of runs) dl.appendChild(new Option(r.checkpoint)); }
       fillParamCmp();
@@ -668,7 +676,31 @@
   }
   const HEAD = `<tr><th>run</th><th class="num">epochs</th><th class="num">best</th><th class="num">val loss</th><th class="num">RRMSE_t</th><th class="num">RRMSE_s</th><th class="num">ACC</th><th></th></tr>`;
 
-  function runRow(r) {
+  // "Today" is the reader's today, so the day heading is worked out here rather
+  // than on the server: the page is reloaded far more often than the clock
+  // crosses midnight, and a stale heading is then one refresh from correct.
+  function dayLabel(date) {
+    if (!date) return "no timestamp";
+    const midnight = d => { const c = new Date(d); c.setHours(0, 0, 0, 0); return c; };
+    const days = Math.round((midnight(new Date()) - midnight(new Date(date + "T00:00:00"))) / 86400000);
+    if (days === 0) return "Today";
+    if (days === 1) return "Yesterday";
+    const d = new Date(date + "T00:00:00");
+    return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })
+      + (d.getFullYear() === new Date().getFullYear() ? "" : ` ${d.getFullYear()}`);
+  }
+
+  // The clock time, and a ~ when it came from a file mtime rather than the run.
+  function clock(r) {
+    if (!r.finished_at) return "";
+    const t = r.finished_at.slice(11, 16);
+    const guessed = r.finished_at_source !== "recorded";
+    return `<span class="stamp" title="${guessed
+      ? "read from the checkpoint file's timestamp — accurate unless the directory was copied or restored"
+      : "recorded by the run itself"}">${guessed ? "~" : ""}${t}</span>`;
+  }
+
+  function runRow(r, when = "") {
     const badges = (r.bidirectional ? '<span class="badge bi">bi</span>' : "")
       + (r.kd ? '<span class="badge kd">kd</span>' : "")
       + (r.status === "stale" ? '<span class="badge stale" title="history.json and the weights beside it come from different runs — this directory was re-used">stale</span>' : "")
@@ -683,7 +715,7 @@
           : '<span class="badge loss" title="this run recorded no loss_fn and it could not be recovered — its val loss is not comparable with anything">loss ?</span>');
     const plot = r.status === "interrupted" ? "" : ` <button class="link" data-hist="${r.name}" title="Plot this run's curve in the Train tab">curve</button>`;
     return `<tr>
-      <td>${r.name}${badges}${plot}</td>
+      <td>${when}${r.name}${badges}${plot}</td>
       <td class="num">${r.epochs ?? "—"}</td><td class="num">${r.best_epoch ?? "—"}</td>
       <td class="num">${fmt(r.val_loss, 4)}</td><td class="num">${fmt(r.rrmse_t)}</td><td class="num">${fmt(r.rrmse_s)}</td><td class="num">${fmt(r.acc)}</td>
       <td><button data-ckpt="${r.checkpoint}">Use as teacher</button></td></tr>`;
@@ -728,6 +760,21 @@
           + g.runs.map(runRow).join("");
       }).join("");
       t.innerHTML = HEAD + (body || '<tr><td colspan="8" class="muted">no complete runs yet</td></tr>');
+    } else if (state.runsView === "time") {
+      const times = state.meta.times || [];
+      const guessed = times.some(g => g.sources.some(x => x !== "recorded"));
+      $("#runsNote").innerHTML = `${all.length} run${all.length === 1 ? "" : "s"} over `
+        + `${times.length} day${times.length === 1 ? "" : "s"}, newest first`
+        + ` · unfinished and stale runs are kept here — this is the log, not the results`
+        + (guessed ? ` · <b>times marked ~ are file timestamps</b>, not recorded by the run` : "");
+      const body = times.map(g => {
+        const stale = g.sources.some(x => x !== "recorded");
+        return `<tr class="group"><td colspan="8">${dayLabel(g.date)}`
+          + `<span class="sub">${g.n} run${g.n === 1 ? "" : "s"}`
+          + `${stale ? " · times read off the files" : ""}</span></td></tr>`
+          + g.runs.map(r => runRow(r, clock(r))).join("");
+      }).join("");
+      t.innerHTML = HEAD + (body || '<tr><td colspan="8" class="muted">no runs yet</td></tr>');
     } else if (state.runsView === "kind") {
       const shown = kinds.reduce((n, g) => n + g.n, 0);
       $("#runsNote").textContent = `${shown} complete run${shown === 1 ? "" : "s"} in ${kinds.length} kind${kinds.length === 1 ? "" : "s"}`
@@ -968,7 +1015,7 @@
       state.meta = await api("/api/meta");
       buildForm();
       fillConfigList(state.meta.configs);
-      try { const v = localStorage.getItem("trainGui.runsView"); if (["all", "kind", "loss", "optim"].includes(v)) state.runsView = v; } catch (e) {}
+      try { const v = localStorage.getItem("trainGui.runsView"); if (["all", "kind", "loss", "optim", "time"].includes(v)) state.runsView = v; } catch (e) {}
       $("#runsView").querySelectorAll("button").forEach(x => x.classList.toggle("active", x.dataset.view === state.runsView));
       try { const c = localStorage.getItem("trainGui.paramCmp"); if (c) state.paramCmp = c; } catch (e) {}
       fillParamCmp();

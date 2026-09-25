@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -478,7 +479,8 @@ def _checkpoint_info(path: Path) -> dict:
     try:
         import torch
         ck = torch.load(path, map_location="cpu", weights_only=False)
-        info = {"epoch": ck.get("epoch"), "model_config": dict(ck.get("model_config") or {}),
+        info = {"epoch": ck.get("epoch"), "saved_at": ck.get("saved_at"),
+                "model_config": dict(ck.get("model_config") or {}),
                 "params": sum(v.numel() for k, v in (ck.get("model_state") or {}).items()
                               if not k.endswith("causal_mask")),
                 "optimizer": optimizer_info(ck)}
@@ -486,6 +488,30 @@ def _checkpoint_info(path: Path) -> dict:
         info = {}
     _CKPT_CACHE[key] = (st.st_mtime, st.st_size, info)
     return info
+
+
+def _run_time(run_dir: Path, best_info: dict) -> dict:
+    """
+    When the run last wrote, as ``(finished_at, finished_at_source)``.
+
+    ``recorded``  the checkpoint says so itself (``saved_at``, since Sep 2026)
+    ``file``      the mtime of last.pt, which is the same answer until the
+                  directory is copied, restored from a backup or synced — then
+                  it is the time of the copy, not of the run
+
+    Sorting by it is still the right default for older runs; the view marks the
+    ones it had to guess so a suspicious ordering can be explained.
+    """
+    last = run_dir / "last.pt"
+    newest = last if last.is_file() else run_dir / "best.pt"
+    recorded = (_checkpoint_info(newest) or {}).get("saved_at") or best_info.get("saved_at")
+    if recorded:
+        return {"finished_at": recorded, "finished_at_source": "recorded"}
+    try:
+        stamp = datetime.fromtimestamp(newest.stat().st_mtime)
+    except OSError:
+        return {"finished_at": None, "finished_at_source": "unknown"}
+    return {"finished_at": stamp.isoformat(timespec="seconds"), "finished_at_source": "file"}
 
 
 def _artifact_from_name(name: str) -> Optional[str]:
@@ -581,6 +607,7 @@ def list_runs() -> List[dict]:
                "kv_lora_rank": mc.get("kv_lora_rank"),
                "params": info.get("params"),
                "last_epoch": (_checkpoint_info(d / "last.pt") or info).get("epoch"),
+               **_run_time(d, info),
                "loss_fn": None, "loss_source": "unknown",
                "optimizer": (info.get("optimizer") or {}).get("label"),
                "optimizer_key": (info.get("optimizer") or {}).get("key"),
@@ -689,6 +716,39 @@ def runs_by_optimizer(runs: Optional[List[dict]] = None) -> List[dict]:
         g["n"] = len(g["runs"])
         g["known"] = g["key"] != "unknown"
     return sorted(groups.values(), key=lambda g: (not g["known"], g["key"]))
+
+
+def runs_by_time(runs: Optional[List[dict]] = None) -> List[dict]:
+    """
+    Every run, newest first, grouped by the day it last wrote.
+
+    The other views answer "which of these is best"; this one answers "what did
+    I just run, and did it survive".  That is why it keeps the interrupted and
+    stale runs the result views drop — a run that died is exactly what you come
+    here looking for.
+
+    Only the calendar date is grouped on.  Turning it into "Today" belongs to
+    the page, whose clock is the one the reader is actually looking at.
+    """
+    groups: Dict[str, dict] = {}
+    undated = []
+    for r in (list_runs() if runs is None else runs):
+        stamp = r.get("finished_at")
+        if not stamp:
+            undated.append(r)
+            continue
+        groups.setdefault(stamp[:10], {"date": stamp[:10], "runs": []})["runs"].append(r)
+    out = []
+    for g in sorted(groups.values(), key=lambda g: g["date"], reverse=True):
+        g["runs"].sort(key=lambda r: r["finished_at"], reverse=True)
+        g["n"] = len(g["runs"])
+        # A day is only as trustworthy as its weakest timestamp; say so once per
+        # heading rather than on every row.
+        g["sources"] = sorted({r.get("finished_at_source") or "unknown" for r in g["runs"]})
+        out.append(g)
+    if undated:
+        out.append({"date": None, "runs": undated, "n": len(undated), "sources": ["unknown"]})
+    return out
 
 
 def runs_by_kind(runs: Optional[List[dict]] = None) -> List[dict]:
