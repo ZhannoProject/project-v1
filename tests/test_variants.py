@@ -18,8 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 from models.TCN_backbone import CausalConv1d, CausalTCNBackbone
-from models.variants import (BIDIRECTIONAL_VARIANTS, VARIANT_REGISTRY, build_model,
-                             base_variant, variant_is_causal)
+from models.variants import (BIDIRECTIONAL_VARIANTS, FULLY_BIDIRECTIONAL_VARIANTS,
+                             VARIANT_REGISTRY, build_model, base_variant, variant_is_causal)
 
 B, T, SPLIT = 2, 512, 256
 
@@ -56,14 +56,44 @@ class CausalityTests(unittest.TestCase):
         self.assertFalse(build_model("tcn_bi", hidden_channels=64).backbone.causal)
         self.assertTrue(build_model("tcn_mla_bi", hidden_channels=64).tcn_pt1.causal)
 
+    def test_full_bi_is_non_causal_everywhere_and_bi_is_not(self):
+        """The two axes must stay separable: X_bi looks ahead only through
+        attention, X_full_bi looks ahead in the convolutions too.  If the TCN
+        stages ever stopped being causal in X_bi, the control it provides
+        would be gone and nothing else would notice."""
+        for full in FULLY_BIDIRECTIONAL_VARIANTS:
+            attn_only = full.replace("_full_bi", "_bi")
+            with self.subTest(variant=full):
+                a, b = build_model(attn_only, hidden_channels=64), build_model(full, hidden_channels=64)
+                self.assertTrue(a.causal_tcn)
+                self.assertFalse(b.causal_tcn)
+                self.assertFalse(a.causal)
+                self.assertFalse(b.causal)
+                self.assertTrue(a.tcn_pt1.causal and a.tcn_pt2.causal)
+                self.assertFalse(b.tcn_pt1.causal or b.tcn_pt2.causal)
+                # Both see ahead, but unmasking every layer leaks far more than
+                # unmasking attention alone — orders of magnitude, not a margin.
+                self.assertGreater(leak(b), 100 * leak(a))
+
+    def test_tcn_has_no_full_bi_because_the_axes_collapse(self):
+        """With no attention there is only one thing to make non-causal, so
+        tcn_bi already is what tcn_full_bi would be."""
+        self.assertNotIn("tcn_full_bi", VARIANT_REGISTRY)
+        self.assertEqual([v for v in FULLY_BIDIRECTIONAL_VARIANTS if base_variant(v) == "tcn"], [])
+
     def test_a_twin_is_the_same_model_with_different_padding(self):
         """Same shapes both ways, or the teacher cannot initialise the student."""
         for causal_name in ("tcn", "tcn_mla", "tcn_mla_par"):
             with self.subTest(variant=causal_name):
-                a = build_model(causal_name, hidden_channels=64).state_dict()
-                b = build_model(causal_name + "_bi", hidden_channels=64).state_dict()
-                self.assertEqual({k: v.shape for k, v in a.items()},
-                                 {k: v.shape for k, v in b.items()})
+                shapes = []
+                for suffix in ("", "_bi", "_full_bi"):
+                    name = causal_name + suffix
+                    if name not in VARIANT_REGISTRY:
+                        continue
+                    sd = build_model(name, hidden_channels=64).state_dict()
+                    shapes.append({k: v.shape for k, v in sd.items()})
+                for other in shapes[1:]:
+                    self.assertEqual(shapes[0], other)
 
     def test_the_name_and_the_flag_cannot_disagree(self):
         with self.assertRaisesRegex(ValueError, "tcn_bi"):

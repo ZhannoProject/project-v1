@@ -24,6 +24,7 @@ The study also introduces **Multi-head Latent Attention (MLA)**, adapted from De
 | `tcn_mla_r{N}` | MLA with fixed kv_lora_rank=N | MLA (rank sweep) | varies |
 | `tcn_mha_bi`, `tcn_mla_bi`, `tcn_mha_par_bi`, `tcn_mla_par_bi` | Same as above, **bidirectional** attention (non-causal) | KD teachers only | same as causal twin |
 | `tcn_bi` | Baseline with **non-causal convolutions** (centred padding) | None | 117k |
+| `tcn_mha_full_bi`, `tcn_mla_full_bi`, `tcn_mha_par_full_bi`, `tcn_mla_par_full_bi` | Bidirectional attention **and** non-causal convolutions | KD teachers only | same as causal twin |
 
 ### Sandwich topology
 
@@ -327,9 +328,21 @@ reduce `--batch_size` if needed.
 Every attention variant has a **bidirectional twin** (`tcn_mla_bi`, `tcn_mha_bi`,
 `tcn_mha_par_bi`, `tcn_mla_par_bi`): identical weights and shapes, but the
 attention mask is dropped so each position sees the whole 512-sample window.
-The TCN stages in those twins stay causal — only attention looks ahead. The
-baseline has no attention to unmask, so its twin `tcn_bi` centres the padding
-in every convolution instead and is non-causal throughout.
+The TCN stages in those twins stay causal — only attention looks ahead.
+
+Causality is really two switches, and the registry exposes every useful
+setting of them:
+
+| Variant | Attention | Convolutions | What it isolates |
+|---------|-----------|--------------|------------------|
+| `tcn_mla` | causal | causal | the deployable model |
+| `tcn_mla_bi` | bidirectional | causal | attending to the future, and nothing else |
+| `tcn_mla_full_bi` | bidirectional | non-causal | the full offline ceiling |
+| `tcn_bi` | — | non-causal | seeing the future without attention |
+
+`tcn` has no attention to unmask, so `tcn_bi` is already fully non-causal and
+there is no `tcn_full_bi`. All of them keep the weights and shapes of their
+causal twin, so any of them can teach it.
 Such a model cannot run online — it needs future samples — but on the same
 weight budget it is a stronger denoiser. It is used as a frozen **teacher**,
 and the deployable causal model is trained as a **student** to reproduce, from
@@ -709,7 +722,7 @@ python reproduce.py
 python reproduce.py --quick
 ```
 
-This runs **81 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future, and that the optional BottleneckSkip stays causal), seeding (same `master_seed` → same init and batch order), losses, metrics, training, checkpointing, evaluation, and knowledge distillation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
+This runs **90 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future, and that the optional BottleneckSkip stays causal), seeding (same `master_seed` → same init and batch order), losses, metrics, training, checkpointing, evaluation, and knowledge distillation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
 
 The same script runs in GitHub Actions on every push — see the badge at the top.
 
@@ -725,6 +738,7 @@ The study isolates one variable at a time while sharing everything else:
 | KV rank sweep (r4/r8/r16/r32) | How much compression is viable? | Same architecture, only rank varies |
 | Causal vs bidirectional (`X` vs `X_bi`) | What does causality cost? | Same weights and shapes, only the attention mask differs |
 | `tcn_bi` vs `tcn_mla_bi` | Is the gain from seeing the future, or from attending to it? | Both non-causal; only one has attention |
+| `X_bi` vs `X_full_bi` | How much is attention alone worth against the full offline ceiling? | Same weights; only the convolution padding differs |
 | Student vs distilled student (`X` vs `X` + KD) | Can a non-causal teacher close that gap? | Same model, only the training signal differs |
 
 ## License

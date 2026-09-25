@@ -7,6 +7,7 @@ Five groups of variants, one file:
   - TCNWithMLA  : TCN_pt1 + Causal MLA + TCN_pt2 (sandwich)
   - tcn_mla_rN  : MLA with explicit kv_lora_rank=N (rank sweep ablation)
   - tcn_bi      : the baseline with non-causal convolutions (offline control)
+  - tcn_*_full_bi : bidirectional attention AND non-causal convolutions
   - tcn_*_bi    : the same models with BIDIRECTIONAL attention — non-causal
                   teachers for knowledge distillation (see below)
 
@@ -223,7 +224,11 @@ class TCNWithMHA(nn.Module):
     The (B,C,T) ↔ (B,T,C) permutation for attention is handled
     INSIDE CausalTransformerDecoder — this forward() stays in (B,C,T).
 
-    ``causal=False`` builds the bidirectional teacher (registry: ``tcn_mha_bi``).
+    ``causal=False`` unmasks attention and builds the bidirectional teacher
+    (registry: ``tcn_mha_bi``); the TCN stages stay causal, so the model looks
+    ahead only through attention.  ``causal_tcn=False`` centres the padding in
+    those stages as well (registry: ``tcn_mha_full_bi``), which makes nothing in
+    the model causal.  Both keep the weights and shapes of the causal twin.
     """
 
     def __init__(
@@ -236,9 +241,11 @@ class TCNWithMHA(nn.Module):
         bottleneck_ratio: float = 0.5,
         skip_bottleneck_ratio: float | None = None,
         causal: bool = True,
+        causal_tcn: bool = True,
     ):
         super().__init__()
         self.causal = causal
+        self.causal_tcn = causal_tcn
 
         # Attention operates in a compressed channel space:
         #   H channels  →  squeeze to H' = H * ratio  →  attention  →  expand back to H
@@ -250,6 +257,7 @@ class TCNWithMHA(nn.Module):
             hidden_channels=hidden_channels,
             dilations=[1, 2, 4],
             dropout=dropout,
+            causal=causal_tcn,
         )
 
         # --- Channel bottleneck: compress before attention ---
@@ -276,6 +284,7 @@ class TCNWithMHA(nn.Module):
             hidden_channels=hidden_channels,
             dilations=[8, 16, 32],
             dropout=dropout,
+            causal=causal_tcn,
         )
 
         # --- Output head ---
@@ -313,7 +322,11 @@ class TCNWithMLA(nn.Module):
           → TCN_pt2  [8, 16, 32]             → (B, H, T)   reconstruction
           → 1×1 CausalConv head              → (B, 1, T)   output
 
-    ``causal=False`` builds the bidirectional teacher (registry: ``tcn_mla_bi``).
+    ``causal=False`` unmasks attention and builds the bidirectional teacher
+    (registry: ``tcn_mla_bi``); the TCN stages stay causal, so the model looks
+    ahead only through attention.  ``causal_tcn=False`` centres the padding in
+    those stages as well (registry: ``tcn_mla_full_bi``), which makes nothing in
+    the model causal.  Both keep the weights and shapes of the causal twin.
     """
 
     def __init__(
@@ -327,9 +340,11 @@ class TCNWithMLA(nn.Module):
         bottleneck_ratio: float = 0.5,
         skip_bottleneck_ratio: float | None = None,
         causal: bool = True,
+        causal_tcn: bool = True,
     ):
         super().__init__()
         self.causal = causal
+        self.causal_tcn = causal_tcn
 
         attn_dim = int(hidden_channels * bottleneck_ratio)
 
@@ -339,6 +354,7 @@ class TCNWithMLA(nn.Module):
             hidden_channels=hidden_channels,
             dilations=[1, 2, 4],
             dropout=dropout,
+            causal=causal_tcn,
         )
 
         # --- Channel bottleneck: compress before attention ---
@@ -366,6 +382,7 @@ class TCNWithMLA(nn.Module):
             hidden_channels=hidden_channels,
             dilations=[8, 16, 32],
             dropout=dropout,
+            causal=causal_tcn,
         )
 
         # --- Output head ---
@@ -413,7 +430,11 @@ class TCNParallelMHA(nn.Module):
     The per-block identity skip inside the decoder still exists;
     ``skip_bottleneck_ratio`` swaps it for a BottleneckSkip here too.
 
-    ``causal=False`` builds the bidirectional teacher (registry: ``tcn_mha_par_bi``).
+    ``causal=False`` unmasks attention and builds the bidirectional teacher
+    (registry: ``tcn_mha_par_bi``); the TCN stages stay causal, so the model looks
+    ahead only through attention.  ``causal_tcn=False`` centres the padding in
+    those stages as well (registry: ``tcn_mha_par_full_bi``), which makes nothing in
+    the model causal.  Both keep the weights and shapes of the causal twin.
     """
 
     def __init__(
@@ -425,9 +446,11 @@ class TCNParallelMHA(nn.Module):
         dropout: float = 0.1,
         skip_bottleneck_ratio: float | None = None,
         causal: bool = True,
+        causal_tcn: bool = True,
     ):
         super().__init__()
         self.causal = causal
+        self.causal_tcn = causal_tcn
 
         # --- Stage 1: shared feature extraction ---
         self.tcn_pt1 = CausalTCNBackbone(
@@ -435,6 +458,7 @@ class TCNParallelMHA(nn.Module):
             hidden_channels=hidden_channels,
             dilations=[1, 2, 4],
             dropout=dropout,
+            causal=causal_tcn,
         )
 
         # --- Branch A: global context via MHA ---
@@ -455,6 +479,7 @@ class TCNParallelMHA(nn.Module):
             hidden_channels=hidden_channels,
             dilations=[8, 16, 32],
             dropout=dropout,
+            causal=causal_tcn,
         )
 
         # --- Output head: fuses both branches (2H → 1) ---
@@ -490,7 +515,11 @@ class TCNParallelMLA(nn.Module):
           → torch.cat(A, B, dim=1)                  → (B, 2H, T)
           → 1×1 CausalConv head                     → (B, 1, T)
 
-    ``causal=False`` builds the bidirectional teacher (registry: ``tcn_mla_par_bi``).
+    ``causal=False`` unmasks attention and builds the bidirectional teacher
+    (registry: ``tcn_mla_par_bi``); the TCN stages stay causal, so the model looks
+    ahead only through attention.  ``causal_tcn=False`` centres the padding in
+    those stages as well (registry: ``tcn_mla_par_full_bi``), which makes nothing in
+    the model causal.  Both keep the weights and shapes of the causal twin.
     """
 
     def __init__(
@@ -503,9 +532,11 @@ class TCNParallelMLA(nn.Module):
         kv_lora_rank: int | None = None,
         skip_bottleneck_ratio: float | None = None,
         causal: bool = True,
+        causal_tcn: bool = True,
     ):
         super().__init__()
         self.causal = causal
+        self.causal_tcn = causal_tcn
 
         # --- Stage 1: shared feature extraction ---
         self.tcn_pt1 = CausalTCNBackbone(
@@ -513,6 +544,7 @@ class TCNParallelMLA(nn.Module):
             hidden_channels=hidden_channels,
             dilations=[1, 2, 4],
             dropout=dropout,
+            causal=causal_tcn,
         )
 
         # --- Branch A: global context via MLA ---
@@ -534,6 +566,7 @@ class TCNParallelMLA(nn.Module):
             hidden_channels=hidden_channels,
             dilations=[8, 16, 32],
             dropout=dropout,
+            causal=causal_tcn,
         )
 
         # --- Output head: fuses both branches (2H → 1) ---
@@ -580,6 +613,23 @@ for _base in ["tcn", "tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
     _name = _base + BIDIRECTIONAL_SUFFIX
     VARIANT_REGISTRY[_name] = partial(VARIANT_REGISTRY[_base], causal=False)
     BIDIRECTIONAL_VARIANTS.append(_name)
+
+# Fully non-causal twins: tcn_mha_full_bi, tcn_mla_full_bi, tcn_mha_par_full_bi,
+# tcn_mla_par_full_bi.  ``X_bi`` unmasks attention and leaves the convolutions
+# causal; ``X_full_bi`` also centres their padding, so nothing in the model is
+# causal any more.  Between them they separate "sees the future" from "attends
+# to it": X_bi is the first without the second, X_full_bi is both, and tcn_bi is
+# the first without any attention at all.
+#
+# tcn has no attention, so tcn_bi is already fully non-causal and there is no
+# tcn_full_bi — the two axes collapse into one when there is no mask to drop.
+FULLY_BIDIRECTIONAL_SUFFIX = "_full" + BIDIRECTIONAL_SUFFIX
+FULLY_BIDIRECTIONAL_VARIANTS = []
+for _base in ["tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
+    _name = _base + FULLY_BIDIRECTIONAL_SUFFIX
+    VARIANT_REGISTRY[_name] = partial(VARIANT_REGISTRY[_base], causal=False, causal_tcn=False)
+    BIDIRECTIONAL_VARIANTS.append(_name)
+    FULLY_BIDIRECTIONAL_VARIANTS.append(_name)
 
 
 def variant_is_causal(variant: str) -> bool:
@@ -643,10 +693,12 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
     # Causality is part of the variant name so checkpoints are self-describing;
     # refuse a `causal` kwarg that contradicts it rather than silently obeying it.
     if "causal" in kwargs and kwargs["causal"] != variant_is_causal(variant):
-        want = variant + BIDIRECTIONAL_SUFFIX if kwargs["causal"] is False \
-            else variant[: -len(BIDIRECTIONAL_SUFFIX)]
+        # Suggest the twin, but only when it is a name the registry actually has:
+        # tcn_mla_full_bi's causal counterpart is tcn_mla, not "tcn_mla_full".
+        want = base_variant(variant) if kwargs["causal"] else variant + BIDIRECTIONAL_SUFFIX
+        hint = f"; use '{want}' instead" if want in VARIANT_REGISTRY else ""
         raise ValueError(
-            f"causal={kwargs['causal']} contradicts variant '{variant}'; use '{want}' instead"
+            f"causal={kwargs['causal']} contradicts variant '{variant}'{hint}"
         )
     # Same rule for the rank aliases.  functools.partial lets a call-time kwarg
     # override its keywords, so without this check build_model("tcn_mla_r8",

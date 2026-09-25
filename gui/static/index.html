@@ -824,7 +824,7 @@
             f ? `L${f.n_layers}` : "no attention",
             f ? `d_model ${f.d_model}` : null,
             f && f.kv_lora_rank != null ? `rank ${f.kv_lora_rank}` : null,
-            r.causal ? null : "non-causal",
+            r.causal && r.causal_tcn ? null : r.causal_tcn ? "bi attention" : "fully non-causal",
             `${fmtN(r.trainable)} trainable`].filter(Boolean).join(" · ");
   }
 
@@ -892,14 +892,16 @@
 
     const f = a.attention;
     const facts = [];
-    // Two different ways a model can be non-causal, and they cost the same
-    // (nothing): the attention twins drop the mask, tcn_bi centres the
-    // convolution padding.  Say which one this is.
-    facts.push(a.causal
+    // Two independent ways a model can look ahead, and neither costs a
+    // parameter: attention drops its mask, convolutions centre their padding.
+    // Which combination this is, is the whole point of the *_bi families.
+    facts.push(a.causal && a.causal_tcn
       ? `this model is <b>causal</b> — position t sees [0..t], deployable online`
-      : f
-        ? `attention is <b>bidirectional</b> — every position sees the whole window while the TCN stages stay causal; teacher only, and it costs no parameters (the mask is dropped, nothing is added)`
-        : `the convolutions are <b>non-causal</b> — padding is centred rather than left-only, so every position sees ahead as well as behind; teacher only, and it costs no parameters (the weights are the causal twin's)`);
+      : a.causal_tcn
+        ? `<b>attention is bidirectional</b>, convolutions stay causal — the model looks ahead only through attention, which is what separates "sees the future" from "attends to it". Teacher only, and it costs no parameters (the mask is dropped, nothing is added)`
+        : f
+          ? `<b>nothing here is causal</b> — attention is unmasked and the convolution padding is centred, so every stage sees ahead. Teacher only; still no extra parameters (same weights as the causal twin)`
+          : `the <b>convolutions are non-causal</b> — padding is centred rather than left-only, so every position sees ahead as well as behind; teacher only, and it costs no parameters (the weights are the causal twin's)`);
     if (f) {
       const mha = 2 * f.d_model * f.n_layers;
       facts.push(`KV state to cache per new sample: <b>${fmtN(f.kv_per_step)}</b> fp32 values (<b>${fmtBytes(f.kv_bytes_per_step)}</b>)`

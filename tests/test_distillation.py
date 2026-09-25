@@ -10,8 +10,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from models.AttentionBlocks.attention import CausalMHA, CausalMLA, CausalTransformerDecoder
-from models.variants import (BIDIRECTIONAL_VARIANTS, build_model, build_model_from_config,
-                             variant_is_causal)
+from models.variants import (BIDIRECTIONAL_VARIANTS, base_variant, build_model,
+                             build_model_from_config, variant_is_causal)
 from trainer.checkpoint import save_checkpoint
 from trainer.distillation import (DistillationLoss, FeatureProjector, FeatureTap, KDTrainer,
                                   init_student_from_teacher, load_teacher,
@@ -97,7 +97,9 @@ class BidirectionalAttentionTests(unittest.TestCase):
 
     def test_bi_variants_see_the_future_and_causal_twins_do_not(self):
         for name in BIDIRECTIONAL_VARIANTS:
-            base = name[:-3]
+            # Not name[:-3]: tcn_mla_full_bi's causal twin is tcn_mla, and the
+            # registry is what knows that.
+            base = base_variant(name)
             self.assertFalse(variant_is_causal(name))
             self.assertTrue(variant_is_causal(base))
             self.assertGreater(_past_diff(_small(name)), 0.0, name)
@@ -106,7 +108,7 @@ class BidirectionalAttentionTests(unittest.TestCase):
     def test_bi_variants_share_state_dict_with_causal_twin(self):
         for name in BIDIRECTIONAL_VARIANTS:
             t_sd = _small(name).state_dict()
-            s_sd = _small(name[:-3]).state_dict()
+            s_sd = _small(base_variant(name)).state_dict()
             self.assertEqual(list(t_sd), list(s_sd), name)
             for k in t_sd:
                 self.assertEqual(t_sd[k].shape, s_sd[k].shape, f"{name}.{k}")

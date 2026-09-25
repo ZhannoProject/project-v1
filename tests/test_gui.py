@@ -662,6 +662,16 @@ class ParamReportTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             params.report_for_run("no_such_run")
 
+    def test_causality_is_reported_on_both_axes(self):
+        for variant, causal, causal_tcn in (("tcn", True, True),
+                                            ("tcn_bi", False, False),
+                                            ("tcn_mla", True, True),
+                                            ("tcn_mla_bi", False, True),
+                                            ("tcn_mla_full_bi", False, False)):
+            with self.subTest(variant=variant):
+                r = params.report({"variant": variant, "hidden_channels": 64})
+                self.assertEqual((r["causal"], r["causal_tcn"]), (causal, causal_tcn))
+
 
 class NativeAndBundleTests(unittest.TestCase):
     def test_cli_mode_selection(self):

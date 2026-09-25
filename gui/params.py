@@ -32,6 +32,7 @@ MODEL_SECTIONS = ("Model", "TurboQuant")
 BYTES_FP32 = 4
 
 
+
 def model_defaults() -> Dict[str, Any]:
     """Schema defaults for the keys that build the model (mirrors trainer/__main__.py)."""
     return {f.key: f.default
@@ -287,9 +288,12 @@ def report(values: Optional[dict] = None, *, config: Optional[dict] = None,
         "variant": cfg.get("variant"),
         "config": {k: v for k, v in cfg.items() if not k.startswith("turboquant")},
         "notes": notes,
-        # Causality is a property of the whole model: the attention twins keep
-        # causal convolutions, tcn_bi has no attention to unmask at all.
+        # Two independent axes.  ``causal`` is the attention mask (and, for the
+        # attention-free baseline, the whole model); ``causal_tcn`` is the
+        # convolution padding.  TCNOnly has only the first, so it answers for
+        # both — tcn_bi is non-causal throughout.
         "causal": bool(getattr(model, "causal", True)),
+        "causal_tcn": bool(getattr(model, "causal_tcn", getattr(model, "causal", True))),
         "trainable": trainable,
         "frozen": total - trainable,
         "checkpoint": saved,
