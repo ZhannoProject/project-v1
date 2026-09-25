@@ -140,7 +140,7 @@ def main():
     cfg.setdefault("warmup_epochs",      5)
     cfg.setdefault("warmup_lr",          1e-3)
     cfg.setdefault("finetune_lr",        5e-4)
-    cfg.setdefault("loss_fn",            "mse")
+    cfg.setdefault("loss_fn",            "l1_combined")   # must match Trainer's default and the presets
     cfg.setdefault("bottleneck_ratio",  0.5)
     cfg.setdefault("skip_bottleneck_ratio", None)
     cfg.setdefault("kv_lora_rank",      16)
@@ -215,6 +215,7 @@ def main():
         use_tensorboard=cfg["tensorboard"],
         loss_fn=cfg["loss_fn"],
         device=device,
+        run_config=cfg,
     )
     if distil:
         teacher = load_teacher(cfg["teacher_ckpt"], cfg["teacher_config"])

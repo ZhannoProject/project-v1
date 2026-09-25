@@ -55,6 +55,7 @@ class Trainer:
         device: Optional[torch.device] = None,
         use_tensorboard: bool = False,
         loss_fn: str = "l1_combined",
+        run_config: Optional[dict] = None,
     ):
         self.device = device or get_device()
         print(f"[Trainer] Device: {self.device}")
@@ -80,8 +81,29 @@ class Trainer:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
+        # Reusing a directory silently mixes two runs: the new run overwrites best.pt
+        # at its first epoch, while history.json survives from the old one unless this
+        # run finishes.  Warn loudly; history.json is now rewritten every epoch so the
+        # two files cannot drift apart even if training is interrupted.
+        existing = [f for f in ("best.pt", "last.pt", "history.json") if (self.save_dir / f).is_file()]
+        if existing:
+            print(f"[Trainer] WARNING: {self.save_dir} already contains {', '.join(existing)} "
+                  f"from an earlier run — they will be overwritten.")
+
         self.best_val_loss = float("inf")
-        self.history = {"train_loss": [], "val_loss": [], "rrmse_t": [], "rrmse_s": [], "acc": []}
+        # ``config`` records what produced these numbers.  val_loss is only comparable
+        # across runs that share loss_fn, artifact, snr_range_db and master_seed.
+        self.history = {"train_loss": [], "val_loss": [], "rrmse_t": [], "rrmse_s": [], "acc": [],
+                        "config": {"loss_fn": loss_fn,
+                                   # the optimizer class actually built, not the one
+                                   # the code is assumed to build
+                                   "optimizer": type(self.optimizer).__name__,
+                                   **{k: v for k, v in (run_config or {}).items()
+                                      if k in ("variant", "artifact", "max_epochs", "batch_size",
+                                               "learning_rate", "attn_lr_scale", "weight_decay",
+                                               "sched_warmup_epochs", "eta_min",
+                                               "snr_range_db", "master_seed",
+                                               "staged", "teacher_ckpt")}}}
 
         self.writer = create_tb_writer(self.save_dir, use_tensorboard)
 
@@ -208,6 +230,9 @@ class Trainer:
                 self.optimizer, self.scheduler,
                 val_loss, self.history, is_best,
             )
+            # Written every epoch (not only at the end): an interrupted run then still
+            # leaves a history.json that describes the best.pt sitting next to it.
+            save_history(self.save_dir, self.history)
 
     def _finish(self):
         save_history(self.save_dir, self.history)
