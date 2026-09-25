@@ -237,6 +237,13 @@ first if a training run is still going).
   saved by every checkpoint, so it works on runs of any age. Each row also shows
   an `Adam`/`AdamW` badge whose tooltip carries the full recipe.
 
+  Every row carries its **parameter count** — the same figure the Params tab
+  calls the checkpoint count, read from the weights rather than recomputed, with
+  the exact number on hover. The grouped views still print it in the group
+  header, but only when every run in that group agrees; two runs of the same
+  `variant × artifact` trained at different widths no longer both inherit the
+  first one's count.
+
   *By time* is the other kind of question: not which run is best but what you
   ran, and when. Every run, newest first, grouped by the day it last wrote, with
   the clock time on each row — and unlike the three views above it keeps the

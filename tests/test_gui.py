@@ -1,6 +1,7 @@
 """Run: python -m unittest discover -s tests -p 'test_gui.py'."""
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -783,6 +784,38 @@ class ParamReportTests(unittest.TestCase):
             with self.subTest(variant=variant):
                 r = params.report({"variant": variant, "hidden_channels": 64})
                 self.assertEqual((r["causal"], r["causal_tcn"]), (causal, causal_tcn))
+
+
+class RunsTablePageTests(unittest.TestCase):
+    """The runs table is built by string concatenation in three places, and a
+    column added to one of them shows up as a quietly ragged table rather than
+    an error.  Nothing else checks that they still agree."""
+
+    PAGE = (ROOT / "gui" / "static" / "index.html").read_text()
+
+    def test_header_row_and_group_spans_agree_on_the_column_count(self):
+        head = re.search(r"const HEAD = `(.*?)`;", self.PAGE, re.S)
+        self.assertIsNotNone(head, "HEAD row not found")
+        columns = len(re.findall(r"<th", head.group(1)))
+        spans = set(re.findall(r'colspan="(\d+)"', self.PAGE))
+        self.assertEqual(spans, {str(columns)},
+                         f"header has {columns} columns; colspans say {sorted(spans)}")
+
+    def test_a_run_row_fills_every_column(self):
+        body = re.search(r"function runRow\(r, when = \"\"\) \{(.*?)\n  \}", self.PAGE, re.S)
+        self.assertIsNotNone(body, "runRow not found")
+        head = re.search(r"const HEAD = `(.*?)`;", self.PAGE, re.S)
+        columns = len(re.findall(r"<th", head.group(1)))
+        # <td ...> written inline, plus the helpers that each contribute one cell
+        cells = len(re.findall(r"<td", body.group(1))) + len(re.findall(r"\$\{paramCell\(", body.group(1)))
+        self.assertEqual(cells, columns,
+                         f"runRow emits {cells} cells for {columns} columns")
+
+    def test_the_params_column_is_served_to_the_page(self):
+        """The cell reads r.params, which list_runs has to keep providing."""
+        self.assertIn("paramCell(r.params)", self.PAGE)
+        self.assertIn('"params": info.get("params")',
+                      (ROOT / "gui" / "config_io.py").read_text())
 
 
 class NativeAndBundleTests(unittest.TestCase):
