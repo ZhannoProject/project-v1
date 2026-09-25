@@ -21,7 +21,10 @@ milliseconds, so the page can recompute on every keystroke.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
+import io
+import re
 from typing import Any, Dict, List, Optional
 
 from gui.config_io import SCHEMA, RUNS_DIR
@@ -31,6 +34,12 @@ from gui.config_io import SCHEMA, RUNS_DIR
 MODEL_SECTIONS = ("Model", "TurboQuant")
 BYTES_FP32 = 4
 
+# Ceiling on what the counter will allocate.  This runs on every keystroke, so
+# one stray digit in hidden_channels (640 → 6400) would otherwise ask torch for
+# tens of gigabytes and take the GUI down with it.  200M parameters is ~800 MB
+# of fp32 and roughly a thousand times the largest variant in the study, so
+# nothing real trips it.
+MAX_PARAMS = 200_000_000
 
 
 def model_defaults() -> Dict[str, Any]:
@@ -41,13 +50,29 @@ def model_defaults() -> Dict[str, Any]:
 
 
 def resolve(values: Optional[dict]) -> Dict[str, Any]:
-    """Form values laid over the schema defaults, keeping only model keys."""
+    """
+    Form values laid over the schema defaults, keeping only model keys.
+
+    This runs on every keystroke, so a field mid-edit is the normal case, not
+    an error to be surprised by: an empty depth box arrives as 0 or None and
+    must come back as a sentence the page can show, never a traceback.  The
+    constructors catch most of it; the two checks here cover what they do not.
+    """
+    if values is not None and not isinstance(values, dict):
+        raise ValueError(f"values must be an object, got {type(values).__name__}")
     cfg = model_defaults()
     for key, value in (values or {}).items():
         if key in cfg:
             cfg[key] = value
     if not cfg.get("variant"):
         cfg["variant"] = "tcn_mla"
+    if not isinstance(cfg["variant"], str):
+        raise ValueError(f"variant must be a name, got {type(cfg['variant']).__name__}")
+    # A decoder with no blocks builds without complaint and then has nothing to
+    # describe.  The trainer rejects it too, in the same words.
+    depth = cfg.get("n_attn_layers")
+    if depth is not None and (type(depth) is not int or depth < 1):
+        raise ValueError(f"n_attn_layers must be a positive integer, got {depth!r}")
     return cfg
 
 
@@ -88,6 +113,42 @@ def _notes(cfg: Dict[str, Any]) -> List[str]:
 # ============================================================
 # Breakdown
 # ============================================================
+def _estimate(cfg: Dict[str, Any]) -> int:
+    """
+    Rough upper bound on the parameter count, computed from the numbers alone.
+
+    Deliberately crude — it only has to be the right order of magnitude to stop
+    an absurd config before ``torch`` tries to allocate it.  A residual block is
+    two k=3 convolutions (~6H² each) and there are at most six of them; a
+    transformer layer is ~4d² of attention plus ~8d² of FFN.
+    """
+    def number(key, absent, unusable):
+        """``absent`` when the key is unset, ``unusable`` when it is not a number.
+
+        A value this cannot read must never switch the ceiling off — a string
+        ``bottleneck_ratio`` alongside a mistyped width would then let the very
+        allocation this exists to prevent straight through.  Each unreadable
+        field falls back to the value that keeps the bound conservative.
+        """
+        v = cfg.get(key)
+        if v is None:
+            return absent
+        # bool is an int in Python and is never a width or a depth.
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return unusable
+        return v
+
+    # A non-numeric width is the one case that is safe to skip: Conv1d rejects it
+    # before reserving anything, so there is nothing to protect against.
+    h = number("hidden_channels", 0, None)
+    if h is None:
+        return 0
+    layers = number("n_attn_layers", 0, 0)      # a decoder that cannot build costs nothing
+    ratio = number("bottleneck_ratio", 1, 1)    # unreadable ratio → assume full width
+    d = h * (ratio if ratio > 0 else 1)
+    return int(12 * 6 * h * h + 12 * layers * d * d)
+
+
 def _count(module) -> int:
     return sum(p.numel() for p in module.parameters())
 
@@ -146,6 +207,9 @@ def _decoder_group(name: str, decoder) -> dict:
     what the reader needs to see how depth scales the model.
     """
     n_layers = len(decoder.blocks)
+    if not n_layers:                       # resolve() rejects this; belt and braces
+        return {"key": name, "label": name, "note": "no blocks",
+                "params": _count(decoder), "items": [], "subtotals": {}}
     buckets: Dict[str, int] = {}
     for pname, p in decoder.named_parameters():
         parts = pname.split(".")
@@ -269,8 +333,17 @@ def report(values: Optional[dict] = None, *, config: Optional[dict] = None,
     # A half-typed form is the normal case here (n_heads 3 against d_model 64,
     # a width of 0 while the digit is being replaced).  The constructor says
     # exactly what is wrong; the page wants that sentence, not a traceback.
+    size = _estimate(cfg)
+    if size > MAX_PARAMS:
+        raise ValueError(
+            f"that is roughly a {size / 1e6:,.0f}M-parameter model; the counter stops at "
+            f"{MAX_PARAMS // 1_000_000}M so a mistyped width cannot exhaust memory")
     try:
-        model = build_model_from_config(cfg)
+        # build_model_from_config narrates what a variant name overrides.  That
+        # belongs in the trainer's log, not once per keystroke on the server
+        # console — the same information comes back in ``notes``.
+        with contextlib.redirect_stdout(io.StringIO()):
+            model = build_model_from_config(cfg)
     except ValueError:
         raise
     except Exception as exc:
@@ -311,9 +384,19 @@ def report_for_run(name: str) -> dict:
     checkpoint recorded.  Runs saved before ``model_config`` existed cannot
     be rebuilt this way and say so rather than guessing from the name.
     """
-    if not name or "/" in name or "\\" in name or name.startswith("."):
-        raise ValueError(f"bad run name: {name!r}")
-    path = RUNS_DIR / name / "best.pt"
+    # Same guard as config_io.read_run_history: a name-shaped string, and the
+    # resolved directory really sitting directly inside runs/.  The regex alone
+    # admits ".." — only the second check rules it out.
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", name or ""):
+        raise ValueError(f"invalid run name {name!r}")
+    d = (RUNS_DIR / name).resolve()
+    if d.parent != RUNS_DIR.resolve():
+        raise ValueError("run must be a directory directly inside runs/")
+    if not d.is_dir():
+        # Kept separate from the sandbox check: a typo deserves "no such run",
+        # not a lecture about where runs live.
+        raise FileNotFoundError(f"no run directory at runs/{name}")
+    path = d / "best.pt"
     if not path.is_file():
         raise FileNotFoundError(f"no checkpoint at runs/{name}/best.pt")
     import torch

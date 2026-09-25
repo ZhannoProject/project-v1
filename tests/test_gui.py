@@ -657,10 +657,40 @@ class ParamReportTests(unittest.TestCase):
             params.report({"variant": "tcn_nonesuch"})
 
     def test_run_lookup_is_sandboxed_and_needs_a_recorded_architecture(self):
-        with self.assertRaises(ValueError):
-            params.report_for_run("../secrets")
+        for name in ("../secrets", "..", ".", "", "runs/x", "a/../../etc"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                params.report_for_run(name)
         with self.assertRaises(FileNotFoundError):
             params.report_for_run("no_such_run")
+
+    def test_a_half_typed_form_is_a_message_not_a_traceback(self):
+        """This recomputes on every keystroke, so a field mid-edit is normal
+        traffic.  Everything here used to reach the page as a 500."""
+        for label, values in (
+            ("empty depth box", {"variant": "tcn_mla", "n_attn_layers": 0}),
+            ("negative depth", {"variant": "tcn_mla", "n_attn_layers": -3}),
+            ("depth not whole", {"variant": "tcn_mla", "n_attn_layers": 2.5}),
+            ("variant not a name", {"variant": ["tcn_mla"]}),
+            ("values not an object", "tcn_mla"),
+        ):
+            with self.subTest(case=label), self.assertRaises(ValueError):
+                params.report(values)
+
+    def test_an_absurd_width_is_refused_before_anything_is_allocated(self):
+        """One stray digit in hidden_channels would otherwise ask torch for tens
+        of gigabytes.  A non-numeric field must not switch the ceiling off: that
+        is exactly the combination that slipped through."""
+        with self.assertRaisesRegex(ValueError, "counter stops at"):
+            params.report({"variant": "tcn_mla", "hidden_channels": 6400})
+        with self.assertRaisesRegex(ValueError, "counter stops at"):
+            params.report({"variant": "tcn_mha_par_bi", "hidden_channels": 100000,
+                           "bottleneck_ratio": "half"})
+        with self.assertRaisesRegex(ValueError, "counter stops at"):
+            params.report({"variant": "tcn_mla", "hidden_channels": 100000,
+                           "n_heads": "4"})
+        # and the real models stay comfortably under it
+        self.assertLess(params.report({"variant": "tcn_mla_par_bi"})["trainable"],
+                        params.MAX_PARAMS)
 
     def test_causality_is_reported_on_both_axes(self):
         for variant, causal, causal_tcn in (("tcn", True, True),
