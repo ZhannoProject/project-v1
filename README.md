@@ -210,11 +210,92 @@ first if a training run is still going).
   `python -m trainer --config configs/<file> [extra flags]` with the same
   interpreter and streams the log into the page (also mirrored to
   `runs/gui_train_<timestamp>.log`); **Stop** terminates it.
-- **Runs** lists every `runs/*/best.pt` with its best-epoch metrics; “Use as
-  teacher” fills `teacher_ckpt` for a distillation run.
+- **Live metric curve.** While a run is going, the Train tab plots RRMSE_t,
+  RRMSE_s and ACC per epoch, with the current values, the best epoch so far and
+  the epoch counter. The numbers are parsed out of the training log as it
+  streams, so nothing in the trainer changes and the curve survives a page
+  reload (the server keeps them for the running job). The y-axis is fitted to
+  the bulk of the run — epoch 1 is often several times worse than the rest and
+  would otherwise flatten everything; the caption says when early epochs run
+  off the top.
+- **Runs** has four views. *Complete by kind* groups finished runs by
+  `variant × artifact` (the thing an ablation row compares), best RRMSE_t first,
+  with the depth, KV rank and parameter count read from the checkpoint itself.
+  *Complete by loss* groups them by `loss_fn × artifact` instead, ranked by
+  val loss. This is the grouping to read val loss off: `val_loss` is whatever
+  loss that run minimised on whichever artifact it trained against, so the same
+  number means different things across groups — an MSE 0.13 and an L1+STFT 0.44
+  can be the same model. Every row carries a badge with its loss, solid when the
+  run recorded it and dashed when it was recovered from the weights (see below);
+  runs whose loss is unknown are grouped separately rather than mixed in.
+
+  *Complete by optimizer* groups them by the recipe their checkpoint records —
+  optimizer family, configured LR, decoder-to-TCN LR ratio and schedule. Nothing
+  has to be recomputed for this: `optimizer_state` and `scheduler_state` are
+  saved by every checkpoint, so it works on runs of any age. Each row also shows
+  an `Adam`/`AdamW` badge whose tooltip carries the full recipe.
+
+  *All runs* lists every `runs/*/best.pt` and marks the ones the grouped views
+  leave out:
+  - `partial` — no `history.json`: the run never reached the end.
+  - `stale` — `history.json` and the `last.pt` beside it are from different
+    runs, i.e. the directory was re-used by a later (often shorter) run. The
+    metrics in that row describe weights that no longer exist, so the row is
+    not comparable with anything.
+
+  **curve** on any finished run plots its saved history in the same chart, and
+  “Use as teacher” fills `teacher_ckpt` for a distillation run.
 
 The server binds to 127.0.0.1 only and runs one training job at a time.
 Validation: `python -m unittest discover -s tests -p 'test_gui.py'`.
+
+### Which loss a run used
+
+`val_loss` is only comparable across runs that share `loss_fn` **and**
+`artifact` (and `snr_range_db` / `master_seed`). Runs record their `loss_fn` in
+`history.json["config"]` and in every checkpoint, so the GUI can group by it.
+
+Runs trained before that was recorded carry no such field. Recover it:
+
+```bash
+python -m trainer.identify_loss              # runs with no recorded loss
+python -m trainer.identify_loss --dry-run    # report without writing
+python -m trainer.identify_loss --run tcn_eog --all
+```
+
+It rebuilds each model from `best.pt`, evaluates it on that run's own validation
+split and computes the val loss under every loss in the registry; exactly one
+reproduces the recorded number. The result goes to `runs/<run>/loss_fn.json`,
+which the GUI reads. Nothing is claimed unless it is safe to:
+
+- the recomputed RRMSE_t must match the RRMSE_t in `history.json`, proving
+  `best.pt` really is the model that history describes (a re-used directory
+  fails here and is reported as `checkpoint-mismatch`);
+- the winning candidate must be far closer than the runner-up, since `l1` and
+  `l2_combined` can land within a percent of each other.
+
+Validation: `python -m unittest discover -s tests -p 'test_identify_loss.py'`.
+
+### Which optimizer a run used
+
+Read straight out of the checkpoint, so no tool run is needed:
+
+- **family** — `Adam` and `AdamW` are indistinguishable by their state *keys*;
+  torch 2.x implements AdamW as Adam with `decoupled_weight_decay=True`, and
+  that flag is what separates them. When it is absent (older torch) the family
+  is reported as `Adam/AdamW` rather than guessed.
+- **schedule** — `ReduceLROnPlateau` keeps `factor`/`patience`; this project's
+  warmup→cosine chain is a `SequentialLR` holding a `LinearLR` and a
+  `CosineAnnealingLR`; an empty state means no scheduler.
+- **learning rate** — `initial_lr` is the configured value and is exact. Without
+  it, only the *decayed* rate at save time survives; those runs are flagged
+  `(decayed)` and grouped together rather than split by how far each had decayed.
+- **attention LR scale** — decoder LR ÷ TCN LR. Both groups decay together, so
+  this ratio is exact even when the rates themselves are not.
+
+Runs trained from now on also record the recipe explicitly in
+`history.json["config"]` (`optimizer`, `learning_rate`, `attn_lr_scale`,
+`weight_decay`, `sched_warmup_epochs`, `eta_min`).
 
 ### Transformer depth choices
 

@@ -8,9 +8,14 @@ Local HTTP server behind the training GUI (stdlib only).
     POST /api/config             {name, values} → save, returns the new text
     POST /api/config/new         {name, template} → create a preset
     GET  /api/runs               runs/ table (refreshed on demand)
+    GET  /api/runs/kinds         complete runs only, grouped by variant x artifact
+    GET  /api/runs/losses        complete runs only, grouped by loss_fn x artifact
+    GET  /api/runs/optimizers    complete runs only, grouped by optimizer recipe
+    GET  /api/runs/history?name=X    one finished run's per-epoch curve, for the chart
     POST /api/train              {name, extra_args} → start `python -m trainer --config configs/X`
     POST /api/train/stop
-    GET  /api/train/status?since=N   incremental log lines from index N
+    GET  /api/train/status?since=N   incremental log lines from index N, plus the
+                                 per-epoch validation metrics parsed from them
 
 Binds to 127.0.0.1 only; there is no authentication.  One training job at
 a time; its output is kept in memory (last 5000 lines) and mirrored to
@@ -21,6 +26,7 @@ from __future__ import annotations
 
 import collections
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -41,9 +47,29 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # Training job
 # ============================================================
 class TrainingJob:
-    """Runs one trainer subprocess and buffers its output line by line."""
+    """
+    Runs one trainer subprocess, buffers its output line by line, and reads the
+    per-epoch validation metrics back out of that output so the page can plot
+    them while the run is going.
+
+    Parsing the log (rather than the checkpoints) keeps the trainer untouched
+    and costs nothing: the lines are already streaming through here.
+    """
 
     MAX_LINES = 5000
+
+    #   [fit | Epoch 12/40]
+    EPOCH_RE = re.compile(r"\[([^\]|]+?)\s*\|\s*Epoch\s+(\d+)\s*/\s*(\d+)\]")
+    #     -> train_loss = 0.4234  (24.1s)        (KD adds [task=... output=...])
+    TRAIN_RE = re.compile(r"train_loss\s*=\s*(-?[\d.]+(?:[eE][-+]?\d+)?)")
+    #     -> val_loss   = 0.4232  RRMSE_t=0.760  RRMSE_s=0.700  ACC=0.659
+    #   The arrow is required: KDTrainer prints a "Teacher reference: val_loss=..."
+    #   summary in the same shape, and that is not an epoch of this run.
+    VAL_RE = re.compile(
+        r"→\s*val_loss\s*=\s*(-?[\d.]+(?:[eE][-+]?\d+)?)\s+"
+        r"RRMSE_t=\s*(-?[\d.]+(?:[eE][-+]?\d+)?)\s+"
+        r"RRMSE_s=\s*(-?[\d.]+(?:[eE][-+]?\d+)?)\s+"
+        r"ACC=\s*(-?[\d.]+(?:[eE][-+]?\d+)?)")
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -54,6 +80,9 @@ class TrainingJob:
         self.started: str | None = None
         self.log_path: Path | None = None
         self.returncode: int | None = None
+        self._metrics: list[dict] = []         # one record per finished epoch
+        self._epoch: dict | None = None        # epoch in progress
+        self._max_epochs: int | None = None
 
     @property
     def running(self) -> bool:
@@ -65,6 +94,9 @@ class TrainingJob:
                 raise RuntimeError("a training run is already in progress")
             self._lines.clear()
             self._offset = 0
+            self._metrics = []
+            self._epoch = None
+            self._max_epochs = None
             self.command = list(command)
             self.started = datetime.now().isoformat(timespec="seconds")
             self.returncode = None
@@ -86,6 +118,7 @@ class TrainingJob:
                     if len(self._lines) == self._lines.maxlen:
                         self._offset += 1
                     self._lines.append(line)
+                    self._scan(line)
                 if log:
                     log.write(line + "\n")
                     log.flush()
@@ -96,6 +129,35 @@ class TrainingJob:
             if log:
                 log.write(f"\n[exit code {proc.returncode}]\n")
                 log.close()
+
+    def _scan(self, line: str):
+        """Pull epoch boundaries and validation metrics out of one log line.
+
+        Called with the lock held.  A validation line only counts once an epoch
+        header has been seen, so the teacher's reference pass that KDTrainer
+        runs before training starts is ignored.
+        """
+        m = self.EPOCH_RE.search(line)
+        if m:
+            self._epoch = {"epoch": int(m.group(2)), "phase": m.group(1).strip()}
+            self._max_epochs = int(m.group(3))
+            return
+        if self._epoch is None:
+            return
+        m = self.TRAIN_RE.search(line)
+        if m and "train_loss" not in self._epoch:
+            self._epoch["train_loss"] = float(m.group(1))
+            return
+        m = self.VAL_RE.search(line)
+        if m:
+            self._epoch.update(val_loss=float(m.group(1)), rrmse_t=float(m.group(2)),
+                               rrmse_s=float(m.group(3)), acc=float(m.group(4)))
+            self._metrics.append(self._epoch)
+            self._epoch = None
+
+    def metrics(self) -> list[dict]:
+        with self._lock:
+            return list(self._metrics)
 
     def stop(self, grace: float = 5.0):
         proc = self._proc
@@ -113,7 +175,10 @@ class TrainingJob:
             start = max(since - self._offset, 0)
             lines = list(self._lines)[start:]
             nxt = self._offset + len(self._lines)
+            metrics = list(self._metrics)
+            max_epochs = self._max_epochs
         return {
+            "metrics": metrics, "max_epochs": max_epochs,
             "running": self.running,
             "returncode": self.returncode,
             "command": " ".join(shlex.quote(c) for c in self.command),
@@ -140,6 +205,9 @@ def meta() -> dict:
     from models.variants import VARIANT_REGISTRY, BIDIRECTIONAL_VARIANTS
     runs = config_io.list_runs()
     return {
+        "kinds": config_io.runs_by_kind(runs),
+        "losses": config_io.runs_by_loss(runs),
+        "optimizers": config_io.runs_by_optimizer(runs),
         "schema": config_io.schema_as_json(),
         "choices": {
             "variants": list(VARIANT_REGISTRY),
@@ -224,7 +292,18 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/config":
                 return self._json(config_io.read_config(q.get("name", "")))
             if url.path == "/api/runs":
-                return self._json({"runs": config_io.list_runs()})
+                runs = config_io.list_runs()
+                return self._json({"runs": runs, "kinds": config_io.runs_by_kind(runs),
+                                   "losses": config_io.runs_by_loss(runs),
+                                   "optimizers": config_io.runs_by_optimizer(runs)})
+            if url.path == "/api/runs/kinds":
+                return self._json({"kinds": config_io.runs_by_kind()})
+            if url.path == "/api/runs/losses":
+                return self._json({"losses": config_io.runs_by_loss()})
+            if url.path == "/api/runs/optimizers":
+                return self._json({"optimizers": config_io.runs_by_optimizer()})
+            if url.path == "/api/runs/history":
+                return self._json(config_io.read_run_history(q.get("name", "")))
             if url.path == "/api/train/status":
                 return self._json(JOB.status(int(q.get("since", 0))))
             return self._error("not found", 404)

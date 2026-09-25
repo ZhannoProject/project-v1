@@ -43,6 +43,10 @@
   @keyframes pulse { 50% { opacity: .2; } }
 
   main { display: grid; grid-template-columns: minmax(360px, 520px) 1fr; gap: 16px; padding: 16px; max-width: 1600px; margin: 0 auto; }
+  /* Grid items default to min-width:auto, so one long unwrapped log line (the
+     [Config] dump is ~1000 chars) stretches the whole column instead of
+     scrolling inside the <pre>.  Pin it to 0 and let the panes scroll. */
+  main > section { min-width: 0; }
   @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
   #form details { border-bottom: 1px solid var(--border); }
@@ -70,7 +74,7 @@
   pre { margin: 0; background: var(--code); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: auto; white-space: pre; }
   #yaml { max-height: calc(100vh - 210px); }
   #yaml .ch { background: var(--changed); color: var(--changed-text); display: inline-block; width: 100%; }
-  #log { height: calc(100vh - 330px); min-height: 240px; }
+  #log { height: calc(100vh - 560px); min-height: 180px; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
   .row .grow { flex: 1; }
   .cmd { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); word-break: break-all; margin-bottom: 8px; }
@@ -87,6 +91,33 @@
   .badge.bi { color: var(--warn); border-color: var(--warn); }
   .badge.kd { color: var(--accent); border-color: var(--accent); }
   .muted { color: var(--muted); }
+  .badge.stale { color: var(--err); border-color: var(--err); }
+  button.link { border: 0; background: transparent; color: var(--accent); padding: 0 4px; font-size: 11.5px; }
+  button.link:hover { text-decoration: underline; background: transparent; }
+  .badge.partial { color: var(--muted); }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; padding: 4px 10px; color: var(--muted); background: transparent; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.active { background: var(--accent); color: var(--accent-text); }
+  /* Display only: the variant label reads as a model name (TCN_MHA · EOG) while
+     the DOM text and /api/runs keep the registry spelling ("tcn_mha"), which is
+     what the YAML and build_model() use. The run rows below are directory names
+     in runs/, so they stay as they are on disk. */
+  tr.group td { background: var(--code); font-weight: 600; color: var(--text); text-transform: uppercase; }
+  tr.group .sub { font-weight: 400; color: var(--muted); margin-left: 8px; font-size: 11.5px; text-transform: none; }
+  tr.group.warn td { color: var(--warn); }
+  .badge.loss { color: var(--muted); }
+  .badge.optim { color: var(--muted); }
+  .badge.loss.recovered { border-style: dashed; }
+  tr.best td.num:first-of-type ~ td { }
+  .chartbox { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px 4px; margin-bottom: 10px; background: var(--panel); }
+  .chartbox .head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 2px; }
+  .chartbox .head .grow { flex: 1; }
+  .legend { display: inline-flex; gap: 12px; flex-wrap: wrap; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .legend span.item { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i { width: 10px; height: 2px; border-radius: 1px; display: inline-block; }
+  #chart { overflow: hidden; }
+  #chart svg { display: block; width: 100%; height: auto; max-height: 260px; }
   footer { padding: 6px 16px 16px; color: var(--muted); font-size: 12px; text-align: center; }
   kbd { font: 11px ui-monospace, Menlo, monospace; border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
   dialog { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; width: min(440px, 90vw); box-shadow: 0 20px 60px rgba(0,0,0,.35); }
@@ -138,16 +169,31 @@
         <input type="text" id="extraArgs" class="grow" placeholder="extra CLI flags, e.g. --max_epochs 2 --staged" title="Appended to the command; CLI flags override the YAML">
       </div>
       <div class="cmd" id="cmd"></div>
+      <div class="chartbox">
+        <div class="head">
+          <span class="muted" id="chartTitle">validation metrics</span>
+          <span class="grow"></span>
+          <span class="legend" id="chartLegend"></span>
+        </div>
+        <div id="chart"></div>
+        <div class="muted" id="chartNote" style="font-size:11.5px;min-height:14px"></div>
+      </div>
       <pre id="log"></pre>
       <div class="muted" style="margin-top:6px" id="logNote"></div>
     </div>
 
     <div class="tab" id="tab-runs">
       <div class="row">
-        <span class="muted">Checkpoints in <code>runs/</code>, best epoch by val loss. “Use as teacher” fills <code>teacher_ckpt</code>.</span>
+        <span class="seg" id="runsView">
+          <button data-view="kind" class="active">Complete by kind</button>
+          <button data-view="loss" title="Grouped by the loss function and artifact the run was trained with — val loss is only comparable inside one group">Complete by loss</button>
+          <button data-view="optim" title="Grouped by the optimizer recipe recorded in each checkpoint — family, configured LR, decoder/TCN LR ratio and schedule">Complete by optimizer</button>
+          <button data-view="all">All runs</button>
+        </span>
         <span class="grow"></span>
         <button id="btnRunsRefresh">Refresh</button>
       </div>
+      <div class="row" style="margin-top:-2px"><span class="muted" id="runsNote"></span></div>
       <div style="overflow:auto"><table id="runs"></table></div>
     </div>
   </section>
@@ -170,7 +216,7 @@
 <script>
 (() => {
   const $ = (s, r = document) => r.querySelector(s);
-  const state = { meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {}, job: { running: false, next: 0 } };
+  const state = { meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {}, job: { running: false, next: 0, metrics: [], maxEpochs: null }, runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0 };
   let previewTimer = null, pollTimer = null;
 
   // ---------- helpers ----------
@@ -437,7 +483,7 @@
     }
     try {
       const s = await api("/api/train", { name: state.name, extra_args: $("#extraArgs").value });
-      $("#log").textContent = ""; state.job.next = 0;
+      $("#log").textContent = ""; state.job.next = 0; state.job.metrics = []; state.job.maxEpochs = null;
       applyStatus(s); showTab("train"); startPolling();
     } catch (e) { banner(e.message); }
   }
@@ -464,6 +510,11 @@
       if (atBottom) log.scrollTop = log.scrollHeight;
     }
     state.job.next = s.next ?? state.job.next; state.job.running = s.running;
+    if (s.metrics) {
+      state.job.metrics = s.metrics; state.job.maxEpochs = s.max_epochs ?? null;
+      if (s.running) state.chartRun = null;        // a live run takes the chart back
+      renderChart();
+    }
     if (s.command) $("#cmd").textContent = s.command;
     $("#logNote").textContent = s.log_path ? `Mirrored to ${s.log_path}` : "";
     $("#btnTrain").disabled = s.running; $("#btnStop").disabled = !s.running;
@@ -482,28 +533,194 @@
     else { j.className = "pill err"; j.lastElementChild.textContent = `exit ${s.returncode}`; }
   }
 
+  // ---------- live metric chart ----------
+  const SERIES = [
+    { k: "rrmse_t", label: "RRMSE_t", css: "var(--accent)" },
+    { k: "rrmse_s", label: "RRMSE_s", css: "var(--warn)" },
+    { k: "acc", label: "ACC", css: "var(--ok)" },
+  ];
+
+  function niceTicks(lo, hi, n = 4) {
+    if (!(hi > lo)) hi = lo + 1;
+    const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const step = [1, 2, 2.5, 5, 10].map(x => x * mag).find(x => x >= raw) || mag * 10;
+    const out = [];
+    for (let v = Math.ceil(lo / step) * step; v <= hi + step / 1e6; v += step) out.push(+v.toFixed(10));
+    return out;
+  }
+
+  // Epoch 1 is often an order of magnitude worse than the rest, which would
+  // squash the part worth looking at; fit the axis to the bulk and let the
+  // opening transient run off the top (the note says so when it does).
+  function yRange(m) {
+    const all = SERIES.flatMap(s => m.map(d => d[s.k])).filter(v => v != null && isFinite(v));
+    if (!all.length) return null;
+    const sorted = [...all].sort((a, b) => a - b);
+    const q = f => sorted[Math.max(0, Math.min(sorted.length - 1, Math.round(f * (sorted.length - 1))))];
+    const tail = SERIES.flatMap(s => m.slice(-5).map(d => d[s.k])).filter(v => v != null && isFinite(v));
+    let lo = q(0), hi = Math.max(q(0.92), ...(tail.length ? tail : [q(1)]));
+    const pad = (hi - lo || Math.abs(hi) || 1) * 0.08;
+    return { lo: lo - pad, hi: hi + pad, clipped: sorted[sorted.length - 1] > hi + pad };
+  }
+
+  function renderChart() {
+    const m = (state.chartRun ? state.chartMetrics : state.job.metrics || []).filter(d => d && isFinite(d.rrmse_t));
+    const box = $("#chart"), legend = $("#chartLegend"), note = $("#chartNote");
+    const total = state.chartRun ? state.chartMax : (state.job.maxEpochs || (m.length ? m[m.length - 1].epoch : 0));
+    $("#chartTitle").textContent = !m.length ? "validation metrics"
+      : state.chartRun ? `runs/${state.chartRun} — ${m.length} epochs`
+      : `validation metrics — epoch ${m[m.length - 1].epoch}${total ? " / " + total : ""}`;
+    if (!m.length) {
+      box.innerHTML = `<svg viewBox="0 0 720 210"><text x="360" y="105" text-anchor="middle" font-size="13" fill="${cssVar("--muted")}">metrics appear after the first epoch</text></svg>`;
+      legend.innerHTML = ""; note.textContent = ""; return;
+    }
+    const W = 720, H = 210, L = 46, R = 14, T = 12, B = 26;
+    const r = yRange(m);
+    const xMax = Math.max(total, m[m.length - 1].epoch, 2);
+    const X = e => L + (e - 1) / Math.max(1, xMax - 1) * (W - L - R);
+    const Y = v => T + (r.hi - v) / (r.hi - r.lo) * (H - T - B);
+    const best = m.reduce((a, b) => (b.val_loss != null && (a.val_loss == null || b.val_loss < a.val_loss) ? b : a), m[0]);
+
+    let g = "";
+    for (const t of niceTicks(r.lo, r.hi)) {
+      const y = Y(t).toFixed(1);
+      g += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="${cssVar("--border")}" stroke-width="1"/>`
+         + `<text x="${L - 6}" y="${y}" text-anchor="end" dominant-baseline="central" font-size="10.5" fill="${cssVar("--muted")}">${(+t).toFixed(2)}</text>`;
+    }
+    const step = Math.max(1, Math.ceil(xMax / 8));
+    for (let e = 1; e <= xMax; e += step) {
+      g += `<text x="${X(e).toFixed(1)}" y="${H - B + 14}" text-anchor="middle" font-size="10.5" fill="${cssVar("--muted")}">${e}</text>`;
+    }
+    g += `<line x1="${L}" y1="${Y(r.lo).toFixed(1)}" x2="${W - R}" y2="${Y(r.lo).toFixed(1)}" stroke="${cssVar("--border")}"/>`;
+    if (best.val_loss != null && m.length > 1) {
+      const x = X(best.epoch).toFixed(1);
+      g += `<line x1="${x}" y1="${T}" x2="${x}" y2="${H - B}" stroke="${cssVar("--muted")}" stroke-width="1" stroke-dasharray="3 3" opacity="0.7"/>`
+         + `<text x="${x}" y="${T + 9}" text-anchor="middle" font-size="10" fill="${cssVar("--muted")}">best ${best.epoch}</text>`;
+    }
+    let paths = "";
+    for (const sr of SERIES) {
+      const pts = m.filter(d => d[sr.k] != null && isFinite(d[sr.k]))
+                   .map(d => `${X(d.epoch).toFixed(1)},${Y(d[sr.k]).toFixed(1)}`);
+      if (!pts.length) continue;
+      paths += `<polyline points="${pts.join(" ")}" fill="none" stroke="${sr.css}" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>`;
+      const last = m[m.length - 1];
+      if (last[sr.k] != null && isFinite(last[sr.k])) paths += `<circle cx="${X(last.epoch).toFixed(1)}" cy="${Y(last[sr.k]).toFixed(1)}" r="2.6" fill="${sr.css}"/>`;
+    }
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="validation metrics per epoch">`
+      + `<clipPath id="plot"><rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}"/></clipPath>`
+      + g + `<g clip-path="url(#plot)">${paths}</g></svg>`;
+    const cur = m[m.length - 1];
+    legend.innerHTML = SERIES.map(sr => `<span class="item"><i style="background:${sr.css}"></i>${sr.label} <b>${fmt(cur[sr.k])}</b></span>`).join("")
+      + `<span class="item muted">val loss <b>${fmt(cur.val_loss, 4)}</b></span>`;
+    note.textContent = r.clipped ? "y-axis fitted to the bulk of the run; the first epochs run off the top." : "";
+  }
+
+  function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || "#888"; }
+
   // ---------- runs ----------
   const fmt = (x, d = 3) => x == null ? "—" : Number(x).toFixed(d);
   async function refreshRuns() {
     try {
-      const { runs } = await api("/api/runs");
-      state.meta.runs = runs; state.meta.datalists.checkpoints = runs.map(r => r.checkpoint);
+      const { runs, kinds } = await api("/api/runs");
+      state.meta.runs = runs; state.meta.kinds = kinds || [];
+      state.meta.datalists.checkpoints = runs.map(r => r.checkpoint);
       const dl = $("#dl_teacher_ckpt"); if (dl) { dl.innerHTML = ""; for (const r of runs) dl.appendChild(new Option(r.checkpoint)); }
       renderRuns();
     } catch (e) { banner(e.message); }
   }
-  function renderRuns() {
-    const t = $("#runs");
-    const rows = state.meta.runs.map(r => `<tr>
-      <td>${r.name}${r.bidirectional ? '<span class="badge bi">bi</span>' : ""}${r.kd ? '<span class="badge kd">kd</span>' : ""}</td>
+  const HEAD = `<tr><th>run</th><th class="num">epochs</th><th class="num">best</th><th class="num">val loss</th><th class="num">RRMSE_t</th><th class="num">RRMSE_s</th><th class="num">ACC</th><th></th></tr>`;
+
+  function runRow(r) {
+    const badges = (r.bidirectional ? '<span class="badge bi">bi</span>' : "")
+      + (r.kd ? '<span class="badge kd">kd</span>' : "")
+      + (r.status === "stale" ? '<span class="badge stale" title="history.json and the weights beside it come from different runs — this directory was re-used">stale</span>' : "")
+      + (r.status === "interrupted" ? '<span class="badge partial" title="no history.json: the run did not finish">partial</span>' : "")
+      + (r.optimizer
+          ? `<span class="badge optim" title="${r.optimizer.replace(/"/g, "&quot;")} — read from the optimizer and scheduler state in the checkpoint">${(r.optimizer_detail || {}).family || "opt"}</span>`
+          : "")
+      + (r.loss_fn
+          ? `<span class="badge loss ${r.loss_source}" title="${r.loss_source === "recorded"
+              ? "loss_fn recorded by the run itself"
+              : "loss_fn recovered from the weights by trainer.identify_loss"}">${r.loss_fn}</span>`
+          : '<span class="badge loss" title="this run recorded no loss_fn and it could not be recovered — its val loss is not comparable with anything">loss ?</span>');
+    const plot = r.status === "interrupted" ? "" : ` <button class="link" data-hist="${r.name}" title="Plot this run's curve in the Train tab">curve</button>`;
+    return `<tr>
+      <td>${r.name}${badges}${plot}</td>
       <td class="num">${r.epochs ?? "—"}</td><td class="num">${r.best_epoch ?? "—"}</td>
       <td class="num">${fmt(r.val_loss, 4)}</td><td class="num">${fmt(r.rrmse_t)}</td><td class="num">${fmt(r.rrmse_s)}</td><td class="num">${fmt(r.acc)}</td>
-      <td><button data-ckpt="${r.checkpoint}">Use as teacher</button></td></tr>`).join("");
-    t.innerHTML = `<tr><th>run</th><th class="num">epochs</th><th class="num">best</th><th class="num">val loss</th><th class="num">RRMSE_t</th><th class="num">RRMSE_s</th><th class="num">ACC</th><th></th></tr>${rows || '<tr><td colspan="8" class="muted">no runs/*/best.pt yet</td></tr>'}`;
+      <td><button data-ckpt="${r.checkpoint}">Use as teacher</button></td></tr>`;
+  }
+
+  function renderRuns() {
+    const t = $("#runs"), all = state.meta.runs || [], kinds = state.meta.kinds || [],
+          losses = state.meta.losses || [], optims = state.meta.optimizers || [];
+    if (state.runsView === "optim") {
+      const shown = optims.reduce((n, g) => n + g.n, 0);
+      $("#runsNote").innerHTML = `${shown} complete run${shown === 1 ? "" : "s"} in ${optims.length} optimizer recipe${optims.length === 1 ? "" : "s"}`
+        + (all.length - shown ? ` · ${all.length - shown} hidden (unfinished, or history and weights out of step)` : "")
+        + ` · read from each checkpoint's optimizer state · <b>runs in different groups were optimised differently</b>`;
+      const body = optims.map(g => {
+        const d = g.detail || {};
+        const bits = [d.weight_decay != null ? `wd ${d.weight_decay}` : null,
+                      d.betas ? `betas ${d.betas.join("/")}` : null,
+                      d.lr_exact === false ? "configured LR not recorded — value shown is the decayed rate" : null]
+                     .filter(Boolean).join(" · ");
+        return `<tr class="group${d.lr_exact === false ? " warn" : ""}"><td colspan="8">${g.label}`
+          + `<span class="sub">${g.n} run${g.n === 1 ? "" : "s"}${bits ? " · " + bits : ""}</span></td></tr>`
+          + g.runs.map(runRow).join("");
+      }).join("");
+      t.innerHTML = HEAD + (body || '<tr><td colspan="8" class="muted">no complete runs yet</td></tr>');
+    } else if (state.runsView === "loss") {
+      const shown = losses.reduce((n, g) => n + g.n, 0);
+      const known = losses.filter(g => g.comparable).length;
+      $("#runsNote").innerHTML = `${shown} complete run${shown === 1 ? "" : "s"} in ${known} comparable group${known === 1 ? "" : "s"}`
+        + (all.length - shown ? ` · ${all.length - shown} hidden (unfinished, or history and weights out of step)` : "")
+        + ` · <b>val loss is only comparable inside one group</b> — ranked by it here`;
+      const body = losses.map(g => {
+        const label = g.comparable
+          ? `${g.loss_fn} · ${g.artifact || "?"}`
+          : `loss unknown · ${g.artifact || "?"}`;
+        const note = g.comparable
+          ? (g.sources.includes("recovered")
+              ? (g.sources.includes("recorded") ? "recorded + recovered from weights" : "recovered from weights")
+              : "recorded by the run")
+          : "run python -m trainer.identify_loss to recover it";
+        return `<tr class="group${g.comparable ? "" : " warn"}"><td colspan="8">${label}`
+          + `<span class="sub">${g.n} run${g.n === 1 ? "" : "s"} · ${note}</span></td></tr>`
+          + g.runs.map(runRow).join("");
+      }).join("");
+      t.innerHTML = HEAD + (body || '<tr><td colspan="8" class="muted">no complete runs yet</td></tr>');
+    } else if (state.runsView === "kind") {
+      const shown = kinds.reduce((n, g) => n + g.n, 0);
+      $("#runsNote").textContent = `${shown} complete run${shown === 1 ? "" : "s"} in ${kinds.length} kind${kinds.length === 1 ? "" : "s"}`
+        + (all.length - shown ? ` · ${all.length - shown} hidden (unfinished, or history and weights out of step)` : "");
+      const body = kinds.map(g => {
+        const spec = [g.runs[0].n_attn_layers != null ? "L" + g.runs[0].n_attn_layers : null,
+                      g.runs[0].kv_lora_rank != null ? "rank " + g.runs[0].kv_lora_rank : null,
+                      g.runs[0].params != null ? (g.runs[0].params / 1000).toFixed(0) + "k params" : null]
+                     .filter(Boolean).join(" · ");
+        return `<tr class="group"><td colspan="8">${g.kind}<span class="sub">${g.n} run${g.n === 1 ? "" : "s"}${spec ? " · " + spec : ""}</span></td></tr>`
+          + g.runs.map(runRow).join("");
+      }).join("");
+      t.innerHTML = HEAD + (body || '<tr><td colspan="8" class="muted">no complete runs yet</td></tr>');
+    } else {
+      $("#runsNote").textContent = `${all.length} checkpoint director${all.length === 1 ? "y" : "ies"} in runs/ · best epoch by val loss · “Use as teacher” fills teacher_ckpt`;
+      t.innerHTML = HEAD + (all.map(runRow).join("") || '<tr><td colspan="8" class="muted">no runs/*/best.pt yet</td></tr>');
+    }
     t.querySelectorAll("button[data-ckpt]").forEach(b => b.addEventListener("click", () => {
       setField(fieldByKey("teacher_ckpt"), b.dataset.ckpt); onChange(); showTab("yaml");
       $("#f_teacher_ckpt").scrollIntoView({ block: "center" });
     }));
+    t.querySelectorAll("button[data-hist]").forEach(b => b.addEventListener("click", () => plotRun(b.dataset.hist)));
+  }
+
+  async function plotRun(name) {
+    if (state.job.running) { banner("A run is training — the chart is showing it live.", "info"); return; }
+    try {
+      const h = await api(`/api/runs/history?name=${encodeURIComponent(name)}`);
+      state.chartRun = name; state.chartMetrics = h.metrics || []; state.chartMax = h.max_epochs || 0;
+      banner(""); renderChart(); showTab("train");
+    } catch (e) { banner(e.message); }
   }
 
   // ---------- tabs / wiring ----------
@@ -529,6 +746,12 @@
   $("#btnTrain").addEventListener("click", train);
   $("#btnStop").addEventListener("click", stop);
   $("#btnRunsRefresh").addEventListener("click", refreshRuns);
+  $("#runsView").querySelectorAll("button").forEach(b => b.addEventListener("click", () => {
+    state.runsView = b.dataset.view;
+    $("#runsView").querySelectorAll("button").forEach(x => x.classList.toggle("active", x === b));
+    try { localStorage.setItem("trainGui.runsView", state.runsView); } catch (e) {}
+    renderRuns();
+  }));
   $("#extraArgs").addEventListener("input", updateCmd);
   document.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); save(); } });
   window.addEventListener("beforeunload", e => { if (state.dirty) { e.preventDefault(); e.returnValue = ""; } });
@@ -538,7 +761,10 @@
       state.meta = await api("/api/meta");
       buildForm();
       fillConfigList(state.meta.configs);
+      try { const v = localStorage.getItem("trainGui.runsView"); if (["all", "kind", "loss", "optim"].includes(v)) state.runsView = v; } catch (e) {}
+      $("#runsView").querySelectorAll("button").forEach(x => x.classList.toggle("active", x.dataset.view === state.runsView));
       renderRuns();
+      renderChart();
       $("#envNote").textContent = `${state.meta.env.project_root} · ${state.meta.env.python} · device ${state.meta.env.device} · ⌘S saves`;
       let first = state.meta.configs[0];
       try { const saved = localStorage.getItem("trainGui.config"); if (saved && state.meta.configs.includes(saved)) first = saved; } catch (e) {}

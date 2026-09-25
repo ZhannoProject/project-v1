@@ -379,8 +379,185 @@ def create_config(name: str, template: Optional[str] = None) -> str:
 # ============================================================
 # Runs (for the teacher picker and the runs table)
 # ============================================================
+_CKPT_CACHE: Dict[str, tuple] = {}          # path -> (mtime, size, info); torch.load is ~12 ms
+
+
+def _fmt_lr(v: Optional[float]) -> str:
+    return "?" if v is None else f"{v:.2g}"
+
+
+def optimizer_info(ck: dict) -> dict:
+    """
+    What optimizer and schedule produced a checkpoint, read from the state it saves.
+
+    Nothing has to be recomputed: ``optimizer_state`` and ``scheduler_state`` are
+    written by every checkpoint, so this works on runs of any age.
+
+      family     Adam and AdamW differ only in ``decoupled_weight_decay`` (torch 2.x
+                 implements AdamW as Adam with that flag on); SGD by ``momentum``.
+      scheduler  ReduceLROnPlateau keeps ``factor``/``patience``; the project's
+                 warmup->cosine chain is a SequentialLR holding a LinearLR and a
+                 CosineAnnealingLR; an empty state means no scheduler at all.
+      lr         ``initial_lr`` is the configured value and is exact.  Without it
+                 (no LR scheduler ever attached) only the *decayed* rate at save
+                 time survives, so ``lr_exact`` is False and the value is not the
+                 one that was configured.
+      attn_lr_scale  decoder LR / TCN LR.  Both groups decay together, so this
+                 ratio is exact even when the rates themselves are not.
+    """
+    groups = (ck.get("optimizer_state") or {}).get("param_groups") or []
+    if not groups:
+        return {}
+    g0 = groups[0]
+    if "betas" in g0:
+        dwd = g0.get("decoupled_weight_decay")
+        family = "Adam/AdamW" if dwd is None else ("AdamW" if dwd else "Adam")
+    elif "momentum" in g0:
+        family = "SGD"
+    else:
+        family = "?"
+
+    sch = ck.get("scheduler_state") or {}
+    if "factor" in sch and "patience" in sch:
+        scheduler = "plateau"
+    elif "_schedulers" in sch:
+        inner = sch["_schedulers"]
+        scheduler = "cosine+warmup" if any("T_max" in x for x in inner) else "chained"
+    elif "T_max" in sch:
+        scheduler = "cosine"
+    elif not sch:
+        scheduler = "none"
+    else:
+        scheduler = "?"
+
+    initial = [g.get("initial_lr") for g in groups]
+    lr_exact = all(v is not None for v in initial)
+    lrs = initial if lr_exact else [g.get("lr") for g in groups]
+    names = [g.get("name") for g in groups]
+    lr = lrs[0] if lrs else None
+    scale = None
+    if len(groups) == 2 and lrs[0]:
+        # the group order is (tcn, decoder) as build_param_groups creates them
+        i_dec = names.index("decoder") if "decoder" in names else 1
+        i_tcn = 1 - i_dec
+        lr = lrs[i_tcn]
+        if lrs[i_tcn]:
+            scale = round(lrs[i_dec] / lrs[i_tcn], 4)
+
+    label = f"{family} · lr {_fmt_lr(lr)}{'' if lr_exact else ' (decayed)'}"
+    if scale is not None:
+        label += f" · attn ×{scale:g}"
+    label += f" · {scheduler}"
+    # runs whose configured LR was never recorded group together rather than
+    # splitting by however far each had decayed when it was saved
+    key = (f"{family} · lr {_fmt_lr(lr) if lr_exact else '?'}"
+           + (f" · attn ×{scale:g}" if scale is not None else "")
+           + f" · {scheduler}")
+    return {"family": family, "scheduler": scheduler, "lr": lr, "lr_exact": lr_exact,
+            "attn_lr_scale": scale, "weight_decay": g0.get("weight_decay"),
+            "betas": list(g0["betas"]) if g0.get("betas") else None,
+            "groups": [n for n in names if n], "label": label, "key": key}
+
+
+def _checkpoint_info(path: Path) -> dict:
+    """
+    ``epoch`` and ``model_config`` of one checkpoint, cached on (mtime, size).
+
+    Returns ``{}`` when torch is missing or the file cannot be read — the GUI
+    stays usable without torch, it just cannot show the architecture.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    key = str(path)
+    hit = _CKPT_CACHE.get(key)
+    if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+        return hit[2]
+    info: dict = {}
+    try:
+        import torch
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        info = {"epoch": ck.get("epoch"), "model_config": dict(ck.get("model_config") or {}),
+                "params": sum(v.numel() for k, v in (ck.get("model_state") or {}).items()
+                              if not k.endswith("causal_mask")),
+                "optimizer": optimizer_info(ck)}
+    except Exception:                        # torch missing, half-written file, foreign format
+        info = {}
+    _CKPT_CACHE[key] = (st.st_mtime, st.st_size, info)
+    return info
+
+
+def _artifact_from_name(name: str) -> Optional[str]:
+    """``tcn_mla_bi_both`` -> ``BOTH``.  The artifact is a data setting, so it is
+    not in ``model_config``; the run directory name is the only record of it."""
+    low = name.lower()
+    for token in ("both", "eog", "emg"):
+        if low.endswith("_" + token) or ("_" + token + "_") in low:
+            return token.upper()
+    return None
+
+
+def _variant_from_name(name: str, artifact: Optional[str]) -> Optional[str]:
+    """
+    Fall back to the run directory name for checkpoints saved before
+    ``model_config`` existed: runs are created as ``<variant>_<artifact>[_kd]``.
+    """
+    stem = name[:-3] if name.endswith("_kd") else name
+    if artifact and stem.lower().endswith("_" + artifact.lower()):
+        stem = stem[: -(len(artifact) + 1)]
+    return stem or None
+
+
+def _loss_of(run_dir: Path, history: Optional[dict]) -> tuple[Optional[str], str]:
+    """
+    ``(loss_fn, source)`` for one run.
+
+    ``recorded``   the run saved it itself (history.json["config"], since Sep 2026)
+    ``recovered``  ``python -m trainer.identify_loss`` reproduced it from the weights
+    ``unknown``    neither — its ``val_loss`` cannot be compared with anything
+
+    Both sources are plain JSON, so the GUI still reads them without torch.
+    """
+    cfg = (history or {}).get("config") or {}
+    if cfg.get("loss_fn"):
+        return cfg["loss_fn"], "recorded"
+    side = run_dir / "loss_fn.json"
+    if side.is_file():
+        try:
+            rec = json.loads(side.read_text())
+        except ValueError:
+            return None, "unknown"
+        if rec.get("loss_fn") and rec.get("status") in ("recovered", "recorded"):
+            # The verdict was reached by running that checkpoint; if best.pt has
+            # been rewritten since (the run was retrained), it no longer applies.
+            try:
+                st = (run_dir / "best.pt").stat()
+            except OSError:
+                return None, "unknown"
+            stamped = (rec.get("checkpoint_mtime"), rec.get("checkpoint_size"))
+            if stamped != (None, None) and stamped != (st.st_mtime, st.st_size):
+                return None, "unknown"
+            return rec["loss_fn"], "recovered"
+    return None, "unknown"
+
+
 def list_runs() -> List[dict]:
-    """One row per runs/<dir> that holds a best.pt; history summary if present."""
+    """
+    One row per runs/<dir> that holds a best.pt.
+
+    Besides the best-epoch metrics from history.json, each row carries what the
+    checkpoint says about itself (``variant``, depth, rank, parameter count) and
+    a ``status``:
+
+      complete     history.json exists and last.pt sits at its final epoch
+      stale        history.json exists but last.pt is at a different epoch — the
+                   directory was re-used, so the metrics shown describe weights
+                   that have been overwritten
+      interrupted  no history.json: the run never reached _finish()
+
+    ``kind`` groups runs that are the same experiment (variant x artifact).
+    """
     rows = []
     if not RUNS_DIR.is_dir():
         return rows
@@ -388,11 +565,29 @@ def list_runs() -> List[dict]:
         best = d / "best.pt"
         if not d.is_dir() or not best.is_file():
             continue
+        info = _checkpoint_info(best)
+        mc = info.get("model_config") or {}
+        artifact = _artifact_from_name(d.name)
+        variant = mc.get("variant") or _variant_from_name(d.name, artifact)
         row = {"name": d.name, "checkpoint": f"./runs/{d.name}/best.pt",
-               "bidirectional": d.name.endswith("_bi") or "_bi_" in d.name,
+               "bidirectional": bool(mc.get("causal") is False) or d.name.endswith("_bi")
+                                or "_bi_" in d.name,
                "epochs": None, "best_epoch": None, "val_loss": None,
-               "rrmse_t": None, "rrmse_s": None, "acc": None, "kd": False}
+               "rrmse_t": None, "rrmse_s": None, "acc": None, "kd": False,
+               "variant": variant, "artifact": artifact,
+               "kind": f"{variant} · {artifact}" if variant and artifact else (variant or d.name),
+               "hidden_channels": mc.get("hidden_channels"),
+               "n_attn_layers": mc.get("n_attn_layers"),
+               "kv_lora_rank": mc.get("kv_lora_rank"),
+               "params": info.get("params"),
+               "last_epoch": (_checkpoint_info(d / "last.pt") or info).get("epoch"),
+               "loss_fn": None, "loss_source": "unknown",
+               "optimizer": (info.get("optimizer") or {}).get("label"),
+               "optimizer_key": (info.get("optimizer") or {}).get("key"),
+               "optimizer_detail": info.get("optimizer") or {},
+               "status": "interrupted"}
         hist = d / "history.json"
+        h = None
         if hist.is_file():
             try:
                 h = json.loads(hist.read_text())
@@ -402,7 +597,115 @@ def list_runs() -> List[dict]:
                     row.update(epochs=len(vl), best_epoch=i + 1, val_loss=vl[i],
                                rrmse_t=h["rrmse_t"][i], rrmse_s=h["rrmse_s"][i], acc=h["acc"][i],
                                kd="kd_output" in h)
+                    # last.pt should sit at the final epoch of that history; if it
+                    # does not, the directory was re-used by a later, shorter run.
+                    last = row["last_epoch"]
+                    row["status"] = "complete" if last in (None, len(vl)) else "stale"
             except (ValueError, KeyError, IndexError):
-                pass
+                h = None
+        row["loss_fn"], row["loss_source"] = _loss_of(d, h)
         rows.append(row)
     return rows
+
+
+def read_run_history(name: str) -> dict:
+    """
+    The per-epoch history of one finished run, in the same record shape the
+    training stream produces, so the page can plot a past run with the same
+    code that draws the live one.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", name or ""):
+        raise ValueError(f"invalid run name {name!r}")
+    d = (RUNS_DIR / name).resolve()
+    if d.parent != RUNS_DIR.resolve() or not d.is_dir():
+        raise ValueError("run must be a directory directly inside runs/")
+    hist = d / "history.json"
+    if not hist.is_file():
+        raise FileNotFoundError(f"{name} has no history.json (the run did not finish)")
+    h = json.loads(hist.read_text())
+    vl = h.get("val_loss") or []
+    records = []
+    for i in range(len(vl)):
+        rec = {"epoch": i + 1, "phase": "history", "val_loss": vl[i]}
+        for key in ("train_loss", "rrmse_t", "rrmse_s", "acc"):
+            seq = h.get(key) or []
+            if i < len(seq):
+                rec[key] = seq[i]
+        records.append(rec)
+    return {"name": name, "max_epochs": len(records), "metrics": records}
+
+
+def runs_by_loss(runs: Optional[List[dict]] = None) -> List[dict]:
+    """
+    Complete runs grouped by ``loss_fn`` x ``artifact``, best val_loss first.
+
+    ``val_loss`` is whatever ``loss_fn`` the run minimised, measured on whichever
+    artifact it trained against, so it is only comparable inside one of these
+    groups — across groups the same number means different things (an MSE 0.13
+    and an L1+STFT 0.44 can be the same model).  Within a group the runs are
+    ranked by val_loss, which is the one view where that ranking is meaningful.
+
+    Runs whose loss is unknown are grouped separately rather than mixed in;
+    ``python -m trainer.identify_loss`` recovers it for those that can be.
+    """
+    groups: Dict[str, dict] = {}
+    for r in (list_runs() if runs is None else runs):
+        if r["status"] != "complete":
+            continue
+        loss = r.get("loss_fn") or "unknown"
+        artifact = r.get("artifact") or "?"
+        key = f"{loss} · {artifact}"
+        g = groups.setdefault(key, {"key": key, "loss_fn": r.get("loss_fn"),
+                                    "artifact": r.get("artifact"), "runs": [],
+                                    "comparable": bool(r.get("loss_fn"))})
+        g["runs"].append(r)
+    for g in groups.values():
+        g["runs"].sort(key=lambda r: (r["val_loss"] is None, r["val_loss"]))
+        g["n"] = len(g["runs"])
+        g["sources"] = sorted({r.get("loss_source", "unknown") for r in g["runs"]})
+    # known losses first, then by loss name, then artifact
+    return sorted(groups.values(),
+                  key=lambda g: (not g["comparable"], g["loss_fn"] or "~", g["artifact"] or "~"))
+
+
+def runs_by_optimizer(runs: Optional[List[dict]] = None) -> List[dict]:
+    """
+    Complete runs grouped by the optimizer recipe their checkpoint records:
+    family, configured LR, decoder-to-TCN LR ratio and schedule.
+
+    Two runs in different groups were optimised differently, so a difference
+    between them is not attributable to the thing an ablation means to vary.
+    """
+    groups: Dict[str, dict] = {}
+    for r in (list_runs() if runs is None else runs):
+        if r["status"] != "complete":
+            continue
+        key = r.get("optimizer_key") or "unknown"
+        g = groups.setdefault(key, {"key": key, "label": r.get("optimizer") or "unknown",
+                                    "detail": r.get("optimizer_detail") or {}, "runs": []})
+        g["runs"].append(r)
+    for g in groups.values():
+        g["runs"].sort(key=lambda r: (r["rrmse_t"] is None, r["rrmse_t"]))
+        g["n"] = len(g["runs"])
+        g["known"] = g["key"] != "unknown"
+    return sorted(groups.values(), key=lambda g: (not g["known"], g["key"]))
+
+
+def runs_by_kind(runs: Optional[List[dict]] = None) -> List[dict]:
+    """
+    Complete runs only, grouped by kind (variant x artifact), best first.
+
+    This is the list to read results off: it leaves out interrupted runs and
+    runs whose history no longer matches the weights beside it.
+    """
+    groups: Dict[str, dict] = {}
+    for r in (list_runs() if runs is None else runs):
+        if r["status"] != "complete":
+            continue
+        g = groups.setdefault(r["kind"], {"kind": r["kind"], "variant": r.get("variant"),
+                                          "artifact": r.get("artifact"), "runs": []})
+        g["runs"].append(r)
+    for g in groups.values():
+        g["runs"].sort(key=lambda r: (r["rrmse_t"] is None, r["rrmse_t"]))
+        g["n"] = len(g["runs"])
+    return sorted(groups.values(), key=lambda g: (g["artifact"] or "~", g["kind"]))
