@@ -21,6 +21,10 @@ What it verifies
      the identity skip, and keeps the model causal
  10. Seeding is deterministic: same master_seed → same weights, same
      batch order
+ 11. The artifact-switch probe is reproducible, realises the SNR it asks
+     for in each segment, and its matched control differs from it only
+     after the switch — so the response curve reads look-ahead back out
+     (zero for a causal model, non-zero for one that peeks)
 
 If real EEGdenoiseNet data is present, it uses that.
 Otherwise, it synthesises small random .npy files so CI works without
@@ -639,6 +643,130 @@ def test_configs():
 
 
 # =====================================================================
+# 11. Non-stationary artifact-switch probe
+# =====================================================================
+def test_switch_probe(data_dir: str):
+    print("\n" + "=" * 60)
+    print("11. Artifact-switch probe + response curve")
+    print("=" * 60)
+
+    import eval as evaltools
+    from data.Dataloader import ArtifactSwitchDataset, SWITCH_PROBE_SEEDS
+
+    def probe(**kw):
+        kw.setdefault("n_epochs", 16)
+        return ArtifactSwitchDataset(data_dir, **kw)
+
+    # --- reproducibility of the probe series ---
+    try:
+        a, b, c = probe(probe_seed=0), probe(probe_seed=0), probe(probe_seed=1)
+        same = (np.array_equal(a.switch_idx, b.switch_idx)
+                and torch.equal(a[1]["noisy"], b[1]["noisy"]))
+        moved = not np.array_equal(a.switch_idx, c.switch_idx)
+        report("probe: same probe_seed → identical epochs", same)
+        report("probe: different probe_seed → different switch points", moved,
+               f"seeds={list(SWITCH_PROBE_SEEDS)}")
+    except Exception as e:
+        report("probe: reproducibility", False, str(e))
+        return
+
+    # --- __getitem__ must not depend on access order ---
+    try:
+        first = a[2]["noisy"].clone()
+        for j in (5, 0, 2, 9):
+            a[j]
+        report("probe: __getitem__ is a pure function of the index",
+               torch.equal(first, a[2]["noisy"]))
+    except Exception as e:
+        report("probe: __getitem__ is a pure function of the index", False, str(e))
+
+    # --- the design: randomised switch, balanced directions ---
+    try:
+        lo, hi = a.switch_bounds
+        inside = bool((a.switch_idx >= lo).all() and (a.switch_idx <= hi).all())
+        varying = len(np.unique(a.switch_idx)) > 1
+        report("probe: switch point randomised inside its range", inside and varying,
+               f"[{lo}, {hi}], {len(np.unique(a.switch_idx))} distinct")
+        report("probe: directions exactly balanced",
+               int(a.eog_first.sum()) == len(a) // 2)
+        report("probe: the two SNRs are drawn independently",
+               not np.allclose(a.snr_eog, a.snr_emg))
+    except Exception as e:
+        report("probe: design", False, str(e))
+
+    # --- the SNR asked for is the SNR realised, per segment ---
+    try:
+        worst = 0.0
+        for i in range(len(a)):
+            k = int(a.switch_idx[i])
+            s = a[i]
+            clean = a.clean[i]
+            art = s["noisy"].squeeze().numpy() * s["sigma"].item() - clean
+
+            def snr(x, y):
+                return 20 * np.log10(np.sqrt(np.mean(x ** 2)) / np.sqrt(np.mean(y ** 2)))
+
+            want_pre = a.snr_eog[i] if a.eog_first[i] else a.snr_emg[i]
+            want_post = a.snr_emg[i] if a.eog_first[i] else a.snr_eog[i]
+            worst = max(worst, abs(snr(clean[:k], art[:k]) - want_pre),
+                        abs(snr(clean[k:], art[k:]) - want_post))
+        report("probe: each segment realises its own requested SNR", worst < 1e-2,
+               f"max error {worst:.1e} dB")
+    except Exception as e:
+        report("probe: each segment realises its own requested SNR", False, str(e))
+
+    # --- the matched control differs only after the switch ---
+    try:
+        ctrl = probe(probe_seed=0, control=True)
+        pre_gap = post_gap = 0.0
+        for i in range(len(a)):
+            k = int(a.switch_idx[i])
+            x = a[i]["noisy"].squeeze().numpy()
+            y = ctrl[i]["noisy"].squeeze().numpy()
+            pre_gap = max(pre_gap, np.abs(x[:k] - y[:k]).max())
+            post_gap = max(post_gap, np.abs(x[k:] - y[k:]).max())
+        report("probe: control is bit-identical before the switch", pre_gap == 0.0)
+        report("probe: control splices something different after it", post_gap > 0.0)
+    except Exception as e:
+        report("probe: matched control", False, str(e))
+
+    # --- the response curve reads causality back out ---
+    class _Causal(torch.nn.Module):
+        def forward(self, x):
+            return 0.5 * (x + torch.nn.functional.pad(x, (1, 0))[..., :-1])
+
+    class _Peeking(torch.nn.Module):
+        def forward(self, x):
+            return 0.5 * (x + torch.nn.functional.pad(x, (0, 1))[..., 1:])
+
+    try:
+        kw = dict(probe_seeds=(0, 1), n_epochs=16, batch_size=8,
+                  device=DEVICE, verbose=False)
+        causal = evaltools.evaluate_switch_response(_Causal(), data_dir, **kw)
+        peeking = evaltools.evaluate_switch_response(_Peeking(), data_dir, **kw)
+
+        off = causal["offsets"]
+        report("switch curve: offsets symmetric around the switch",
+               off[0] == -off[-1] and 0 in off and len(off) == len(causal["all"]["err"]),
+               f"±{off[-1]} samples")
+        report("switch curve: causal model leaks nothing before the switch",
+               causal["all"]["summary"]["pre_leak"] == 0.0)
+        report("switch curve: non-causal model does leak",
+               peeking["all"]["summary"]["pre_leak"] > 0.0,
+               f"pre_leak={peeking['all']['summary']['pre_leak']:.4f}")
+        report("switch curve: per-direction breakdown present",
+               all(d in causal for d in ("all", "eog_to_emg", "emg_to_eog")))
+        keys = {"pre", "post_floor", "peak", "overshoot", "delta_floor",
+                "transient_peak", "transient_area"}
+        report("switch curve: summary carries the reported fields",
+               keys <= set(causal["all"]["summary"]))
+        json.dumps(evaltools._switch_result_to_json(causal))
+        report("switch curve: result is JSON-serialisable", True)
+    except Exception as e:
+        report("switch curve", False, str(e))
+
+
+# =====================================================================
 # Main
 # =====================================================================
 def main():
@@ -674,6 +802,7 @@ def main():
                 save_dir, data_dir, variant = result
                 test_checkpoint_roundtrip(save_dir, variant)
                 test_eval_pipeline(data_dir, save_dir, variant)
+                test_switch_probe(data_dir)
                 test_kd_training_loop(tmpdir, data_dir)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
