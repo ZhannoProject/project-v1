@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -207,17 +208,20 @@ class TrainingJobTests(unittest.TestCase):
 class MetricsParsingTests(unittest.TestCase):
     """The chart's data: per-epoch validation metrics read back out of the log."""
 
+    # Epoch 1 is in the pre-rename spelling (RRMSE_s / ACC) and epoch 2 in the
+    # current one (RRMSE_f / CC): the parser has to read both, or the logs
+    # already sitting in runs/ stop plotting.
     LOG = [
         "[KD] Teacher on the validation split:",
-        "  → val_loss   = 0.3000  RRMSE_t=0.500  RRMSE_s=0.510  ACC=0.850",
+        "  → val_loss   = 0.3000  RRMSE_t=0.500  RRMSE_f=0.510  CC=0.850",
         "[fit | Epoch 1/3]",
         "  [E01] step   20/75  loss=1.3000",
         "  → train_loss = 1.2000  (10.0s)",
         "  → val_loss   = 0.9000  RRMSE_t=2.000  RRMSE_s=3.000  ACC=-0.010",
         "[fit | Epoch 2/3]",
         "  → train_loss = 0.6000  [task=0.5000  output=0.3000  feature=0.2000]  (9.0s)",
-        "  → val_loss   = 0.5000  RRMSE_t=0.800  RRMSE_s=0.700  ACC=0.700",
-        "Teacher reference: val_loss=0.3000  RRMSE_t=0.500  RRMSE_s=0.510  ACC=0.850",
+        "  → val_loss   = 0.5000  RRMSE_t=0.800  RRMSE_f=0.700  CC=0.700",
+        "Teacher reference: val_loss=0.3000  RRMSE_t=0.500  RRMSE_f=0.510  CC=0.850",
     ]
 
     def test_epochs_are_parsed_and_teacher_lines_ignored(self):
@@ -592,6 +596,14 @@ class ApiTests(unittest.TestCase):
         cls.srv.shutdown(); cls.srv.server_close()
         cls.tmp.__exit__(None, None, None)
 
+    def call_raw(self, path):
+        """Like call(), but returns the body bytes — the figure route is not JSON."""
+        try:
+            with urllib.request.urlopen(self.base + path) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
     def call(self, path, body=None):
         req = urllib.request.Request(self.base + path, method="POST" if body is not None else "GET",
                                      data=json.dumps(body).encode() if body is not None else None,
@@ -711,6 +723,62 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(self.call("/api/train/status")[1]["running"])
 
 
+    def test_eval_endpoints_with_stubbed_command(self):
+        server.EVAL_JOB = server.EvalJob()
+        with tempfile.TemporaryDirectory() as tmp:
+            figs = Path(tmp) / "figures"
+            figs.mkdir()
+            (figs / "shot.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            # An absolute path, because this test points FIGURES_DIR at a temp
+            # directory while figure_rel_path resolves relative paths against
+            # PROJECT_ROOT — in production the one is inside the other.
+            fake = [sys.executable, "-c",
+                    f"print('[Switch] Figure saved: {figs / 'shot.png'}')"]
+            with mock.patch.object(server, "FIGURES_DIR", figs), \
+                 mock.patch.object(server, "build_eval_command",
+                                   return_value=(fake, "figures/out")):
+                status, s = self.call("/api/eval", {"mode": "curves", "run": "x"})
+                self.assertEqual(status, 200)
+                self.assertEqual(s["save_dir"], "figures/out")
+                for _ in range(100):
+                    status, s = self.call("/api/eval/status?since=0")
+                    if not s["running"]:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(s["returncode"], 0)
+                self.assertEqual(s["artifacts"], ["shot.png"])
+                self.assertTrue(s["log_path"].endswith(".log"))
+
+                # the figure the run reported is servable, and nothing else is
+                status, body = self.call_raw("/api/eval/figure?path=shot.png")
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b"\x89PNG\r\n\x1a\n")
+                self.assertEqual(self.call("/api/eval/figure?path=../secret")[0], 400)
+                self.assertEqual(self.call("/api/eval/figure?path=missing.png")[0], 400)
+
+    def test_eval_preview_reports_the_command_and_its_refusals(self):
+        status, s = self.call("/api/eval/preview", {"mode": "curves", "run": "nope"})
+        self.assertEqual(status, 400)
+        self.assertIn("nope", s["error"])
+        status, s = self.call("/api/eval/preview", {"mode": "bogus"})
+        self.assertEqual(status, 400)
+
+    def test_an_evaluation_does_not_block_training(self):
+        """The two jobs are independent; neither 409s the other."""
+        server.EVAL_JOB = server.EvalJob()
+        server.JOB = TrainingJob()
+        slow = [sys.executable, "-c", "import time; print('x', flush=True); time.sleep(30)"]
+        try:
+            with mock.patch.object(server, "build_eval_command", return_value=(slow, "figures/o")):
+                self.assertEqual(self.call("/api/eval", {"mode": "curves", "run": "x"})[0], 200)
+                self.assertEqual(self.call("/api/eval", {"mode": "curves", "run": "x"})[0], 409)
+            with mock.patch.object(server, "build_train_command", return_value=slow):
+                self.assertEqual(self.call("/api/train", {"name": "tcn_eog.yaml"})[0], 200)
+        finally:
+            self.call("/api/eval/stop", {})
+            self.call("/api/train/stop", {})
+
+
 @unittest.skipIf(torch is None, "parameter counting builds a real model")
 class ParamReportTests(unittest.TestCase):
     """The Params tab: the breakdown has to add up and reconcile with the Runs tab."""
@@ -826,15 +894,62 @@ class RunsTablePageTests(unittest.TestCase):
                          f"header has {columns} columns; colspans say {sorted(spans)}")
 
     def test_a_run_row_fills_every_column(self):
-        body = re.search(r"function runRow\(r, when = \"\"\) \{(.*?)\n  \}", self.PAGE, re.S)
-        self.assertIsNotNone(body, "runRow not found")
+        row = re.search(r"return `<tr\$\{rowAttrs\}>(.*?)</tr>`;", self.PAGE, re.S)
+        self.assertIsNotNone(row, "runRow's row template not found")
         head = re.search(r"const HEAD = `(.*?)`;", self.PAGE, re.S)
         columns = len(re.findall(r"<th", head.group(1)))
-        # <td ...> written inline, plus the helpers that each contribute one cell
-        helpers = len(re.findall(r"\$\{(?:paramCell|seedCell)\(", body.group(1)))
-        cells = len(re.findall(r"<td", body.group(1))) + helpers
+        # <td ...> written inline, plus the interpolations that each stand for
+        # exactly one cell: the two cell helpers and the trailing action cell,
+        # which differs between the Runs tab and the picker.
+        helpers = len(re.findall(r"\$\{(?:paramCell|seedCell|action)\}?\(?", row.group(1)))
+        cells = len(re.findall(r"<td", row.group(1))) + helpers
         self.assertEqual(cells, columns,
                          f"runRow emits {cells} cells for {columns} columns")
+
+    def test_both_run_row_modes_emit_exactly_one_action_cell(self):
+        """The Runs tab's actions and the picker's Select share the last column."""
+        action = re.search(r"const action = mode === \"pick\"\n(.*?);\n", self.PAGE, re.S)
+        self.assertIsNotNone(action, "runRow's action cell not found")
+        for branch in action.group(1).split("      : "):
+            self.assertEqual(len(re.findall(r"<td", branch)), 1,
+                             f"an action branch does not emit exactly one cell: {branch.strip()}")
+
+
+class RunPickerPageTests(unittest.TestCase):
+    """The Evaluate tab picks its run from the Runs table rather than a bare
+    dropdown, which is only true for as long as the two share a renderer."""
+
+    PAGE = (ROOT / "gui" / "static" / "index.html").read_text()
+
+    def test_the_tab_and_the_picker_share_one_renderer(self):
+        for caller in ("function renderRuns()", "function renderRunPicker()"):
+            block = self.PAGE[self.PAGE.index(caller):]
+            self.assertIn("runsMarkup(", block[:400],
+                          f"{caller} does not build its table with runsMarkup")
+        self.assertIn('runsMarkup(state.runsView, "tab")', self.PAGE)
+        self.assertIn('runsMarkup(state.pickView, "pick")', self.PAGE)
+
+    def test_the_picker_offers_the_same_views_as_the_runs_tab(self):
+        def views(container):
+            block = re.search(rf'id="{container}">(.*?)</span>', self.PAGE, re.S)
+            self.assertIsNotNone(block, f"{container} not found")
+            return set(re.findall(r'data-view="([^"]+)"', block.group(1)))
+        self.assertEqual(views("pickView"), views("runsView"))
+
+    def test_the_picker_drops_the_actions_that_would_navigate_away(self):
+        """curve and "Use as teacher" leave the tab; mid-choice that loses the
+        choice, so pick mode must not render them."""
+        self.assertIn('const plot = (mode === "tab"', self.PAGE)
+        self.assertIn('mode === "pick"\n      ? `<td><button class="primary" data-pick=', self.PAGE)
+
+    def test_no_run_is_selected_by_default(self):
+        """The dropdown this replaced defaulted to whatever sorted first — a
+        non-causal control run — so evaluating the wrong model took one click
+        and said nothing.  Nothing is chosen until the user chooses it."""
+        self.assertRegex(self.PAGE, r"evalRun: null")
+        self.assertIn('out.run = state.evalRun || "";', self.PAGE)
+        self.assertIn("Choose a run…", self.PAGE)
+        self.assertNotIn('$("#evalRun").value', self.PAGE)
 
     def test_run_rows_are_not_built_with_a_bare_map(self):
         """``.map(runRow)`` hands runRow the array index as its second
@@ -900,6 +1015,190 @@ class NativeAndBundleTests(unittest.TestCase):
             # rebuilding replaces the previous bundle
             build_app(Path(tmp))
             self.assertIn("root=", (app / "Contents" / "Resources" / "launch.cfg").read_text())
+
+
+class EvalCommandTests(unittest.TestCase):
+    """The Evaluate tab's contract: what it will run, and what it refuses to."""
+
+    def build(self, **spec):
+        cmd, save_dir = server.build_eval_command(spec)
+        self.assertEqual(cmd[0], sys.executable)
+        self.assertEqual(cmd[1], "eval.py")
+        return cmd, save_dir
+
+    def flag(self, cmd, name, n=1):
+        i = cmd.index(name)
+        return cmd[i + 1] if n == 1 else cmd[i + 1:i + 1 + n]
+
+    # ---- the modes the page offers must be the modes eval.py has ----
+    def test_mode_table_matches_eval_py(self):
+        import eval as evaltools
+        self.assertEqual(set(server.EVAL_MODES), set(evaltools.MODES),
+                         "the GUI's mode table has drifted from eval.py's --mode choices")
+
+    def test_single_model_mode_passes_a_checkpoint(self):
+        cmd, save_dir = self.build(mode="switch", run="tcn_mla_both",
+                                   data_dir="./data/x", artifact="BOTH", master_seed=7,
+                                   probe_seeds="0 1")
+        self.assertEqual(self.flag(cmd, "--ckpt"), "runs/tcn_mla_both/best.pt")
+        self.assertEqual(self.flag(cmd, "--artifact"), "BOTH")
+        self.assertEqual(self.flag(cmd, "--master_seed"), "7")
+        self.assertEqual(self.flag(cmd, "--probe_seeds", 2), ["0", "1"])
+        self.assertTrue(save_dir.startswith("figures/"))
+
+    def test_compare_mode_passes_labelled_runs(self):
+        cmd, _ = self.build(mode="compare_switch", data_dir="./data/x",
+                            runs=[{"name": "tcn_both", "label": "TCN-only"},
+                                  {"name": "tcn_mla_both", "label": ""}])
+        self.assertEqual(self.flag(cmd, "--compare_runs", 2),
+                         ["runs/tcn_both:TCN-only", "runs/tcn_mla_both"])
+        self.assertNotIn("--ckpt", cmd)
+
+    def test_curves_uses_history_and_needs_no_data(self):
+        cmd, _ = self.build(mode="curves", run="tcn_mla_both")
+        self.assertEqual(self.flag(cmd, "--history"), "runs/tcn_mla_both/history.json")
+        for absent in ("--ckpt", "--data_dir", "--artifact", "--master_seed"):
+            self.assertNotIn(absent, cmd)
+
+    def test_switch_options_are_only_sent_when_set(self):
+        cmd, _ = self.build(mode="switch", run="tcn_mla_both", data_dir="d",
+                            switch_ramp=0, switch_snr=None, switch_epochs=None,
+                            switch_control=True)
+        for absent in ("--switch_ramp", "--switch_snr", "--switch_epochs",
+                       "--no-switch_control", "--switch_window"):
+            self.assertNotIn(absent, cmd)
+
+        cmd, _ = self.build(mode="switch", run="tcn_mla_both", data_dir="d",
+                            switch_ramp=32, switch_snr=-3.0, switch_epochs=64,
+                            switch_range=[0.4, 0.6], switch_control=False)
+        self.assertEqual(self.flag(cmd, "--switch_ramp"), "32")
+        self.assertEqual(self.flag(cmd, "--switch_snr"), "-3.0")
+        self.assertEqual(self.flag(cmd, "--switch_epochs"), "64")
+        self.assertEqual(self.flag(cmd, "--switch_range", 2), ["0.4", "0.6"])
+        self.assertIn("--no-switch_control", cmd)
+
+    def test_switch_options_are_not_sent_to_unrelated_modes(self):
+        cmd, _ = self.build(mode="snr", run="tcn_mla_both", data_dir="d",
+                            probe_seeds="0 1", switch_ramp=32, vis_snr=-3)
+        for absent in ("--probe_seeds", "--switch_ramp", "--vis_snr"):
+            self.assertNotIn(absent, cmd)
+
+    def test_extra_args_are_appended(self):
+        cmd, _ = self.build(mode="curves", run="tcn_mla_both",
+                            extra_args="--n_samples 2")
+        self.assertEqual(cmd[-2:], ["--n_samples", "2"])
+
+    def test_save_dir_defaults_under_figures_and_is_pinned_there(self):
+        _, save_dir = self.build(mode="curves", run="tcn_mla_both")
+        self.assertRegex(save_dir, r"^figures/gui_eval_\d{8}_\d{6}$")
+        cmd, save_dir = self.build(mode="curves", run="tcn_mla_both",
+                                   save_dir="figures/mine")
+        self.assertEqual(save_dir, "figures/mine")
+        for escape in ("../runs", "/tmp/anywhere", "figures/../../etc"):
+            with self.assertRaises(ValueError):
+                self.build(mode="curves", run="tcn_mla_both", save_dir=escape)
+
+    def test_refusals(self):
+        cases = {
+            "unknown mode": dict(mode="nope", run="tcn_mla_both"),
+            "no run": dict(mode="switch", data_dir="d"),
+            "one run in a compare": dict(mode="compare_snr", data_dir="d",
+                                         runs=[{"name": "tcn_both"}]),
+            "traversal in a run name": dict(mode="switch", run="../../etc", data_dir="d"),
+            "absent run": dict(mode="switch", run="definitely_not_a_run", data_dir="d"),
+            "colon in a label": dict(mode="compare_snr", data_dir="d",
+                                     runs=[{"name": "tcn_both", "label": "a:b"},
+                                           {"name": "tcn_mla_both"}]),
+            "junk probe seed": dict(mode="switch", run="tcn_mla_both", data_dir="d",
+                                    probe_seeds="0 x"),
+            "no data_dir": dict(mode="switch", run="tcn_mla_both", data_dir=""),
+        }
+        for why, spec in cases.items():
+            with self.subTest(why):
+                with self.assertRaises((ValueError, FileNotFoundError, KeyError)):
+                    server.build_eval_command(spec)
+
+    def test_a_run_without_the_file_the_mode_needs_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            (runs / "empty").mkdir(parents=True)
+            with mock.patch.object(server, "RUNS_DIR", runs):
+                with self.assertRaises(FileNotFoundError):
+                    server.build_eval_command({"mode": "curves", "run": "empty"})
+                with self.assertRaises(FileNotFoundError):
+                    server.build_eval_command({"mode": "switch", "run": "empty",
+                                               "data_dir": "d"})
+
+
+class FigureServingTests(unittest.TestCase):
+    """figures/ is the only tree the GUI serves, and it stays that way."""
+
+    def test_rel_path_accepts_only_paths_inside_figures(self):
+        self.assertEqual(server.figure_rel_path("figures/a/b.png"), "a/b.png")
+        self.assertEqual(
+            server.figure_rel_path(str(server.FIGURES_DIR / "a.png")), "a.png")
+        for outside in ("/etc/passwd", "runs/tcn_both/best.pt", "../figures/x.png"):
+            self.assertIsNone(server.figure_rel_path(outside))
+
+    def test_figure_path_refuses_escapes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            figs = Path(tmp) / "figures"
+            (figs / "sub").mkdir(parents=True)
+            (figs / "sub" / "ok.png").write_bytes(b"\x89PNG")
+            (Path(tmp) / "secret.txt").write_text("no")
+            with mock.patch.object(server, "FIGURES_DIR", figs):
+                self.assertEqual(server.figure_path("sub/ok.png").read_bytes(), b"\x89PNG")
+                for bad in ("", "../secret.txt", "sub/../../secret.txt", "missing.png"):
+                    with self.assertRaises((ValueError, FileNotFoundError)):
+                        server.figure_path(bad)
+
+
+class EvalJobTests(unittest.TestCase):
+    """The eval job collects the files eval.py says it wrote."""
+
+    LOG = [
+        "[Switch] Evaluating: TCN-only (tcn)",
+        "[Switch] Figure saved: figures/gui_eval_1/switch_response.png",
+        "[Switch] Numbers saved: figures/gui_eval_1/switch_response.json",
+        "[Switch] Figure saved: figures/gui_eval_1/switch_response.png",   # same file again
+        "[Curves] Figure saved: /tmp/elsewhere/other.png",                 # outside figures/
+        "nothing saved here",
+    ]
+
+    def test_artifacts_are_collected_deduped_and_confined(self):
+        job = server.EvalJob()
+        for line in self.LOG:
+            job._scan(line)
+        self.assertEqual(job.artifacts(),
+                         ["gui_eval_1/switch_response.png",
+                          "gui_eval_1/switch_response.json"])
+        self.assertEqual(job.status(0)["artifacts"], job.artifacts())
+        self.assertEqual(job.status(0)["kind"], "eval")
+
+    def test_starting_again_clears_the_previous_run(self):
+        job = server.EvalJob()
+        job._scan("[Switch] Figure saved: figures/old.png")
+        self.assertTrue(job.artifacts())
+        job.start([sys.executable, "-c", "pass"], config_io.PROJECT_ROOT)
+        for _ in range(100):
+            if not job.running:
+                break
+            time.sleep(0.02)
+        self.assertEqual(job.artifacts(), [])
+
+    def test_training_and_evaluation_are_separate_jobs(self):
+        """One must not lock out or overwrite the other."""
+        self.assertIsNot(server.JOB, server.EVAL_JOB)
+        self.assertEqual(server.JOB.KIND, "train")
+        self.assertEqual(server.EVAL_JOB.KIND, "eval")
+        train, ev = server.TrainingJob(), server.EvalJob()
+        train._scan("[fit | Epoch 1/3]")
+        train._scan("  → val_loss   = 0.5  RRMSE_t=0.8  RRMSE_f=0.7  CC=0.7")
+        ev._scan("[Switch] Figure saved: figures/x.png")
+        self.assertEqual(len(train.metrics()), 1)
+        self.assertEqual(ev.artifacts(), ["x.png"])
+        self.assertNotIn("metrics", ev.status(0))
+        self.assertNotIn("artifacts", train.status(0))
 
 
 if __name__ == "__main__":

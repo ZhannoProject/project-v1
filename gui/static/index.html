@@ -140,6 +140,44 @@
   #params .track i { display: block; height: 100%; background: var(--accent); }
   .facts { font-size: 12px; color: var(--muted); display: grid; gap: 3px; margin-top: 10px; }
   .facts b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  /* Evaluate tab: a compact control grid, then whatever figures the run wrote. */
+  #tab-eval .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 12px; margin-bottom: 10px; }
+  #tab-eval .efield { display: grid; gap: 3px; }
+  #tab-eval .efield label { font-size: 11.5px; color: var(--muted); }
+  #tab-eval .efield .hint { font-size: 11px; color: var(--muted); }
+  #evalRuns { border: 1px solid var(--border); border-radius: 8px; max-height: 190px; overflow: auto; background: var(--panel); }
+  #evalRuns .r { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  #evalRuns .r:last-child { border-bottom: 0; }
+  #evalRuns .r.on { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  #evalRuns .r .nm { flex: 1; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #evalRuns .r .meta { font-size: 11px; color: var(--muted); }
+  #evalRuns .r input[type=text] { width: 120px; font-size: 11.5px; padding: 2px 6px; }
+  #evalFigs { display: grid; gap: 10px; margin-bottom: 10px; }
+  #evalFigs figure { margin: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
+  #evalFigs img { display: block; width: 100%; height: auto; background: #fff; }
+  #evalFigs figcaption { font-size: 11.5px; color: var(--muted); padding: 5px 8px; display: flex; gap: 8px; align-items: center; }
+  #evalFigs figcaption .grow { flex: 1; }
+  /* Run picker: the Runs tab's own table, in a dialog, with the rows as the control. */
+  #runPicker { width: min(1100px, 94vw); max-width: none; border: 1px solid var(--border); border-radius: 12px; padding: 0; background: var(--panel); color: var(--text); }
+  #runPicker::backdrop { background: rgba(0,0,0,.45); }
+  #runPicker .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 14px 8px; border-bottom: 1px solid var(--border); }
+  #runPicker .head h3 { margin: 0; font-size: 14px; }
+  #runPicker .head .grow { flex: 1; }
+  #runPicker .body { max-height: min(62vh, 620px); overflow: auto; padding: 0 14px; }
+  #runPicker .foot { padding: 8px 14px 12px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+  #runPicker .foot .grow { flex: 1; }
+  #pickNote { font-size: 11.5px; color: var(--muted); padding: 6px 14px 0; }
+  tr.pickable { cursor: pointer; }
+  tr.pickable:hover td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  tr.pickable.current td { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+  /* The Evaluate tab's run field: a button that reads like the select it replaced. */
+  #evalRunBtn { width: 100%; text-align: left; display: flex; align-items: center; gap: 8px; }
+  /* The run name is the thing you are reading, so it keeps its width and the
+     variant/artifact note beside it gives way first when the column is narrow. */
+  #evalRunBtn .grow { flex: 1 1 auto; min-width: 5em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #evalRunBtn .none { color: var(--muted); }
+  #evalRunBtn .meta { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted); }
+  #evalRunBtn .caret { flex: 0 0 auto; color: var(--muted); }
   #chart { overflow: hidden; }
   #chart svg { display: block; width: 100%; height: auto; max-height: 260px; }
   footer { padding: 6px 16px 16px; color: var(--muted); font-size: 12px; text-align: center; }
@@ -174,6 +212,7 @@
     <div class="tabs">
       <button data-tab="yaml" class="active">YAML</button>
       <button data-tab="train">Train</button>
+      <button data-tab="eval" title="Run eval.py on a finished run: per-SNR metrics, curves, waveforms, attention heatmaps, and the artifact-switch probe">Evaluate</button>
       <button data-tab="params" title="Parameter count of the model the form describes, broken down by stage">Params</button>
       <button data-tab="runs">Runs</button>
     </div>
@@ -207,6 +246,100 @@
       <div class="muted" style="margin-top:6px" id="logNote"></div>
     </div>
 
+    <div class="tab" id="tab-eval">
+      <div class="row">
+        <button id="btnEval" class="primary">▶ Evaluate</button>
+        <button id="btnEvalStop" class="danger" disabled>■ Stop</button>
+        <span class="grow"></span>
+        <span class="muted" id="evalModeNote"></span>
+      </div>
+
+      <div class="grid">
+        <div class="efield">
+          <label for="evalMode">mode</label>
+          <select id="evalMode"></select>
+        </div>
+        <div class="efield" id="evalRunWrap">
+          <label for="evalRunBtn">run</label>
+          <button id="evalRunBtn" type="button" title="Pick from the Runs table"></button>
+        </div>
+        <div class="efield" id="evalArtifactWrap">
+          <label for="evalArtifact">artifact</label>
+          <select id="evalArtifact"></select>
+          <span class="hint">the test set to score on, not what the run was trained with</span>
+        </div>
+        <div class="efield" id="evalSeedWrap">
+          <label for="evalSeed">master_seed</label>
+          <input type="number" id="evalSeed" step="1" min="0">
+          <span class="hint">the split seed — must match the run's</span>
+        </div>
+        <div class="efield" id="evalDataWrap">
+          <label for="evalData">data_dir</label>
+          <input type="text" id="evalData">
+        </div>
+      </div>
+
+      <div class="grid" id="evalSwitchOpts">
+        <div class="efield">
+          <label for="evalProbeSeeds">probe_seeds</label>
+          <input type="text" id="evalProbeSeeds" placeholder="0 1 2 3 4">
+          <span class="hint">redrawn switch points per seed — the error bar</span>
+        </div>
+        <div class="efield">
+          <label for="evalRamp">switch_ramp</label>
+          <input type="number" id="evalRamp" step="1" min="0" value="0">
+          <span class="hint">0 = hard switch; &gt;0 softens it</span>
+        </div>
+        <div class="efield">
+          <label for="evalSwitchSnr">switch_snr</label>
+          <input type="number" id="evalSwitchSnr" step="0.5" placeholder="sampled">
+          <span class="hint">blank = sample the two SNRs independently</span>
+        </div>
+        <div class="efield">
+          <label for="evalSwitchEpochs">switch_epochs</label>
+          <input type="number" id="evalSwitchEpochs" step="1" min="1" placeholder="whole split">
+        </div>
+        <div class="efield">
+          <label for="evalControl">control</label>
+          <select id="evalControl">
+            <option value="1">same-type splice (recommended)</option>
+            <option value="0">none — floor-referenced numbers</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid" id="evalVisOpts">
+        <div class="efield">
+          <label for="evalVisSnr">vis_snr</label>
+          <input type="number" id="evalVisSnr" step="0.5" value="-3">
+        </div>
+        <div class="efield">
+          <label for="evalNSamples">n_samples</label>
+          <input type="number" id="evalNSamples" step="1" min="1" value="4">
+        </div>
+        <div class="efield">
+          <label for="evalAttnSample">attn_sample</label>
+          <input type="number" id="evalAttnSample" step="1" min="0" value="0">
+        </div>
+      </div>
+
+      <div id="evalRunsWrap" style="margin-bottom:10px">
+        <div class="row" style="margin-bottom:4px">
+          <span class="muted">runs to compare — tick two or more; the label is what the legend shows</span>
+        </div>
+        <div id="evalRuns"></div>
+      </div>
+
+      <div class="row">
+        <input type="text" id="evalExtra" class="grow" placeholder="extra CLI flags, e.g. --switch_range 0.4 0.6">
+      </div>
+      <div class="cmd" id="evalCmd"></div>
+
+      <div id="evalFigs"></div>
+      <pre id="evalLog"></pre>
+      <div class="muted" style="margin-top:6px" id="evalLogNote"></div>
+    </div>
+
     <div class="tab" id="tab-params">
       <div class="row">
         <span class="muted" id="paramTitle">…</span>
@@ -237,6 +370,27 @@
 </main>
 <footer id="envNote"></footer>
 
+<dialog id="runPicker">
+  <div class="head">
+    <h3>Choose a run to evaluate</h3>
+    <span class="seg" id="pickView">
+      <button data-view="kind" class="active">Complete by kind</button>
+      <button data-view="loss">Complete by loss</button>
+      <button data-view="optim">Complete by optimizer</button>
+      <button data-view="time">By time</button>
+      <button data-view="all">All runs</button>
+    </span>
+    <span class="grow"></span>
+    <button id="pickCancel">Cancel</button>
+  </div>
+  <div id="pickNote"></div>
+  <div class="body"><table id="pickRuns"></table></div>
+  <div class="foot">
+    <span class="muted" id="pickHint">Click a row to use that run. The same table as the Runs tab — unfinished and stale runs included, so you can see what you are picking.</span>
+    <span class="grow"></span>
+  </div>
+</dialog>
+
 <dialog id="dlg">
   <form method="dialog" id="dlgForm">
     <h3 id="dlgTitle"></h3>
@@ -253,8 +407,8 @@
 <script>
 (() => {
   const $ = (s, r = document) => r.querySelector(s);
-  const state = { meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {}, job: { running: false, next: 0, metrics: [], maxEpochs: null }, runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0, params: { a: null, b: null, error: null }, paramCmp: "" };
-  let previewTimer = null, pollTimer = null, paramTimer = null, paramSeq = 0;
+  const state = { meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {}, job: { running: false, next: 0, metrics: [], maxEpochs: null }, runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0, params: { a: null, b: null, error: null }, paramCmp: "", evalRows: [], evalRun: null, pickView: null, evalJob: { running: false, next: 0, artifacts: [] } };
+  let previewTimer = null, pollTimer = null, paramTimer = null, paramSeq = 0, evalTimer = null;
 
   // ---------- helpers ----------
   const api = async (path, body) => {
@@ -572,11 +726,264 @@
     else { j.className = "pill err"; j.lastElementChild.textContent = `exit ${s.returncode}`; }
   }
 
+  // ---------- evaluation ----------
+  // The tab is a thin front end for eval.py: it assembles a spec, asks the
+  // server what command that is (so the preview cannot drift from what runs),
+  // and tails the job.  Which controls are relevant depends entirely on the
+  // mode, so the server's mode table drives what is shown.
+  const evalModeSpec = () => (state.meta.eval_modes || []).find(m => m.mode === $("#evalMode").value);
+
+  const evalRunRows = () => state.meta.runs || [];
+
+  // Called once: the parts that carry the user's choices, so a run finishing
+  // in the background never resets the form under them.
+  function initEvalControls() {
+    const modes = state.meta.eval_modes || [];
+    const sel = $("#evalMode"); sel.innerHTML = "";
+    for (const m of modes) sel.appendChild(new Option(m.label, m.mode));
+    try { const v = localStorage.getItem("trainGui.evalMode"); if (v && modes.some(m => m.mode === v)) sel.value = v; } catch (e) {}
+
+    const art = $("#evalArtifact"); art.innerHTML = "";
+    for (const a of state.meta.choices.artifacts) art.appendChild(new Option(a, a));
+
+    try {
+      const last = localStorage.getItem("trainGui.evalRun");
+      if (last && (state.meta.runs || []).some(r => r.name === last)) state.evalRun = last;
+    } catch (e) {}
+
+    const d = state.meta.eval_defaults || {};
+    $("#evalData").value = d.data_dir || "";
+    $("#evalProbeSeeds").value = d.probe_seeds || "";
+    $("#evalSeed").value = 42;
+
+    const box = $("#evalRuns");
+    box.addEventListener("change", e => {
+      const hit = (state.evalRows || []).find(x => x.cb === e.target);
+      if (hit) hit.row.classList.toggle("on", hit.cb.checked);
+      updateEvalCmd();
+    });
+    box.addEventListener("input", updateEvalCmd);
+    fillEvalRuns();
+    syncEvalMode();
+  }
+
+  // ---------- run picker ----------
+  // Rather than a dropdown of bare directory names, the run is chosen from the
+  // Runs tab's own table: the same groupings, metrics, seeds and badges, so the
+  // choice is made with the numbers in front of you.  Nothing is selected by
+  // default on purpose — the old dropdown defaulted to whatever sorted first,
+  // which was a non-causal control run, and it was easy to evaluate that by
+  // accident without ever noticing.
+  function renderEvalRunButton() {
+    const btn = $("#evalRunBtn"), name = state.evalRun;
+    const r = (state.meta.runs || []).find(x => x.name === name);
+    btn.innerHTML = "";
+    const main = document.createElement("span"); main.className = "grow";
+    if (!name) {
+      main.classList.add("none");
+      main.textContent = "Choose a run…";
+    } else {
+      main.textContent = name;
+    }
+    btn.appendChild(main);
+    if (r) {
+      const meta = document.createElement("span"); meta.className = "meta";
+      meta.textContent = [r.variant, r.artifact].filter(Boolean).join(" · ");
+      btn.appendChild(meta);
+    }
+    const caret = document.createElement("span"); caret.className = "caret"; caret.textContent = "⌄";
+    btn.appendChild(caret);
+    btn.title = name
+      ? `${name}${r ? ` — ${[r.variant, r.artifact].filter(Boolean).join(" · ")}` : ""}`
+        + "\nClick to choose another from the Runs table"
+      : "Pick a run from the Runs table";
+  }
+
+  function setEvalRun(name) {
+    state.evalRun = name || null;
+    try { if (name) localStorage.setItem("trainGui.evalRun", name); } catch (e) {}
+    renderEvalRunButton();
+    updateEvalCmd();
+  }
+
+  function renderRunPicker() {
+    const { html, note } = runsMarkup(state.pickView, "pick");
+    const t = $("#pickRuns");
+    t.innerHTML = html;
+    setNote($("#pickNote"), note);
+    t.querySelectorAll("tr[data-pick-row]").forEach(tr => {
+      if (tr.dataset.pickRow === state.evalRun) tr.classList.add("current");
+      tr.addEventListener("click", () => {
+        setEvalRun(tr.dataset.pickRow);
+        $("#runPicker").close();
+      });
+    });
+  }
+
+  function openRunPicker() {
+    state.pickView = state.pickView || state.runsView;
+    $("#pickView").querySelectorAll("button")
+      .forEach(b => b.classList.toggle("active", b.dataset.view === state.pickView));
+    renderRunPicker();
+    $("#runPicker").showModal();
+    const current = $("#pickRuns").querySelector("tr.current");
+    if (current) current.scrollIntoView({ block: "center" });
+  }
+
+  // Called again whenever runs/ is re-read, keeping the current picks.
+  function fillEvalRuns() {
+    const rows = evalRunRows();
+    // A run can disappear if the directory was removed between refreshes.
+    if (state.evalRun && !rows.some(r => r.name === state.evalRun)) state.evalRun = null;
+    renderEvalRunButton();
+
+    const picked = new Map((state.evalRows || []).map(x => [x.name, { on: x.cb.checked, label: x.label.value }]));
+
+    // Built with DOM calls rather than innerHTML: a run name is a directory
+    // name off the disk, and it goes into both an attribute and a value here.
+    const box = $("#evalRuns"); box.innerHTML = "";
+    state.evalRows = [];
+    for (const r of rows) {
+      const prev = picked.get(r.name);
+      const row = document.createElement("div");
+      row.className = "r" + (prev && prev.on ? " on" : "");
+      const cb = document.createElement("input"); cb.type = "checkbox";
+      cb.checked = !!(prev && prev.on);
+      const nm = document.createElement("span"); nm.className = "nm"; nm.textContent = r.name;
+      const meta = document.createElement("span"); meta.className = "meta";
+      meta.textContent = [r.variant, r.artifact].filter(Boolean).join(" · ");
+      const label = document.createElement("input");
+      label.type = "text"; label.title = "legend label";
+      label.value = prev ? prev.label : r.name;
+      row.append(cb, nm, meta, label);
+      box.appendChild(row);
+      state.evalRows.push({ name: r.name, cb, label, row });
+    }
+  }
+
+  function syncEvalMode() {
+    const spec = evalModeSpec();
+    if (!spec) return;
+    const single = !spec.multi;
+    $("#evalRunWrap").style.display = single ? "" : "none";
+    $("#evalRunsWrap").style.display = spec.multi ? "" : "none";
+    for (const id of ["#evalArtifactWrap", "#evalSeedWrap", "#evalDataWrap"]) $(id).style.display = spec.data ? "" : "none";
+    const isSwitch = ["switch", "compare_switch", "all"].includes(spec.mode);
+    $("#evalSwitchOpts").style.display = isSwitch ? "" : "none";
+    $("#evalVisOpts").style.display = ["waveform", "attention", "all"].includes(spec.mode) ? "" : "none";
+    // The run list already says which runs are non-causal; a switch probe on
+    // one is meaningful (it measures the look-ahead), so this is a note, not
+    // a restriction.
+    $("#evalModeNote").textContent = spec.data ? "" : "no dataset needed — reads history.json";
+    updateEvalCmd();
+  }
+
+  function evalSpec() {
+    const spec = evalModeSpec() || {};
+    const num = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
+    const out = {
+      mode: spec.mode,
+      data_dir: $("#evalData").value.trim(),
+      artifact: $("#evalArtifact").value,
+      master_seed: num("#evalSeed"),
+      probe_seeds: $("#evalProbeSeeds").value.trim(),
+      switch_ramp: num("#evalRamp"),
+      switch_snr: num("#evalSwitchSnr"),
+      switch_epochs: num("#evalSwitchEpochs"),
+      switch_control: $("#evalControl").value === "1",
+      vis_snr: num("#evalVisSnr"),
+      n_samples: num("#evalNSamples"),
+      attn_sample: num("#evalAttnSample"),
+      extra_args: $("#evalExtra").value,
+    };
+    if (spec.multi) {
+      out.runs = (state.evalRows || []).filter(x => x.cb.checked)
+        .map(x => ({ name: x.name, label: x.label.value.trim() }));
+    } else {
+      out.run = state.evalRun || "";
+    }
+    return out;
+  }
+
+  let evalPreviewSeq = 0;
+  async function updateEvalCmd() {
+    const seq = ++evalPreviewSeq;
+    try {
+      const r = await api("/api/eval/preview", evalSpec());
+      if (seq === evalPreviewSeq) $("#evalCmd").textContent = r.command;
+    } catch (e) {
+      if (seq === evalPreviewSeq) $("#evalCmd").textContent = "— " + e.message;
+    }
+  }
+
+  async function runEval() {
+    try {
+      const s = await api("/api/eval", evalSpec());
+      $("#evalLog").textContent = ""; $("#evalFigs").innerHTML = "";
+      state.evalJob = { running: true, next: 0, artifacts: [] };
+      applyEvalStatus(s); startEvalPolling();
+    } catch (e) { banner(e.message); }
+  }
+
+  async function stopEval() {
+    try { applyEvalStatus(await api("/api/eval/stop", {})); } catch (e) { banner(e.message); }
+  }
+
+  function startEvalPolling() { clearInterval(evalTimer); evalTimer = setInterval(pollEval, 1000); pollEval(); }
+
+  async function pollEval() {
+    try {
+      const s = await api(`/api/eval/status?since=${state.evalJob.next}`);
+      applyEvalStatus(s);
+      if (!s.running) { clearInterval(evalTimer); evalTimer = null; }
+    } catch (e) { clearInterval(evalTimer); }
+  }
+
+  function applyEvalStatus(s) {
+    const log = $("#evalLog");
+    if (s.lines && s.lines.length) {
+      const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+      log.textContent += (log.textContent ? "\n" : "") + s.lines.join("\n");
+      if (atBottom) log.scrollTop = log.scrollHeight;
+    }
+    state.evalJob.next = s.next ?? state.evalJob.next;
+    state.evalJob.running = s.running;
+    if (s.command) $("#evalCmd").textContent = s.command;
+    $("#evalLogNote").textContent = s.log_path ? `Mirrored to ${s.log_path}` : "";
+    $("#btnEval").disabled = s.running; $("#btnEvalStop").disabled = !s.running;
+    if (s.artifacts) renderEvalFigures(s.artifacts, s.running);
+  }
+
+  function renderEvalFigures(paths, running) {
+    if (JSON.stringify(paths) === JSON.stringify(state.evalJob.artifacts)) return;
+    state.evalJob.artifacts = paths;
+    const box = $("#evalFigs"); box.innerHTML = "";
+    // A cache-buster: re-running into the same folder rewrites the same path,
+    // and without it the browser would show the previous run's picture.
+    const stamp = Date.now();
+    for (const p of paths) {
+      const url = `/api/eval/figure?path=${encodeURIComponent(p)}`;
+      const fig = document.createElement("figure");
+      if (/\.(png|svg)$/i.test(p)) {
+        const img = document.createElement("img");
+        img.src = `${url}&t=${stamp}`; img.alt = p;
+        fig.appendChild(img);
+      }
+      const cap = document.createElement("figcaption");
+      const name = document.createElement("span"); name.className = "grow"; name.textContent = p;
+      const open = document.createElement("a");
+      open.href = url; open.target = "_blank"; open.rel = "noopener"; open.textContent = "open";
+      cap.append(name, open);
+      fig.appendChild(cap);
+      box.appendChild(fig);
+    }
+  }
+
   // ---------- live metric chart ----------
   const SERIES = [
     { k: "rrmse_t", label: "RRMSE_t", css: "var(--accent)" },
-    { k: "rrmse_s", label: "RRMSE_s", css: "var(--warn)" },
-    { k: "acc", label: "ACC", css: "var(--ok)" },
+    { k: "rrmse_s", label: "RRMSE_f", css: "var(--warn)" },
+    { k: "acc", label: "CC", css: "var(--ok)" },
   ];
 
   function niceTicks(lo, hi, n = 4) {
@@ -671,10 +1078,11 @@
       state.meta.datalists.checkpoints = runs.map(r => r.checkpoint);
       const dl = $("#dl_teacher_ckpt"); if (dl) { dl.innerHTML = ""; for (const r of runs) dl.appendChild(new Option(r.checkpoint)); }
       fillParamCmp();
+      fillEvalRuns();
       renderRuns();
     } catch (e) { banner(e.message); }
   }
-  const HEAD = `<tr><th>run</th><th class="num">params</th><th class="num" title="master_seed: the one seed this project has. It drives the data splits, the SNR pairing, weight init, dropout and batch order together, so runs that differ only in it are independent repeats of the same experiment.">seed</th><th class="num">epochs</th><th class="num">best</th><th class="num">val loss</th><th class="num">RRMSE_t</th><th class="num">RRMSE_s</th><th class="num">ACC</th><th></th></tr>`;
+  const HEAD = `<tr><th>run</th><th class="num">params</th><th class="num" title="master_seed: the one seed this project has. It drives the data splits, the SNR pairing, weight init, dropout and batch order together, so runs that differ only in it are independent repeats of the same experiment.">seed</th><th class="num">epochs</th><th class="num">best</th><th class="num">val loss</th><th class="num">RRMSE_t</th><th class="num">RRMSE_f</th><th class="num">CC</th><th></th></tr>`;
 
   // The same figure the Params tab calls the checkpoint count: every tensor in
   // model_state except the causal masks.  Rounded here because the column is
@@ -717,7 +1125,7 @@
       : "recorded by the run itself"}">${guessed ? "~" : ""}${t}</span>`;
   }
 
-  function runRow(r, when = "") {
+  function runRow(r, when = "", mode = "tab") {
     const badges = (r.bidirectional ? '<span class="badge bi">bi</span>' : "")
       + (r.kd ? '<span class="badge kd">kd</span>' : "")
       + (r.status === "stale" ? '<span class="badge stale" title="history.json and the weights beside it come from different runs — this directory was re-used">stale</span>' : "")
@@ -730,24 +1138,35 @@
               ? "loss_fn recorded by the run itself"
               : "loss_fn recovered from the weights by trainer.identify_loss"}">${r.loss_fn}</span>`
           : '<span class="badge loss" title="this run recorded no loss_fn and it could not be recovered — its val loss is not comparable with anything">loss ?</span>');
-    const plot = r.status === "interrupted" ? "" : ` <button class="link" data-hist="${r.name}" title="Plot this run's curve in the Train tab">curve</button>`;
-    return `<tr>
+    // "tab": the Runs tab's own actions.  "pick": the run picker, where those
+    // would navigate away mid-choice, so the row itself is the control.
+    const plot = (mode === "tab" && r.status !== "interrupted")
+      ? ` <button class="link" data-hist="${r.name}" title="Plot this run's curve in the Train tab">curve</button>` : "";
+    const action = mode === "pick"
+      ? `<td><button class="primary" data-pick="${r.name}">Select</button></td>`
+      : `<td><button data-ckpt="${r.checkpoint}">Use as teacher</button></td>`;
+    const rowAttrs = mode === "pick" ? ` class="pickable" data-pick-row="${r.name}"` : "";
+    return `<tr${rowAttrs}>
       <td>${when}${r.name}${badges}${plot}</td>
       ${paramCell(r.params)}
       ${seedCell(r.master_seed)}
       <td class="num">${r.epochs ?? "—"}</td><td class="num">${r.best_epoch ?? "—"}</td>
       <td class="num">${fmt(r.val_loss, 4)}</td><td class="num">${fmt(r.rrmse_t)}</td><td class="num">${fmt(r.rrmse_s)}</td><td class="num">${fmt(r.acc)}</td>
-      <td><button data-ckpt="${r.checkpoint}">Use as teacher</button></td></tr>`;
+      ${action}</tr>`;
   }
 
-  function renderRuns() {
-    const t = $("#runs"), all = state.meta.runs || [], kinds = state.meta.kinds || [],
+  // The table for one view, as markup plus the caption that goes above it.
+  // Shared by the Runs tab and the run picker so the two can never disagree
+  // about what a run is or how it is grouped.
+  function runsMarkup(view, mode = "tab") {
+    const all = state.meta.runs || [], kinds = state.meta.kinds || [],
           losses = state.meta.losses || [], optims = state.meta.optimizers || [];
-    if (state.runsView === "optim") {
+    let html = "", note = { text: "" };
+    if (view === "optim") {
       const shown = optims.reduce((n, g) => n + g.n, 0);
-      $("#runsNote").innerHTML = `${shown} complete run${shown === 1 ? "" : "s"} in ${optims.length} optimizer recipe${optims.length === 1 ? "" : "s"}`
+      note = { html: `${shown} complete run${shown === 1 ? "" : "s"} in ${optims.length} optimizer recipe${optims.length === 1 ? "" : "s"}`
         + (all.length - shown ? ` · ${all.length - shown} hidden (unfinished, or history and weights out of step)` : "")
-        + ` · read from each checkpoint's optimizer state · <b>runs in different groups were optimised differently</b>`;
+        + ` · read from each checkpoint's optimizer state · <b>runs in different groups were optimised differently</b>` };
       const body = optims.map(g => {
         const d = g.detail || {};
         const bits = [d.weight_decay != null ? `wd ${d.weight_decay}` : null,
@@ -756,15 +1175,15 @@
                      .filter(Boolean).join(" · ");
         return `<tr class="group${d.lr_exact === false ? " warn" : ""}"><td colspan="10">${g.label}`
           + `<span class="sub">${g.n} run${g.n === 1 ? "" : "s"}${bits ? " · " + bits : ""}</span></td></tr>`
-          + g.runs.map(r => runRow(r)).join("");
+          + g.runs.map(r => runRow(r, "", mode)).join("");
       }).join("");
-      t.innerHTML = HEAD + (body || '<tr><td colspan="10" class="muted">no complete runs yet</td></tr>');
-    } else if (state.runsView === "loss") {
+      html = HEAD + (body || '<tr><td colspan="10" class="muted">no complete runs yet</td></tr>');
+    } else if (view === "loss") {
       const shown = losses.reduce((n, g) => n + g.n, 0);
       const known = losses.filter(g => g.comparable).length;
-      $("#runsNote").innerHTML = `${shown} complete run${shown === 1 ? "" : "s"} in ${known} comparable group${known === 1 ? "" : "s"}`
+      note = { html: `${shown} complete run${shown === 1 ? "" : "s"} in ${known} comparable group${known === 1 ? "" : "s"}`
         + (all.length - shown ? ` · ${all.length - shown} hidden (unfinished, or history and weights out of step)` : "")
-        + ` · <b>val loss is only comparable inside one group</b> — ranked by it here`;
+        + ` · <b>val loss is only comparable inside one group</b> — ranked by it here` };
       const body = losses.map(g => {
         const label = g.comparable
           ? `${g.loss_fn} · ${g.artifact || "?"}`
@@ -776,28 +1195,28 @@
           : "run python -m trainer.identify_loss to recover it";
         return `<tr class="group${g.comparable ? "" : " warn"}"><td colspan="10">${label}`
           + `<span class="sub">${g.n} run${g.n === 1 ? "" : "s"} · ${note}</span></td></tr>`
-          + g.runs.map(r => runRow(r)).join("");
+          + g.runs.map(r => runRow(r, "", mode)).join("");
       }).join("");
-      t.innerHTML = HEAD + (body || '<tr><td colspan="10" class="muted">no complete runs yet</td></tr>');
-    } else if (state.runsView === "time") {
+      html = HEAD + (body || '<tr><td colspan="10" class="muted">no complete runs yet</td></tr>');
+    } else if (view === "time") {
       const times = state.meta.times || [];
       const guessed = times.some(g => g.sources.some(x => x !== "recorded"));
-      $("#runsNote").innerHTML = `${all.length} run${all.length === 1 ? "" : "s"} over `
+      note = { html: `${all.length} run${all.length === 1 ? "" : "s"} over `
         + `${times.length} day${times.length === 1 ? "" : "s"}, newest first`
         + ` · unfinished and stale runs are kept here — this is the log, not the results`
-        + (guessed ? ` · <b>times marked ~ are file timestamps</b>, not recorded by the run` : "");
+        + (guessed ? ` · <b>times marked ~ are file timestamps</b>, not recorded by the run` : "") };
       const body = times.map(g => {
         const stale = g.sources.some(x => x !== "recorded");
         return `<tr class="group"><td colspan="10">${dayLabel(g.date)}`
           + `<span class="sub">${g.n} run${g.n === 1 ? "" : "s"}`
           + `${stale ? " · times read off the files" : ""}</span></td></tr>`
-          + g.runs.map(r => runRow(r, clock(r))).join("");
+          + g.runs.map(r => runRow(r, clock(r), mode)).join("");
       }).join("");
-      t.innerHTML = HEAD + (body || '<tr><td colspan="10" class="muted">no runs yet</td></tr>');
-    } else if (state.runsView === "kind") {
+      html = HEAD + (body || '<tr><td colspan="10" class="muted">no runs yet</td></tr>');
+    } else if (view === "kind") {
       const shown = kinds.reduce((n, g) => n + g.n, 0);
-      $("#runsNote").textContent = `${shown} complete run${shown === 1 ? "" : "s"} in ${kinds.length} kind${kinds.length === 1 ? "" : "s"}`
-        + (all.length - shown ? ` · ${all.length - shown} hidden (unfinished, or history and weights out of step)` : "");
+      note = { text: `${shown} complete run${shown === 1 ? "" : "s"} in ${kinds.length} kind${kinds.length === 1 ? "" : "s"}`
+        + (all.length - shown ? ` · ${all.length - shown} hidden (unfinished, or history and weights out of step)` : "") };
       const body = kinds.map(g => {
         const same = key => new Set(g.runs.map(r => r[key])).size === 1 ? g.runs[0][key] : null;
         const params = same("params");
@@ -806,13 +1225,25 @@
                       params != null ? (params / 1000).toFixed(0) + "k params" : null]
                      .filter(Boolean).join(" · ");
         return `<tr class="group"><td colspan="10">${g.kind}<span class="sub">${g.n} run${g.n === 1 ? "" : "s"}${spec ? " · " + spec : ""}</span></td></tr>`
-          + g.runs.map(r => runRow(r)).join("");
+          + g.runs.map(r => runRow(r, "", mode)).join("");
       }).join("");
-      t.innerHTML = HEAD + (body || '<tr><td colspan="10" class="muted">no complete runs yet</td></tr>');
+      html = HEAD + (body || '<tr><td colspan="10" class="muted">no complete runs yet</td></tr>');
     } else {
-      $("#runsNote").textContent = `${all.length} checkpoint director${all.length === 1 ? "y" : "ies"} in runs/ · best epoch by val loss · “Use as teacher” fills teacher_ckpt`;
-      t.innerHTML = HEAD + (all.map(r => runRow(r)).join("") || '<tr><td colspan="10" class="muted">no runs/*/best.pt yet</td></tr>');
+      note = { text: `${all.length} checkpoint director${all.length === 1 ? "y" : "ies"} in runs/ · best epoch by val loss · “Use as teacher” fills teacher_ckpt` };
+      html = HEAD + (all.map(r => runRow(r, "", mode)).join("") || '<tr><td colspan="10" class="muted">no runs/*/best.pt yet</td></tr>');
     }
+    return { html, note };
+  }
+
+  function setNote(el, note) {
+    if (note.html !== undefined) el.innerHTML = note.html; else el.textContent = note.text;
+  }
+
+  function renderRuns() {
+    const { html, note } = runsMarkup(state.runsView, "tab");
+    const t = $("#runs");
+    t.innerHTML = html;
+    setNote($("#runsNote"), note);
     t.querySelectorAll("button[data-ckpt]").forEach(b => b.addEventListener("click", () => {
       setField(fieldByKey("teacher_ckpt"), b.dataset.ckpt); onChange(); showTab("yaml");
       $("#f_teacher_ckpt").scrollIntoView({ block: "center" });
@@ -1028,6 +1459,25 @@
     renderRuns();
   }));
   $("#extraArgs").addEventListener("input", updateCmd);
+  $("#btnEval").addEventListener("click", runEval);
+  $("#btnEvalStop").addEventListener("click", stopEval);
+  $("#evalMode").addEventListener("change", () => {
+    try { localStorage.setItem("trainGui.evalMode", $("#evalMode").value); } catch (e) {}
+    syncEvalMode();
+  });
+  $("#evalRunBtn").addEventListener("click", openRunPicker);
+  $("#pickCancel").addEventListener("click", () => $("#runPicker").close());
+  $("#pickView").querySelectorAll("button").forEach(b => b.addEventListener("click", () => {
+    state.pickView = b.dataset.view;
+    $("#pickView").querySelectorAll("button").forEach(x => x.classList.toggle("active", x === b));
+    renderRunPicker();
+  }));
+  for (const id of ["#evalArtifact", "#evalSeed", "#evalData", "#evalProbeSeeds",
+                    "#evalRamp", "#evalSwitchSnr", "#evalSwitchEpochs", "#evalControl",
+                    "#evalVisSnr", "#evalNSamples", "#evalAttnSample", "#evalExtra"]) {
+    $(id).addEventListener("input", updateEvalCmd);
+    $(id).addEventListener("change", updateEvalCmd);
+  }
   document.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); save(); } });
   window.addEventListener("beforeunload", e => { if (state.dirty) { e.preventDefault(); e.returnValue = ""; } });
 
@@ -1040,6 +1490,7 @@
       $("#runsView").querySelectorAll("button").forEach(x => x.classList.toggle("active", x.dataset.view === state.runsView));
       try { const c = localStorage.getItem("trainGui.paramCmp"); if (c) state.paramCmp = c; } catch (e) {}
       fillParamCmp();
+      initEvalControls();
       renderRuns();
       renderChart();
       $("#envNote").textContent = `${state.meta.env.project_root} · ${state.meta.env.python} · device ${state.meta.env.device} · ⌘S saves`;
@@ -1048,6 +1499,8 @@
       if (first) await loadConfig(first);
       const s = await api("/api/train/status?since=0");
       if (s.running || s.returncode != null) { applyStatus(s); if (s.running) startPolling(); }
+      const e = await api("/api/eval/status?since=0");
+      if (e.running || e.returncode != null) { applyEvalStatus(e); if (e.running) startEvalPolling(); }
     } catch (e) { banner("Could not load: " + e.message); }
   })();
 })();
