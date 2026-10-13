@@ -503,7 +503,7 @@ def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_s
     results = {name: metrics(y, clean) for name, y in modes.items()}
 
     print(f"[test] {Path(npz_path).name}: {n} epochs x {T} samples, SNR {snr.min():+.1f}..{snr.max():+.1f} dB")
-    print(f"       {'':<26s} {'RRMSE_t':>8s} {'RRMSE_s':>8s} {'ACC':>7s}")
+    print(f"       {'':<26s} {'RRMSE_t':>8s} {'RRMSE_f':>8s} {'CC':>7s}")
     for name, m in results.items():
         print(f"       {name:<26s} {m['rrmse_t'].mean():8.4f} {m['rrmse_s'].mean():8.4f} {m['acc'].mean():7.4f}")
     print(f"       epoch mode: {1e3 * t_epoch / n:.2f} ms/epoch (batched)   "
@@ -513,7 +513,7 @@ def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_s
 
     if per_snr:
         m = results["epoch mode"]
-        print(f"       per SNR (epoch mode):  {'SNR dB':>7s} {'n':>3s} {'RRMSE_t':>8s} {'RRMSE_s':>8s} {'ACC':>7s}")
+        print(f"       per SNR (epoch mode):  {'SNR dB':>7s} {'n':>3s} {'RRMSE_t':>8s} {'RRMSE_f':>8s} {'CC':>7s}")
         for level in np.unique(np.round(snr, 2)):
             sel = np.isclose(np.round(snr, 2), level)
             print(f"       {'':<22s} {level:+7.1f} {sel.sum():3d} {m['rrmse_t'][sel].mean():8.4f} "

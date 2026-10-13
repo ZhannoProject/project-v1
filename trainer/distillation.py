@@ -72,7 +72,7 @@ Usage
         --kd_feature_weight 0.1 --save_dir runs/tcn_mla_eog_kd
 
 The student is validated and checkpointed exactly like a normal run
-(task loss + RRMSE_t / RRMSE_s / ACC against the clean signal), so its
+(task loss + RRMSE_t / RRMSE_f / CC against the clean signal), so its
 ``best.pt`` is a drop-in for eval.py and deploy/export_onnx.py.
 ``history.json`` additionally records the per-epoch KD terms
 (``kd_task``, ``kd_output``, ``kd_feature``) and the teacher's own
@@ -573,4 +573,4 @@ class KDTrainer(Trainer):
         t = self.history.get("teacher", {})
         if t:
             print(f"Teacher reference: val_loss={t['val_loss']:.4f}  "
-                  f"RRMSE_t={t['rrmse_t']:.3f}  RRMSE_s={t['rrmse_s']:.3f}  ACC={t['acc']:.3f}")
+                  f"RRMSE_t={t['rrmse_t']:.3f}  RRMSE_f={t['rrmse_s']:.3f}  CC={t['acc']:.3f}")

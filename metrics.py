@@ -2,7 +2,7 @@
 EEGDenoiseNet standard evaluation metrics from the paper
 - RRMSE_temporal : Relative Root Mean Square Error in the time domain
 - RRMSE_spectral : Relative Root Mean Square Error in the frequency domain
-- ACC            : Average Correlation Coefficient
+- CC            : Average Correlation Coefficient
 """
 import warnings
 
@@ -30,7 +30,7 @@ def rrmse_temporal(pred: torch.Tensor, clean: torch.Tensor) -> torch.Tensor:
 
 def rrmse_spectral(pred: torch.Tensor, clean: torch.Tensor) -> torch.Tensor:
     """
-    Equation 9 in the paper: RRMSE_s = RMS(PSD(f(y)) - PSD(x)) / RMS(PSD(x))
+    Equation 9 in the paper: RRMSE_f = RMS(PSD(f(y)) - PSD(x)) / RMS(PSD(x))
 
     Using FFT amplitude spectrum instead of PSD (PSD is a normalized version of |FFT|^2,
     which is equivalent when used as a relative error for the numerator and denominator)
@@ -57,7 +57,7 @@ def rrmse_spectral(pred: torch.Tensor, clean: torch.Tensor) -> torch.Tensor:
 
 def acc(pred: torch.Tensor, clean: torch.Tensor) -> torch.Tensor:
     """
-    Equation 10 in the paper: ACC = Cov(f(y), x) / sqrt(Var(f(y)) * Var(x))
+    Equation 10 in the paper: CC = Cov(f(y), x) / sqrt(Var(f(y)) * Var(x))
     
     This is the Pearson correlation coefficient.
     """

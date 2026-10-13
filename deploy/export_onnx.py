@@ -318,7 +318,7 @@ def verify_onnx(model: torch.nn.Module, onnx_path: str | Path, seq_len: int = 51
       agreement  max |onnx - torch| on random windows (batch 1, and 3 if dynamic)
       causality  perturbing sample T/2 must not change any output before T/2
       latency    onnxruntime batch-1 wall time on THIS machine (not the Pi)
-      metrics    RRMSE_t / RRMSE_s / ACC of both backends on the real test
+      metrics    RRMSE_t / RRMSE_f / CC of both backends on the real test
                  split, when data_dir is given
 
     Raises AssertionError on a failed agreement or causality check.
@@ -461,7 +461,7 @@ def _print_report(r: dict) -> None:
           f"host latency = {r['host_latency_ms_median']} ms")
     if "test_metrics" in r:
         for name, m in r["test_metrics"].items():
-            print(f"         {name:<28s} RRMSE_t={m['rrmse_t']:.4f}  RRMSE_s={m['rrmse_s']:.4f}  ACC={m['acc']:.4f}")
+            print(f"         {name:<28s} RRMSE_t={m['rrmse_t']:.4f}  RRMSE_f={m['rrmse_s']:.4f}  CC={m['acc']:.4f}")
 
 
 def main(argv=None):
