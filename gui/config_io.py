@@ -115,7 +115,12 @@ SCHEMA: List[Section] = [
     ]),
     Section("Output", [
         Field("save_dir", "str", None, nullable=True,
-              help="Checkpoint folder; empty → runs/<variant>_<artifact>[_kd]"),
+              help="Checkpoint folder; empty → runs/<variant>_<artifact>[_kd][_s<seed>] "
+                   "— the seed suffix appears for any seed but the default 42, so two "
+                   "seeds of one model keep their own results"),
+        Field("overwrite", "bool", False,
+              help="Replace the run already in that folder. Without it, training refuses "
+                   "to start on top of a run from a different (or unrecorded) master_seed"),
         Field("tensorboard", "bool", False),
     ]),
     Section("TurboQuant", [

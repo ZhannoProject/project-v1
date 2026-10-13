@@ -29,7 +29,7 @@ from .optimizer import (
     freeze_decoder,
     unfreeze_all,
 )
-from trainer.checkpoint import save_checkpoint, save_history
+from trainer.checkpoint import ensure_writable, save_checkpoint, save_history
 from trainer.logger import create_tb_writer, log_lr, log_scalars
 from trainer.losses import build_loss
 
@@ -56,7 +56,13 @@ class Trainer:
         use_tensorboard: bool = False,
         loss_fn: str = "l1_combined",
         run_config: Optional[dict] = None,
+        overwrite: bool = False,
     ):
+        # Before anything is built or any directory is made: refusing early
+        # means a clash costs a second, not a model and an optimizer.
+        self.save_dir = Path(save_dir)
+        self._guard_save_dir((run_config or {}).get("master_seed"), overwrite)
+
         self.device = device or get_device()
         print(f"[Trainer] Device: {self.device}")
 
@@ -78,17 +84,7 @@ class Trainer:
             eta_min=eta_min,
         )
 
-        self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-
-        # Reusing a directory silently mixes two runs: the new run overwrites best.pt
-        # at its first epoch, while history.json survives from the old one unless this
-        # run finishes.  Warn loudly; history.json is now rewritten every epoch so the
-        # two files cannot drift apart even if training is interrupted.
-        existing = [f for f in ("best.pt", "last.pt", "history.json") if (self.save_dir / f).is_file()]
-        if existing:
-            print(f"[Trainer] WARNING: {self.save_dir} already contains {', '.join(existing)} "
-                  f"from an earlier run — they will be overwritten.")
 
         self.best_val_loss = float("inf")
         # ``config`` records what produced these numbers.  val_loss is only comparable
@@ -158,6 +154,10 @@ class Trainer:
         print(f"  → train_loss = {avg_loss:.4f}  ({elapsed:.1f}s)")
         return avg_loss
 
+    def _guard_save_dir(self, seed, overwrite: bool):
+        """Refuse to start on top of someone else's run — see ensure_writable."""
+        ensure_writable(self.save_dir, seed, overwrite)
+
     @torch.no_grad()  # disable gradient calculation to save memory / compute
     def _validate(self, epoch: int, model: Optional[nn.Module] = None):
         """
@@ -193,8 +193,8 @@ class Trainer:
 
         print(f"  → val_loss   = {avg_loss:.4f}  "
               f"RRMSE_t={agg_metrics['rrmse_t']:.3f}  "
-              f"RRMSE_s={agg_metrics['rrmse_s']:.3f}  "
-              f"ACC={agg_metrics['acc']:.3f}")
+              f"RRMSE_f={agg_metrics['rrmse_s']:.3f}  "
+              f"CC={agg_metrics['acc']:.3f}")
         if model is self.model:
             log_lr(self.optimizer, self.model)
         return avg_loss, agg_metrics

@@ -26,11 +26,18 @@ from data.Dataloader import build_dataloaders
 from models.variants import (build_model_from_config, VARIANT_REGISTRY, variant_is_causal,
                              pinned_kwargs)
 from configs import load_config, merge_cli_overrides
+from trainer.checkpoint import ensure_writable
 from trainer.training import Trainer
 from trainer.distillation import KDTrainer, load_teacher
 from utils.utils import seed_everything, resolve_device, DEVICE_CHOICES
 
 DEFAULT_DATA_DIR = "./data/EEGdenoisenet/data/"
+
+
+#: The seed a run uses when nothing says otherwise.  Runs at this seed keep
+#: the bare ``runs/<variant>_<artifact>`` path they have always had; any other
+#: seed gets its own ``_s<seed>`` folder so the two can coexist.
+DEFAULT_MASTER_SEED = 42
 
 
 def main():
@@ -39,10 +46,16 @@ def main():
     parser.add_argument("--config", type=str, default=None,
                         help="Path to YAML config file (e.g. configs/tcn_mha_eog.yaml)")
     parser.add_argument("--variant", default=None, choices=list(VARIANT_REGISTRY.keys()))
-    parser.add_argument("--artifact", default=None, choices=["EOG", "EMG"])
+    parser.add_argument("--artifact", default=None, choices=["EOG", "EMG", "BOTH"])
     parser.add_argument("--data_dir", default=None)
     parser.add_argument("--save_dir", default=None,
-                        help="Checkpoint directory (default: runs/<variant>_<artifact>)")
+                        help="Checkpoint directory "
+                             "(default: runs/<variant>_<artifact>[_kd][_s<seed>], "
+                             "the seed suffix appearing for any seed but the default)")
+    parser.add_argument("--overwrite", action="store_true", default=None,
+                        help="Replace the run already in save_dir. Without it, training "
+                             "refuses to start on top of a run from a different (or "
+                             "unrecorded) master_seed")
     parser.add_argument("--hidden_channels", type=int, default=None)
     parser.add_argument("--n_attn_layers", type=int, default=None,
                         help="Number of transformer layers (e.g. 2, 10, 20, 50)")
@@ -145,7 +158,8 @@ def main():
     cfg.setdefault("skip_bottleneck_ratio", None)
     cfg.setdefault("kv_lora_rank",      16)
     cfg.setdefault("snr_range_db",      [-7.0, 2.0])
-    cfg.setdefault("master_seed",       42)
+    cfg.setdefault("master_seed",       DEFAULT_MASTER_SEED)
+    cfg.setdefault("overwrite",         False)
     cfg.setdefault("device",            "auto")
     cfg.setdefault("teacher_ckpt",      None)
     cfg.setdefault("teacher_config",    None)
@@ -171,11 +185,26 @@ def main():
 
     distil = cfg["teacher_ckpt"] is not None
     if cfg.get("save_dir") is None:
-        cfg["save_dir"] = f"./runs/{cfg['variant']}_{cfg['artifact'].lower()}" \
-            + ("_kd" if distil else "")
+        # The seed is part of the identity of a run, so it has to be part of
+        # the path: without it, two seeds of the same model land in the same
+        # folder and the second overwrites the first.  The default seed keeps
+        # the bare name, so every directory already in runs/ (and every path in
+        # the README and the deploy scripts) still means what it did.
+        suffix = "" if cfg["master_seed"] == DEFAULT_MASTER_SEED else f"_s{cfg['master_seed']}"
+        cfg["save_dir"] = (f"./runs/{cfg['variant']}_{cfg['artifact'].lower()}"
+                           + ("_kd" if distil else "") + suffix)
     if distil and not variant_is_causal(cfg["variant"]):
         print(f"[Warning] Student '{cfg['variant']}' is bidirectional; distillation is meant "
               f"to teach a causal student. Continuing anyway.")
+
+    # Checked here as well as in the Trainer, so a clash costs a second rather
+    # than the time it takes to load the dataset and build the model.  It is a
+    # mistake in the command, not a crash, so it exits like one.
+    try:
+        ensure_writable(cfg["save_dir"], cfg["master_seed"], cfg.get("overwrite", False))
+    except FileExistsError as e:
+        print(f"\n[Trainer] refusing to start:\n  {e}\n", file=sys.stderr)
+        raise SystemExit(2)
 
     print(f"[Config] {cfg}")
 
@@ -216,6 +245,7 @@ def main():
         loss_fn=cfg["loss_fn"],
         device=device,
         run_config=cfg,
+        overwrite=cfg.get("overwrite", False),
     )
     if distil:
         teacher = load_teacher(cfg["teacher_ckpt"], cfg["teacher_config"])
