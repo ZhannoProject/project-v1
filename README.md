@@ -71,7 +71,8 @@ Not to be confused with `bottleneck_ratio`, which is the channel squeeze between
 │   ├── tcn_{mha,mla}_eog_kd.yaml   # causal students distilled from them (same size)
 │   └── tcn_mla_eog_kd_small.yaml   # a 32-channel student distilled from the 64-channel teacher
 ├── data/
-│   ├── Dataloader.py           # Leak-free train/val/test splits + SNR mixing (seeded)
+│   ├── Dataloader.py           # Leak-free train/val/test splits + SNR mixing (seeded),
+│   │                           #   and the non-stationary artifact-switch probe
 │   └── EEGdenoisenet/data/     # .npy files (not in repo, see Data below)
 ├── models/
 │   ├── TCN_backbone.py         # CausalConv1d → ResidualBlock → CausalTCNBackbone
@@ -89,7 +90,7 @@ Not to be confused with `bottleneck_ratio`, which is the channel squeeze between
 ├── gui/
 │   ├── __main__.py             # python -m gui → local web GUI for the YAML presets + launching runs
 │   ├── config_io.py            # field schema + comment-preserving YAML writer
-│   ├── server.py               # stdlib HTTP/JSON API, training-job runner
+│   ├── server.py               # stdlib HTTP/JSON API, training + evaluation job runners
 │   └── static/index.html       # the page
 ├── deploy/
 │   ├── export_onnx.py          # checkpoint → verified ONNX (+ sidecar JSON) for Raspberry Pi 5
@@ -99,8 +100,9 @@ Not to be confused with `bottleneck_ratio`, which is the channel squeeze between
 │   ├── testdata/EOG_test100.npz#   100 EOG test epochs, 10 per SNR level, ready for the Pi
 │   └── requirements-raspi.txt  # the only two packages the Pi needs
 ├── utils/utils.py              # get_device(), seed_everything()
-├── eval.py                     # 7-in-1 evaluation: metrics, curves, waveforms, heatmaps
-├── metrics.py                  # RRMSE_temporal, RRMSE_spectral, ACC
+├── eval.py                     # 8-in-1 evaluation: metrics, curves, waveforms,
+│                               #   heatmaps, artifact-switch response
+├── metrics.py                  # RRMSE_t, RRMSE_f, CC
 ├── reproduce.py                # Reproducibility smoke test (32 checks)
 ├── requirements.txt
 └── .github/workflows/
@@ -157,16 +159,54 @@ python -m trainer --config configs/mla_rank_sweep_eog.yaml --variant tcn_mla_r32
 
 Config priority: **CLI flag > YAML file > hardcoded defaults**.
 
-Checkpoints are saved to `runs/<variant>_<artifact>/` with `best.pt`, `last.pt`, and `history.json`.
+Checkpoints are saved to `runs/<variant>_<artifact>[_s<seed>]/` with `best.pt`, `last.pt`, and `history.json` — see [One seed, one directory](#one-seed-one-directory) for the seed suffix and the overwrite guard.
 
 ### Seeding
 
 `master_seed` (default 42, `--master_seed N` on the CLI) is the single seed for a run: the train/val/test split, artifact pairing and SNR draws (numpy), the training batch order (a dedicated `torch.Generator`, so it is identical across variants), and weight initialisation and dropout (`seed_everything` in `utils/utils.py`, which also switches cuDNN / `torch.use_deterministic_algorithms` to deterministic kernels).
 
 ```bash
-python -m trainer --config configs/tcn_mla_eog.yaml --master_seed 1 --save_dir runs/tcn_mla_eog_s1
-python -m trainer --config configs/tcn_mla_eog.yaml --device cpu     # bit-exact repeats
+python -m trainer --config configs/tcn_mla_eog.yaml --master_seed 1   # → runs/tcn_mla_eog_s1
+python -m trainer --config configs/tcn_mla_eog.yaml --device cpu      # bit-exact repeats
 ```
+
+#### One seed, one directory
+
+The seed is part of a run's identity, so it is part of its path. The default
+`save_dir` is `runs/<variant>_<artifact>[_kd][_s<seed>]`, and the `_s<seed>`
+suffix appears for every seed but the default 42 — so seed 42 keeps the bare
+name every existing directory already has, and seeds 55 and 67 of the same
+model get `runs/tcn_both_s55` and `runs/tcn_both_s67` instead of fighting over
+`runs/tcn_both`. That is what makes a set of per-seed repeats an error bar
+rather than a single surviving run.
+
+**Training refuses to start on top of another run.** A directory that already
+holds `best.pt` / `last.pt` / `history.json` is reused only when the run in it
+recorded the *same* seed — the ordinary "train it again" loop, which still just
+warns. Anything else stops before the dataset is even loaded:
+
+```
+[Trainer] refusing to start:
+  runs/tcn_both already holds a run at master_seed=55 (best.pt, last.pt, history.json), and this run uses 67.
+  Starting here would overwrite it, and the weights are not recoverable.
+```
+
+A run whose seed was never recorded (anything trained before the trainer wrote
+its config down) counts as another run too: it cannot be shown to be the same
+one, and the weights underneath it are no less real. `--overwrite` replaces
+whatever is there on purpose, and is the only way past the check:
+
+```bash
+python -m trainer --config configs/tcn_eog.yaml --master_seed 55            # its own folder
+python -m trainer --config configs/tcn_eog.yaml --save_dir runs/scratch --overwrite
+```
+
+This is not a hypothetical. The project's own `tcn_both` and `tcn_mla_both`
+directories were overwritten twice — seed 42 replaced by seed 55 in September,
+and seed 55 by seed 67 on 13 October — because the path carried no seed and
+`save_checkpoint` writes in place. The per-epoch metrics survived in
+`runs/gui_train_*.log`, which record the config and every validation line; the
+weights did not. Validation: `python -m unittest discover -s tests -p 'test_run_isolation.py'`.
 
 Two runs of the same config give bit-identical checkpoints on CPU (verified) and on CUDA with the deterministic kernels; **Apple MPS is not deterministic even when seeded** (two runs drift at the 1e-4 level within one epoch), so the trainer prints a reminder and `--device cpu` (or `device: cpu` in the YAML / GUI) is the option for exact repeats. Results across different hardware or torch versions can still differ at floating-point level. Checkpoints produced before seeding was added were not seeded, so their run-to-run variance is unknown — re-run a config with a few seeds before reading small differences as real.
 
@@ -198,6 +238,10 @@ Failures show an alert pointing at `~/Library/Logs/eeg-training-gui.log`.
 The bundle is git-ignored. Closing the window stops the server (and asks
 first if a training run is still going).
 
+The page has five tabs: **YAML** (the text a save would write), **Train**,
+**Evaluate**, **Params** and **Runs**. The Evaluate tab borrows the Runs table
+as a run picker, so those two share one renderer.
+
 - **Form ↔ YAML.** Every key of `trainer/__main__.py` is a field, grouped as in
   the preset files (Model, Data, Training, Scheduler, Staged, Loss, Output,
   TurboQuant, Knowledge distillation). Fields that do not apply to the selected
@@ -213,7 +257,7 @@ first if a training run is still going).
   interpreter and streams the log into the page (also mirrored to
   `runs/gui_train_<timestamp>.log`); **Stop** terminates it.
 - **Live metric curve.** While a run is going, the Train tab plots RRMSE_t,
-  RRMSE_s and ACC per epoch, with the current values, the best epoch so far and
+  RRMSE_f and CC per epoch, with the current values, the best epoch so far and
   the epoch counter. The numbers are parsed out of the training log as it
   streams, so nothing in the trainer changes and the curve survives a page
   reload (the server keeps them for the running job). The y-axis is fitted to
@@ -276,6 +320,49 @@ first if a training run is still going).
 
 The server binds to 127.0.0.1 only and runs one training job at a time.
 Validation: `python -m unittest discover -s tests -p 'test_gui.py'`.
+
+#### Evaluate tab
+
+The other half of the GUI: it runs `eval.py` on a finished run and shows what
+comes back. Every `--mode` the script has is offered — per-SNR metrics, training
+curves, waveforms, attention heatmaps, the artifact-switch probe, and the
+multi-model comparisons — and the mode decides which controls are shown, so the
+switch options appear for a switch run and nothing else.
+
+- **The run is picked from the Runs table, not a dropdown.** Clicking the
+  *run* field opens the Runs tab's own table in a dialog — the same groupings
+  (by kind, loss, optimizer, time, or all), the same params, seed, epochs, val
+  loss, RRMSE_t / RRMSE_f / CC and the same `bi` / `stale` / `partial` badges —
+  and clicking a row picks it. Both are rendered by one function, so the picker
+  cannot drift from the tab. The two actions that would navigate away mid-choice
+  (`curve`, "Use as teacher") are dropped in the picker.
+
+  Nothing is selected until you select it. The plain dropdown this replaced
+  defaulted to whatever sorted first alphabetically — `ctrl_mla_both_bi`, a
+  *non-causal control* — so evaluating the wrong model took one click and
+  nothing said so. The field now reads "Choose a run…" and the command preview
+  says `mode 'X' needs a run` until one is picked. The choice is remembered
+  between sessions.
+- **Two jobs, not one.** Training and evaluation are separate; starting an
+  evaluation neither blocks a running training job nor clobbers its log.
+- **The command is the preview.** The grey line under the form is not built in
+  the page — it is the exact argv the server would run, fetched on every
+  keystroke. So is every refusal: pick one run for a comparison mode, or a run
+  with no `history.json` for `curves`, and the reason appears there before
+  anything starts.
+- **Figures appear inline.** `eval.py` prints what it saves; the tab picks those
+  paths out of the log and renders them, with an `open` link for a full-size
+  view and the JSON listed beside the PNG.
+- **Output is pinned to `figures/`.** Each run writes to
+  `figures/gui_eval_<timestamp>/`, which is also the only directory the server
+  will serve a file from. The log is mirrored to `runs/gui_eval_<timestamp>.log`.
+
+**Two seeds, and the tab shows both.** `master_seed` is the run's data seed —
+it picks the split, and it has to match what the checkpoint was trained with.
+`probe_seeds` is the switch probe's own series, redrawn on top of that split.
+The Model form's `master_seed` field is the *training* one; they are the same
+number for the same run, which is why the tab asks for it separately rather
+than guessing.
 
 ### Which loss a run used
 
@@ -480,22 +567,202 @@ python eval.py --ckpt runs/tcn_mla_eog/best.pt --data_dir ./data/EEGdenoisenet/d
 
 | Mode | Description |
 |------|-------------|
-| `snr` | Per-SNR quantitative metrics (RRMSE_t, RRMSE_s, ACC) |
+| `snr` | Per-SNR quantitative metrics (RRMSE_t, RRMSE_f, CC) |
 | `curves` | Training loss and metric curves from history.json |
 | `waveform` | Time-domain + PSD comparison plots |
 | `attention` | Per-head, per-layer attention weight heatmaps |
 | `snr_plot` | Per-SNR metric line charts |
 | `compare_curves` | Overlay training curves from multiple runs |
 | `compare_snr` | Overlay per-SNR metrics from multiple models |
+| `switch` | Error vs. distance to a non-stationary artifact switch |
+| `compare_switch` | Overlay switch-response curves from multiple models |
 | `all` | Run all single-model tools (default) |
+
+### Non-stationary artifact switch
+
+Every table above scores a model on epochs whose artifact type never changes.
+A deployed online denoiser does not get that: the artifact mix shifts as the
+subject blinks, clenches, or stops doing either. The switch probe asks what a
+model does at the moment the statistics change under it.
+
+**The probe.** A clean EEG epoch gets one artifact type before a switch point
+and the other after it. Nothing about the probe is constant enough to be
+learned as a position: the switch index is drawn per sample inside
+`switch_range` (default 0.25–0.75 of the epoch, so 128 samples on each side at
+minimum), the two artifact types get independently drawn SNRs, and exactly half
+the epochs run EOG → EMG while the other half run EMG → EOG. Each artifact is
+calibrated against the clean signal of the segment it occupies, so the realised
+SNR in each half is the SNR asked for regardless of where the switch landed.
+
+It is an *evaluation* probe, not a training set — score models trained with
+`artifact: BOTH` on it. It draws from the same leak-free pools as the ordinary
+`BOTH` test split at the same `master_seed`, so a model's test split is its
+test split here too.
+
+**The series of seeds.** `master_seed` fixes which epochs exist in the split;
+`probe_seed` fixes everything drawn on top of them — switch points, SNRs,
+directions, pairings. The default series is `SWITCH_PROBE_SEEDS = (0,1,2,3,4)`,
+and the curve is measured once per seed, so a bump has to survive five
+independent draws of the switch positions to appear in the figure. Every draw
+is made in `__init__` and stored, so `__getitem__` is a pure function of the
+index: shuffling or scoring a subset cannot change what a sample contains.
+
+**The matched control.** A raw response curve is not interpretable on its own,
+because two other things happen at a switch point. The signal was *spliced* —
+cut and glued to something else — which costs error whether or not the artifact
+type changed. And a causal model has no left context at the start of an epoch,
+so its error falls through the first few hundred ms regardless; because the
+switch index varies, that within-epoch warm-up tilts the whole curve.
+
+So every run also measures a control probe in which the splice still happens,
+at the same index, but what gets spliced in is *a different epoch of the same
+artifact type* at the same SNR. Everything else is identical, down to the
+normalisation constant, which makes the two probes bit-identical before the
+switch. The reported `delta` is switch − control, paired within each probe
+seed. What it leaves is the change of artifact *statistics*, alone.
+
+**Reading the numbers.** `eval.py --mode compare_switch` prints one row per
+model and direction:
+
+| Column | Meaning |
+|--------|---------|
+| `pre`, `floor` | Settled error either side of the switch, from the raw curve |
+| `peak`, `oversh` | Raw peak and peak ÷ floor. Mostly the splice, not the type change |
+| `leak` | RMS of Δ *before* the switch. Exactly 0.000 for a causal model — the two probes are one signal there. Reads as look-ahead only under a hard switch; `--switch_ramp` reaches back before the index by design |
+| `far` | The same over the oldest half of the window. `leak > 0, far = 0` is a finite look-ahead horizon; both > 0 is look-ahead over the whole epoch |
+| `Δfloor` | The regime shift alone: how much harder the new artifact is, at matched SNR, with the splice controlled for |
+| `Tpeak`, `Trec`, `Tarea` | The transient (Δ minus Δfloor) — the re-adaptation cost. Peak, time to decay to 10 % of that peak, and area in relative error × ms |
+
+```bash
+# The figure: TCN-only vs. attention, five probe seeds, both directions
+python eval.py --mode compare_switch --data_dir data/EEGdenoisenet/data/ \
+       --compare_runs runs/tcn_both:TCN-only runs/tcn_mha_both:TCN+MHA \
+                      runs/tcn_mla_both:TCN+MLA --save_dir figures/
+
+# What future context is worth at a switch (causal vs. its non-causal twins)
+python eval.py --mode compare_switch --data_dir data/EEGdenoisenet/data/ \
+       --compare_runs runs/tcn_mla_both:MLA-causal runs/tcn_mla_bi_both:MLA-bidir \
+                      runs/tcn_bi_both:TCN-noncausal --save_dir figures/causality/
+
+# Controls: a soft switch instead of a hard one, and a single SNR
+python eval.py --mode compare_switch --data_dir data/EEGdenoisenet/data/ \
+       --compare_runs runs/tcn_both:TCN runs/tcn_mla_both:MLA \
+       --switch_ramp 32 --switch_snr -3
+```
+
+All of this is also in the GUI's **Evaluate** tab (`python -m gui`), which
+builds these commands for you and shows the figures inline.
+
+**Two seeds, and they are not the same thing.** `--master_seed` is the *run's*
+seed — it picks the train/val/test split, so it has to match the
+`--master_seed` the checkpoint was trained with or the model is scored on the
+wrong data (it defaults to 42, like the trainer). `--probe_seeds` sits on top
+of it: the split stays put and only the switch points, SNRs, directions and
+pairings are redrawn. Vary `--probe_seeds` for an error bar on the probe; set
+`--master_seed` to match your run.
+
+`--no-switch_control` drops the control probe and falls back to floor-referenced
+numbers; `--switch_window`, `--switch_range` and `--switch_epochs` are the
+other knobs. `--save_dir` writes
+`switch_response.png` and a `switch_response.json` that carries the per-seed
+curves, so a difference between two models can be tested seed by seed rather
+than eyeballed off the band.
+
+#### What it shows
+
+Measured on the three `BOTH`-trained reference runs, five probe seeds, 510 test
+epochs each:
+
+| Model | Direction | peak | oversh | leak | Δfloor | Tpeak | Tarea |
+|---|---|---|---|---|---|---|---|
+| TCN-only | EOG→EMG | 1.007 | 1.52 | 0.000 | +0.084 | 0.029 | −27.2 |
+| TCN+MHA | EOG→EMG | 0.970 | 1.44 | 0.000 | +0.065 | 0.031 | −24.7 |
+| TCN+MLA | EOG→EMG | 0.974 | 1.44 | 0.000 | +0.062 | 0.026 | −22.9 |
+| TCN-only | EMG→EOG | 0.960 | 1.71 | 0.000 | −0.084 | 0.318 | +21.5 |
+| TCN+MHA | EMG→EOG | 0.931 | 1.67 | 0.000 | −0.088 | 0.305 | +23.6 |
+| TCN+MLA | EMG→EOG | 0.944 | 1.65 | 0.000 | −0.076 | 0.306 | +22.1 |
+
+Three things, and only the first two are effects:
+
+1. **The switch costs a large error spike — but much of it is just the splice.**
+   The raw error rises to 1.4–1.7× the settled level within 12–16 ms. The
+   same-type control reproduces a good part of that. Measured as excess over
+   the new-regime floor, raw peak − floor is 0.34–0.40 in both directions,
+   while the type-change-specific transient is 0.31 (EMG→EOG) but only 0.03
+   (EOG→EMG). Reading the raw peak as an adaptation cost therefore overstates
+   it by ~1.2× arriving at EOG and by ~10–12× arriving at EMG.
+2. **The cost is strongly asymmetric.** Arriving at EOG costs ~10× more
+   transient than arriving at EMG. That fits the rest of the study: an EOG
+   onset is a structured event the model has to respond to, while EMG onset is
+   broadband and the model already handles it generically.
+3. **Attention does not recover faster.** Across five probe seeds the paired
+   difference in transient peak is +0.012 ± 0.007 (EMG→EOG, TCN-only worse on
+   5/5 seeds) and −0.009 ± 0.005 (EOG→EMG, TCN-only *better* on 5/5). Transient
+   area differs by less than its own spread in both directions. Attention does
+   give a uniformly lower error level — the raw peak and the settled floors are
+   both better — but that is the same advantage it has everywhere, not a faster
+   response to non-stationarity. **The probe does not support a routing or
+   re-adaptation account of what attention is doing here.**
+
+#### What future context is worth at a switch
+
+The same probe measures causality directly, because `leak` is exactly zero if
+and only if the model cannot see past the switch:
+
+| Model | Attention | Convolutions | leak | far | Δ first leaves zero |
+|---|---|---|---|---|---|
+| `tcn_mla_both` | causal | causal | **0.000** | **0.000** | never (at the switch) |
+| `tcn_bi_both` | — | non-causal | 0.006 | 0.000 | −242 ms |
+| `tcn_mla_bi_both` | bidirectional | causal | 0.015 | 0.015 | −477 ms (window edge) |
+
+(Pooled over both directions; the per-direction rows are in the printed table.)
+
+Three qualitatively different signatures, visible in the bottom row of the
+figure. The causal model's Δ is **identically zero** at every offset before the
+switch and jumps only at it — not approximately, exactly, which is what makes
+the control a causality test rather than an estimate. `tcn_bi` departs from
+zero 242 ms early and is exactly zero before that: its non-causal convolutions
+have a finite receptive field, and that departure point measures it. The
+bidirectional model never reaches zero anywhere in the measured window — its
+attention reaches the whole 512-sample epoch, so it has no look-ahead horizon
+to measure.
+
+That 242 ms is a check on the method, not just a result. Perturbing a single
+input sample of `tcn_bi` and asking how far back the output moves gives a
+forward receptive field of exactly 62 samples — 242 ms at 256 Hz, independent
+of width. The switch probe recovers the same number to the sample, from
+artifact statistics alone, without touching the weights. That equality is
+asserted in `tests/test_switch_probe.py`.
+
+The non-causal models also settle ~0.11 lower, which is the familiar causality
+cost, and they pay a *larger* relative overshoot (1.85–1.87 vs 1.65) — the
+extra context they rely on is exactly what a switch invalidates.
+
+Validation: `python -m unittest discover -s tests -p 'test_switch_probe.py'`
+covers the probe's reproducibility and purity, the randomised switch point and
+balanced directions, the SNR realised in each segment, the crossfade, the
+leak-free split, the matched control's before/after behaviour, and the response
+curve, its window clipping and its summary decomposition.
 
 ### Metrics
 
 Following the EEGdenoiseNet benchmark:
 
-- **RRMSE_temporal** — relative RMS error in the time domain (lower is better)
-- **RRMSE_spectral** — relative RMS error in the frequency domain (lower is better)
-- **ACC** — average Pearson correlation coefficient (higher is better)
+- **RRMSE_t** — relative RMS error in the time domain (lower is better)
+- **RRMSE_f** — relative RMS error in the frequency domain (lower is better)
+- **CC** — average Pearson correlation coefficient (higher is better)
+
+These are the names printed, plotted and used in the paper. The correlation
+coefficient is **CC**, not ACC: in a denoising table "ACC" reads as *accuracy*,
+which is not what it is. The spectral RRMSE is **RRMSE_f**, matching RRMSE_t
+rather than mixing a domain letter with a word initial.
+
+The internal dictionary keys are deliberately **not** renamed: every finished
+run's `history.json` is keyed on `rrmse_t` / `rrmse_s` / `acc`, and so are the
+checkpoints and the deploy sidecars. Renaming them would invalidate the runs
+already in `runs/` for no benefit to a reader, so the keys stay and only the
+labels move. The GUI's log parser accepts both spellings, so logs written
+before the rename still plot.
 
 ## Deployment: ONNX on Raspberry Pi 5
 
@@ -518,7 +785,7 @@ and the verification results. The export is refused unless the graph:
 
 - matches PyTorch to < 1e-4 on random windows (typically ~1e-6),
 - is **strictly causal** (a perturbation at sample 256 changes nothing before it),
-- and, when `--data_dir` is given, reproduces the test-split RRMSE_t / RRMSE_s / ACC
+- and, when `--data_dir` is given, reproduces the test-split RRMSE_t / RRMSE_f / CC
   of the PyTorch model (identical to 4 decimals for the reference checkpoint).
 
 The architecture is inferred from the weights, not from the YAML, so older
@@ -595,7 +862,7 @@ ondemand governor) for the shipped 2-layer MLA model, one 512-sample window:
 
 Two threads give the best tail latency; using all four cores contends with
 the OS and doubles the p95. The test-set metrics on the Pi are identical to
-the host (epoch mode RRMSE_t 0.4601 / RRMSE_s 0.4643 / ACC 0.8826). On an
+the host (epoch mode RRMSE_t 0.4601 / RRMSE_f 0.4643 / CC 0.8826). On an
 Apple-silicon host the same window takes ~2 ms. `--benchmark` prints the
 numbers for whatever board it runs on.
 
@@ -610,11 +877,11 @@ it on the Pi with the same command you would use on the host:
 python raspi_infer.py tcn_mla_eog.onnx --testdata EOG_test100.npz
 ```
 
-This prints RRMSE_t / RRMSE_s / ACC for epoch mode, streaming mode, and the
+This prints RRMSE_t / RRMSE_f / CC for epoch mode, streaming mode, and the
 untouched noisy input as a baseline, plus a per-SNR table and timings. The
 metrics are numpy replicas of `metrics.py` (they agree to 2e-7), so host and
 Pi numbers are directly comparable. Reference for the shipped MLA model:
-epoch mode RRMSE_t 0.460 / RRMSE_s 0.464 / ACC 0.883 versus 1.41 / 4.91 /
+epoch mode RRMSE_t 0.460 / RRMSE_f 0.464 / CC 0.883 versus 1.41 / 4.91 /
 0.595 for the raw noisy input. The streaming row is a pessimistic bound —
 the epochs are independent 2-s segments, so every window straddles two
 unrelated signals — and is not what a continuous recording would give.
@@ -727,7 +994,7 @@ one 512-sample forward faster than ~15 ms on this SoC.
   activation scales per tensor at run time, so a future sample changes the
   scale applied to past samples and the graph stops being causal
   (past_diff = 0.32 on the reference checkpoint). It was also slower for
-  these tiny matmuls and slightly less accurate (ACC 0.8754 vs 0.8772).
+  these tiny matmuls and slightly less accurate (CC 0.8754 vs 0.8772).
 - **No KV cache.** Each call recomputes attention over the whole window. With
   T = 512 and d_model = 32 this is negligible; the KV-cache size advantage of
   MLA is therefore not exercised by this deployment path.
@@ -748,7 +1015,7 @@ python reproduce.py
 python reproduce.py --quick
 ```
 
-This runs **90 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future, and that the optional BottleneckSkip stays causal), seeding (same `master_seed` → same init and batch order), losses, metrics, training, checkpointing, evaluation, and knowledge distillation. It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
+This runs **105 automated checks** covering model construction, causality (including that the `*_bi` teachers do see the future, and that the optional BottleneckSkip stays causal), seeding (same `master_seed` → same init and batch order), losses, metrics, training, checkpointing, evaluation, knowledge distillation, and the artifact-switch probe (reproducible draws, the SNR realised per segment, a control that differs only after the switch, and a response curve that reads look-ahead back out). It synthesises random data if the real dataset is not present, so it works in CI without any external downloads.
 
 The same script runs in GitHub Actions on every push — see the badge at the top.
 
@@ -766,6 +1033,7 @@ The study isolates one variable at a time while sharing everything else:
 | `tcn_bi` vs `tcn_mla_bi` | Is the gain from seeing the future, or from attending to it? | Both non-causal; only one has attention |
 | `X_bi` vs `X_full_bi` | How much is attention alone worth against the full offline ceiling? | Same weights; only the convolution padding differs |
 | Student vs distilled student (`X` vs `X` + KD) | Can a non-causal teacher close that gap? | Same model, only the training signal differs |
+| Artifact switch vs same-type splice | What does a change of artifact *statistics* cost, over and above a splice? | Same clean epochs, switch points, SNRs and normalisation; only the type changes |
 
 ## License
 
