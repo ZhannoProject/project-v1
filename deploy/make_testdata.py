@@ -11,8 +11,10 @@ Writes deploy/testdata/<artifact>_test<N>.npz (about 4 KB per epoch) with
     fs      ()       int       256 Hz
 
 The epochs are the first N items of the project's own *test* split
-(data/Dataloader.py, master_seed 42), so they are disjoint from anything the
-models were trained or validated on, and they cycle the 10-point SNR grid
+(data/Dataloader.py) at --master_seed, which must be the seed the model being
+scored was trained with: the split is a function of it, so a set cut at one
+seed is training data for a run trained at another.  Files cut at a seed other
+than 42 carry it in their name.  They cycle the 10-point SNR grid
 from -7 dB to 2 dB: with N a multiple of 10, every SNR is equally
 represented.  They are stored at raw scale (the per-epoch normalisation the
 data loader applies is undone), because that is what raspi_infer.py expects.
@@ -58,13 +60,18 @@ def make_testdata(data_dir: str, artifact: str = "EOG", n: int = 100,
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{artifact}_test{n}.npz"
+    # The seed is part of the file's identity, because it is part of the split's.
+    # A set cut at one seed is training data for a run trained at another, and
+    # scoring against it would be measuring the model on what it learned from.
+    stem = f"{artifact}_test{n}" + ("" if master_seed == 42 else f"_s{master_seed}")
+    path = out_dir / f"{stem}.npz"
     np.savez_compressed(path, noisy=np.stack(noisy).astype(np.float32),
                         clean=np.stack(clean).astype(np.float32),
                         snr_db=np.asarray(snr, dtype=np.float32), fs=SAMPLE_RATE_HZ)
     levels = sorted(set(np.round(snr, 2)))
     print(f"[testdata] wrote {path}  ({path.stat().st_size / 1024:.0f} KB): {n} epochs x 512 samples, "
-          f"{artifact} test split, SNR levels {levels[0]:+.1f} .. {levels[-1]:+.1f} dB "
+          f"{artifact} test split at master_seed {master_seed}, "
+          f"SNR levels {levels[0]:+.1f} .. {levels[-1]:+.1f} dB "
           f"({len(levels)} levels, {n // len(levels)} epochs each)")
     return path
 
@@ -75,8 +82,12 @@ def main(argv=None):
     p.add_argument("--artifact", default="EOG", choices=["EOG", "EMG", "BOTH"])
     p.add_argument("--n", type=int, default=100, help="epochs to cut (multiple of 10 recommended)")
     p.add_argument("--out_dir", default=str(PROJECT_ROOT / "deploy" / "testdata"))
+    p.add_argument("--master_seed", type=int, default=42,
+                   help="the split to cut from — it must be the seed the model being "
+                        "scored was trained with, or the 'test' set is that model's "
+                        "training data")
     a = p.parse_args(argv)
-    make_testdata(a.data_dir, a.artifact, a.n, a.out_dir)
+    make_testdata(a.data_dir, a.artifact, a.n, a.out_dir, a.master_seed)
 
 
 if __name__ == "__main__":

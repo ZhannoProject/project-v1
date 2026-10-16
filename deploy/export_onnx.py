@@ -311,6 +311,7 @@ def _torch_forward(model: torch.nn.Module, x: np.ndarray) -> np.ndarray:
 
 def verify_onnx(model: torch.nn.Module, onnx_path: str | Path, seq_len: int = 512,
                 dynamic_batch: bool = True, atol: float = 1e-4, data_dir: str | None = None,
+                master_seed: int = 42,
                 artifact: str = "EOG", max_batches: int | None = None, seed: int = 0) -> dict:
     """
     Check the ONNX graph against the PyTorch model.
@@ -363,14 +364,16 @@ def verify_onnx(model: torch.nn.Module, onnx_path: str | Path, seq_len: int = 51
 
     # ---- benchmark metrics on the real test split ----
     if data_dir:
+        report["master_seed"] = master_seed
         report["test_metrics"] = evaluate_backends(
             {"torch": lambda x: _torch_forward(model, x), Path(onnx_path).name: run},
-            data_dir, artifact, max_batches,
+            data_dir, artifact, master_seed, max_batches,
         )
     return report
 
 
 def evaluate_backends(backends: dict, data_dir: str, artifact: str = "EOG",
+                      master_seed: int = 42,
                       max_batches: int | None = None, batch_size: int = 32) -> dict:
     """
     Run each ``name -> f(np.ndarray) -> np.ndarray`` backend over the test
@@ -380,7 +383,11 @@ def evaluate_backends(backends: dict, data_dir: str, artifact: str = "EOG",
     from data.Dataloader import build_dataloaders
     from metrics import compute_all_metrics
 
-    _, _, test_loader = build_dataloaders(data_dir, artifact_type=artifact, batch_size=batch_size)
+    # The split is a function of the seed, so it has to be the seed the
+    # checkpoint was trained with -- otherwise these "test" metrics are
+    # measured on epochs the model was trained on.
+    _, _, test_loader = build_dataloaders(data_dir, artifact_type=artifact,
+                                          batch_size=batch_size, master_seed=master_seed)
     sums = {name: {"rrmse_t": 0.0, "rrmse_s": 0.0, "acc": 0.0} for name in backends}
     n = 0
     for i, batch in enumerate(test_loader):
@@ -403,6 +410,7 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
                       name: str | None = None, config: str | None = None, n_heads: int | None = None,
                       seq_len: int | None = None, opset: int = DEFAULT_OPSET, dynamic_batch: bool = True,
                       data_dir: str | None = None, artifact: str = "EOG",
+                      master_seed: int = 42,
                       max_batches: int | None = None) -> dict:
     """
     Checkpoint -> verified ONNX -> sidecar JSON.
@@ -428,7 +436,8 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
 
     print("[verify] onnxruntime vs PyTorch ...")
     fp32_report = verify_onnx(model, fp32_path, seq_len, dynamic_batch,
-                              data_dir=data_dir, artifact=artifact, max_batches=max_batches)
+                              data_dir=data_dir, artifact=artifact,
+                              master_seed=master_seed, max_batches=max_batches)
     _print_report(fp32_report)
 
     sidecar = {
@@ -477,9 +486,16 @@ def main(argv=None):
     p.add_argument("--data_dir", default=None, help="EEGdenoiseNet .npy dir; enables test-set metrics")
     p.add_argument("--artifact", default="EOG", choices=["EOG", "EMG", "BOTH"])
     p.add_argument("--max_batches", type=int, default=None, help="limit test batches for a quick check")
+    p.add_argument("--master_seed", type=int, default=42,
+                   help="the split the test metrics are measured on; it must be the seed "
+                        "the checkpoint was trained with, or they are measured on epochs "
+                        "the model was trained on")
     a = p.parse_args(argv)
+    # Keywords past the positional block: a parameter inserted into the middle
+    # of the signature would otherwise silently shift what follows it.
     export_checkpoint(a.ckpt, a.out_dir, a.name, a.config, a.n_heads, a.seq_len, a.opset,
-                      not a.static_batch, a.data_dir, a.artifact, a.max_batches)
+                      not a.static_batch, data_dir=a.data_dir, artifact=a.artifact,
+                      master_seed=a.master_seed, max_batches=a.max_batches)
 
 
 if __name__ == "__main__":

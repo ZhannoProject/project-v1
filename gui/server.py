@@ -25,19 +25,28 @@ Local HTTP server behind the training GUI (stdlib only).
     GET  /api/eval/status?since=N    incremental log lines, plus the figures the
                                  run has reported writing so far
     GET  /api/eval/figure?path=X one file from figures/ (png / svg / json)
+    GET  /api/pi/meta            exports, test sets and latency traces on disk
+    POST /api/pi/preview         {target, model, …} → the commands a run would use
+    POST /api/pi/run             the same, but starts them
+    POST /api/pi/stop
+    GET  /api/pi/status?since=N  incremental log lines, the step the run is on,
+                                 and the numbers parsed out of them so far
+    GET  /api/pi/trace?name=X    one trace from deploy/artifacts/pi_latency/
 
-Binds to 127.0.0.1 only; there is no authentication.  One training job and
-one evaluation job at a time, each independent of the other; their output is
-kept in memory (last 5000 lines) and mirrored to
-runs/gui_{train,eval}_<timestamp>.log.
+Binds to 127.0.0.1 only; there is no authentication.  One training job, one
+evaluation job and one deploy job at a time, each independent of the others;
+their output is kept in memory (last 5000 lines) and mirrored to
+runs/gui_{train,eval,deploy}_<timestamp>.log.
 """
 
 from __future__ import annotations
 
 import collections
 import json
+import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -47,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from gui import config_io, params
+from gui import config_io, params, pi
 from gui.config_io import PROJECT_ROOT, RUNS_DIR
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -58,14 +67,19 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # ============================================================
 class Job:
     """
-    Runs one subprocess, buffers its output line by line, and serves that
-    buffer back incrementally so the page can tail it.
+    Runs a subprocess — or a short sequence of them — buffers the output line
+    by line, and serves that buffer back incrementally so the page can tail it.
 
     Subclasses give the lines meaning by overriding ``_scan`` (called with the
     lock held, once per line) and ``_extra_status``.  The GUI keeps one
-    instance per kind of job — training and evaluation — so a long evaluation
-    does not lock out the Train tab, and neither job can clobber the other's
-    log.
+    instance per kind of job — training, evaluation and deployment — so a long
+    evaluation does not lock out the Train tab, and no job can clobber
+    another's log.
+
+    A sequence is one job, not three: the Deploy tab's "export, measure, then
+    sweep the hop sizes" is a single thing the user started and a single log to
+    read, and a step that fails stops the ones after it rather than leaving
+    half a measurement to be puzzled over.
     """
 
     MAX_LINES = 5000
@@ -77,9 +91,17 @@ class Job:
         self._lines: collections.deque = collections.deque(maxlen=self.MAX_LINES)
         self._offset = 0                       # index of _lines[0] in the full stream
         self.command: list[str] = []
+        self.steps: list[dict] = []            # [{label, command, env, returncode}]
+        self.step = 0                          # index of the step in progress
         self.started: str | None = None
         self.log_path: Path | None = None
         self.returncode: int | None = None
+        self._active = False                   # true from start() until the last step ends
+        self._cancelled = False
+        # Bumped by every start, and again if a stop has to abandon a reader
+        # that will not come back.  Output from an older generation is dropped
+        # rather than appended to whatever is running now.
+        self._gen = 0
         self._reset_state()
 
     # ---- subclass hooks ----
@@ -96,57 +118,219 @@ class Job:
     # ---- process ----
     @property
     def running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+        # Not "the subprocess is alive": between two steps of a sequence there
+        # is no subprocess, and the job has not finished.
+        return self._active
 
     def start(self, command: list[str], cwd: Path, log_path: Path | None = None):
+        """One command, the ordinary case."""
+        self.start_steps([{"label": self.KIND, "command": list(command)}], cwd, log_path)
+
+    def start_steps(self, steps: list[dict], cwd: Path, log_path: Path | None = None):
+        """
+        Several commands, run in order as one job.
+
+        Each step is ``{label, command[, env]}``; the first non-zero exit stops
+        the rest.  ``env`` is merged into this process's environment for that
+        step only — it is how the Deploy tab passes ``HOP=…`` to a shell script
+        that reads its settings from the environment.
+        """
+        if not steps:
+            raise ValueError("nothing to run")
         with self._lock:
-            if self.running:
+            if self._active:
                 raise RuntimeError(f"a {self.KIND} job is already in progress")
             self._lines.clear()
             self._offset = 0
             self._reset_state()
-            self.command = list(command)
+            self.steps = [{"label": s.get("label") or self.KIND, "command": list(s["command"]),
+                           "env": dict(s.get("env") or {}), "returncode": None} for s in steps]
+            self.step = 0
+            self.command = list(self.steps[0]["command"])
             self.started = datetime.now().isoformat(timespec="seconds")
             self.returncode = None
+            self._cancelled = False
+            self._active = True
+            self._gen += 1
+            gen = self._gen
             self.log_path = log_path
             if log_path:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._proc = subprocess.Popen(
-                command, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env={**__import__("os").environ, "PYTHONUNBUFFERED": "1"},
-            )
-            threading.Thread(target=self._pump, args=(self._proc,), daemon=True).start()
+        threading.Thread(target=self._run_steps, args=(cwd, gen), daemon=True).start()
 
-    def _pump(self, proc: subprocess.Popen):
+    def _append(self, line: str):
+        """Add one line to the buffer.  Caller holds the lock."""
+        if len(self._lines) == self._lines.maxlen:
+            self._offset += 1
+        self._lines.append(line)
+
+    def _emit(self, line: str, log, gen: int):
+        with self._lock:
+            if gen != self._gen:
+                return          # a stop gave up on this step; its output is no longer ours
+            self._append(line)
+            self._scan(line)
+        if log:
+            log.write(line + "\n")
+            log.flush()
+
+    def _run_steps(self, cwd: Path, gen: int):
         log = open(self.log_path, "w") if self.log_path else None
+        rc = 0
         try:
-            for line in proc.stdout:
-                line = line.rstrip("\n")
-                with self._lock:
-                    if len(self._lines) == self._lines.maxlen:
-                        self._offset += 1
-                    self._lines.append(line)
-                    self._scan(line)
-                if log:
-                    log.write(line + "\n")
-                    log.flush()
+            for i, step in enumerate(self.steps):
+                if self._cancelled:
+                    self._emit(f"[gui] stopped before: {step['label']}", log, gen)
+                    break
+                self.step = i
+                self.command = step["command"]
+                if len(self.steps) > 1:
+                    self._emit("", log, gen)
+                    self._emit(f"=== step {i + 1}/{len(self.steps)}: {step['label']} ===", log, gen)
+                rc = self._run_one(step, cwd, log, gen)
+                if gen != self._gen:
+                    return          # abandoned by stop(); the job has already moved on
+                step["returncode"] = rc
+                if rc != 0:
+                    if len(self.steps) > 1 and i + 1 < len(self.steps):
+                        self._emit(f"[gui] {step['label']} exited {rc} — "
+                                   "the remaining steps were not run", log, gen)
+                    break
         finally:
-            proc.stdout.close()
-            proc.wait()
-            self.returncode = proc.returncode
+            with self._lock:
+                if gen == self._gen:
+                    self.returncode = rc
+                    self._proc = None
+                    self._active = False
             if log:
-                log.write(f"\n[exit code {proc.returncode}]\n")
+                log.write(f"\n[exit code {rc}]\n")
                 log.close()
 
-    def stop(self, grace: float = 5.0):
-        proc = self._proc
-        if proc is None or proc.poll() is not None:
-            return False
-        proc.terminate()
+    def _spawn(self, step: dict, cwd: Path) -> subprocess.Popen | None:
+        """
+        Start one step's process, unless the job has already been cancelled.
+
+        The check and the Popen are taken together under the lock because
+        ``stop()`` can arrive between two steps — or a moment before the first
+        process exists at all.  Without this it would find nothing to
+        terminate and the step would start just afterwards anyway.
+
+        Two details are what make a step stoppable.  ``start_new_session``
+        gives it a session of its own, so ``stop()`` can signal everything it
+        forked rather than only the process named here — a step is not always
+        one process, and ``deploy/run_on_pi.sh`` forks ssh and scp.  And stdin
+        is ``/dev/null``: a subprocess that unexpectedly asks a question (ssh
+        wanting a password) would otherwise read the server's own stdin and
+        wait there forever.
+        """
+        with self._lock:
+            if self._cancelled:
+                return None
+            self._proc = subprocess.Popen(
+                step["command"], cwd=str(cwd),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                env={**os.environ, "PYTHONUNBUFFERED": "1", **step.get("env", {})},
+                start_new_session=(os.name == "posix"),
+            )
+            return self._proc
+
+    def _run_one(self, step: dict, cwd: Path, log, gen: int) -> int:
+        proc = self._spawn(step, cwd)
+        if proc is None:
+            self._emit(f"[gui] stopped before: {step['label']}", log, gen)
+            return -1
+        try:
+            for line in proc.stdout:
+                self._emit(line.rstrip("\n"), log, gen)
+        except ValueError:                     # the pipe was closed under the reader
+            pass
+        finally:
+            try:
+                proc.stdout.close()
+            except (OSError, ValueError):
+                pass
+        return proc.wait()
+
+    # ---- stopping ----
+    def _session_of(self, proc: subprocess.Popen) -> int | None:
+        """
+        The step's own process group, or None if it has not got one.
+
+        The guard matters: if ``start_new_session`` did not take effect the
+        process group is *this server's*, and signalling it would kill the GUI
+        along with the job.
+        """
+        if os.name != "posix":
+            return None
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            return None
+        return pgid if pgid == proc.pid else None
+
+    def _signal(self, proc: subprocess.Popen, group: int | None, sig: int):
+        try:
+            if group is not None:
+                os.killpg(group, sig)
+            elif proc.poll() is None:
+                proc.send_signal(sig)
+        except (OSError, ValueError):          # already gone, or not ours to signal
+            pass
+
+    def _end_tree(self, proc: subprocess.Popen, grace: float):
+        """
+        End the step and everything it started.
+
+        Signalling only the process named in the step is not enough: whatever
+        it forked inherited this job's output pipe, and the pipe does not close
+        while any of them holds it — so the reader below never sees the end of
+        the stream and the job never comes to rest.  That is how a Pi run
+        became impossible to stop: ``run_on_pi.sh`` forks ssh and scp, they
+        outlive the SIGTERM sent to bash, and the job stayed "running" with
+        nothing left to stop.
+        """
+        group = self._session_of(proc)
+        self._signal(proc, group, signal.SIGTERM)
         try:
             proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            pass
+        # Whether or not the step itself went quietly, anything it left behind
+        # is still holding the pipe.  One SIGKILL to the session settles both.
+        self._signal(proc, group, signal.SIGKILL)
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def stop(self, grace: float = 5.0):
+        with self._lock:
+            if not self._active:
+                return False
+            self._cancelled = True             # so a sequence stops here, not at the next step
+            proc, gen = self._proc, self._gen
+        if proc is not None:
+            self._end_tree(proc, grace)
+        # A process that escaped its session (anything that daemonises) could
+        # still be holding the pipe.  Rather than leave a job that cannot be
+        # stopped — the worst of the outcomes — give the reader a moment and
+        # then let go of it: the generation counter makes an orphaned reader
+        # harmless, since nothing it writes is accepted any more.
+        for _ in range(20):
+            if not self._active:
+                return True
+            time.sleep(0.05)
+        with self._lock:
+            if self._active and gen == self._gen:
+                self._gen += 1
+                self._proc = None
+                self._active = False
+                self.returncode = -int(signal.SIGKILL)
+                self._append("[gui] stopped — something this step started is still holding "
+                             "its output pipe open, so the job was let go of rather than "
+                             "left running")
         return True
 
     def status(self, since: int = 0) -> dict:
@@ -155,12 +339,16 @@ class Job:
             lines = list(self._lines)[start:]
             nxt = self._offset + len(self._lines)
             extra = self._extra_status()
+            steps = [{"label": s["label"], "returncode": s["returncode"],
+                      "command": " ".join(shlex.quote(c) for c in s["command"])}
+                     for s in self.steps]
         return {
             **extra,
             "kind": self.KIND,
             "running": self.running,
             "returncode": self.returncode,
             "command": " ".join(shlex.quote(c) for c in self.command),
+            "steps": steps, "step": self.step,
             "started": self.started,
             "log_path": str(self.log_path) if self.log_path else None,
             "since": since, "next": nxt, "lines": lines,
@@ -268,8 +456,38 @@ class EvalJob(Job):
             return list(self._artifacts)
 
 
+class DeployJob(Job):
+    """
+    The Deploy tab's job: ``deploy/raspi_infer.py`` on this machine, or
+    ``deploy/run_on_pi.sh`` on the board, optionally preceded by an export.
+
+    What it adds over a plain tail is the reading: the benchmark, the latency
+    summaries, the duty-cycle rows and the test-set metrics are pulled out of
+    the stream as they print, so a sweep that takes two minutes fills the tab
+    in as it goes.  Those are a live preview — the same numbers land in
+    ``deploy/artifacts/pi_latency/*.json``, which is what the page reads back
+    once a trace exists.
+    """
+
+    KIND = "deploy"
+
+    def _reset_state(self):
+        self._scan_state = pi.LogScan()
+
+    def _scan(self, line: str):
+        self._scan_state.feed(line)
+
+    def _extra_status(self) -> dict:
+        return {"parsed": self._scan_state.state()}
+
+    def parsed(self) -> dict:
+        with self._lock:
+            return self._scan_state.state()
+
+
 JOB = TrainingJob()
 EVAL_JOB = EvalJob()
+DEPLOY_JOB = DeployJob()
 
 
 # ============================================================
@@ -484,6 +702,7 @@ def meta() -> dict:
         },
         "configs": config_io.list_configs(),
         "runs": runs,
+        "pi": pi.meta(),
         "env": {"python": sys.executable, "project_root": str(PROJECT_ROOT),
                 "device": _device_name()},
     }
@@ -589,6 +808,13 @@ class Handler(BaseHTTPRequestHandler):
                                                   "application/octet-stream"))
             if url.path == "/api/train/status":
                 return self._json(JOB.status(int(q.get("since", 0))))
+            if url.path == "/api/pi/meta":
+                return self._json(pi.meta())
+            if url.path == "/api/pi/status":
+                return self._json(DEPLOY_JOB.status(int(q.get("since", 0))))
+            if url.path == "/api/pi/trace":
+                return self._json(pi.read_trace(q.get("name", ""),
+                                                int(q.get("max_points", 900))))
             return self._error("not found", 404)
         except (ValueError, FileNotFoundError, KeyError) as e:
             return self._error(e, 400)
@@ -631,6 +857,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({**EVAL_JOB.status(0), "save_dir": save_dir})
             if url.path == "/api/eval/stop":
                 return self._json({"stopped": EVAL_JOB.stop(), **EVAL_JOB.status(0)})
+            if url.path == "/api/pi/preview":
+                return self._json({"steps": pi.describe(pi.build_steps(body))})
+            if url.path == "/api/pi/run":
+                if DEPLOY_JOB.running:
+                    return self._error("a deploy run is already in progress", 409)
+                steps = pi.build_steps(body)
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                DEPLOY_JOB.start_steps(steps, PROJECT_ROOT, RUNS_DIR / f"gui_deploy_{stamp}.log")
+                return self._json({**DEPLOY_JOB.status(0), "planned": pi.describe(steps)})
+            if url.path == "/api/pi/stop":
+                return self._json({"stopped": DEPLOY_JOB.stop(), **DEPLOY_JOB.status(0)})
             return self._error("not found", 404)
         except FileExistsError as e:
             return self._error(e, 409)
@@ -661,7 +898,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True,
     except KeyboardInterrupt:
         pass
     finally:
-        for job, what in ((JOB, "training"), (EVAL_JOB, "evaluation")):
+        for job, what in ((JOB, "training"), (EVAL_JOB, "evaluation"), (DEPLOY_JOB, "deploy")):
             if job.running:
                 print(f"[gui] stopping the {what} job ...")
                 job.stop()

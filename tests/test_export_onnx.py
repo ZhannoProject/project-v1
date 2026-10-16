@@ -187,8 +187,14 @@ class ExportOnnxTests(unittest.TestCase):
             self.assertAlmostEqual(by_hop[128]["total_latency_median_ms"],
                                    by_hop[128]["hop_budget_ms"] + by_hop[128]["e2e_median_ms"], places=1)
             self.assertIn("smallest hop that is comfortably real-time: 128", log.getvalue())
-            js, csv = save_duty_rows(rows, Path(tmp) / "duty")
-            self.assertEqual([r["hop"] for r in json.loads(js.read_text())], [128, 1])
+            # A sweep carries the state of the machine it was measured on: a
+            # duty cycle is only a number about the model if the clock was
+            # held still, so the two are written together.
+            js, csv = save_duty_rows(rows, Path(tmp) / "duty",
+                                     environment={"verdict": "locked"})
+            saved = json.loads(js.read_text())
+            self.assertEqual([r["hop"] for r in saved["rows"]], [128, 1])
+            self.assertEqual(saved["environment"], {"verdict": "locked"})
             lines = csv.read_text().strip().splitlines()
             self.assertEqual(len(lines), 3)
             self.assertTrue(lines[0].startswith("hop,hop_budget_ms,") and lines[0].endswith(",verdict"))

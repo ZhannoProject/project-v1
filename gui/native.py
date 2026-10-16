@@ -70,12 +70,18 @@ def run_native(host: str = "127.0.0.1", port: int = 0, verbose: bool = False,
         text_select=True,
     )
 
+    # Anything closing the window would kill: a training run, an evaluation, or
+    # a deploy run (which may be driving a Raspberry Pi over SSH).
+    jobs = ((_server.JOB, "training run"), (_server.EVAL_JOB, "evaluation"),
+            (_server.DEPLOY_JOB, "deploy run"))
+
     def on_closing():
         # Returning False keeps the window open.
-        if _server.JOB.running:
+        busy = [what for job, what in jobs if job.running]
+        if busy:
             ok = window.create_confirmation_dialog(
-                "Training in progress",
-                "A training run is still going. Quit the GUI and stop it?",
+                "Still running",
+                f"A {' and a '.join(busy)} is still going. Quit the GUI and stop it?",
             )
             if not ok:
                 return False
@@ -87,8 +93,9 @@ def run_native(host: str = "127.0.0.1", port: int = 0, verbose: bool = False,
         # private_mode=False keeps localStorage (last-opened preset) across launches
         webview.start(private_mode=False)
     finally:
-        if _server.JOB.running:
-            print("[gui] stopping the training job ...")
-            _server.JOB.stop()
+        for job, what in jobs:
+            if job.running:
+                print(f"[gui] stopping the {what} ...")
+                job.stop()
         httpd.shutdown()
         httpd.server_close()

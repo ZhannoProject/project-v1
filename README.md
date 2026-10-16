@@ -90,9 +90,11 @@ Not to be confused with `bottleneck_ratio`, which is the channel squeeze between
 ├── gui/
 │   ├── __main__.py             # python -m gui → local web GUI for the YAML presets + launching runs
 │   ├── config_io.py            # field schema + comment-preserving YAML writer
-│   ├── server.py               # stdlib HTTP/JSON API, training + evaluation job runners
+│   ├── server.py               # stdlib HTTP/JSON API, training / evaluation / deploy job runners
+│   ├── pi.py                   # Deploy tab: step builder, log reader, latency + duty traces
 │   └── static/index.html       # the page
 ├── deploy/
+│   ├── preflight.py            # the state of the machine a timing run is taken on, judged
 │   ├── export_onnx.py          # checkpoint → verified ONNX (+ sidecar JSON) for Raspberry Pi 5
 │   ├── run_on_pi.sh            # one command: copy to the Pi over SSH, set up, benchmark, score
 │   ├── raspi_infer.py          # numpy + onnxruntime inference (epoch + causal streaming), --testdata scoring, per-hop latency monitor
@@ -238,9 +240,9 @@ Failures show an alert pointing at `~/Library/Logs/eeg-training-gui.log`.
 The bundle is git-ignored. Closing the window stops the server (and asks
 first if a training run is still going).
 
-The page has five tabs: **YAML** (the text a save would write), **Train**,
-**Evaluate**, **Params** and **Runs**. The Evaluate tab borrows the Runs table
-as a run picker, so those two share one renderer.
+The page has six tabs: **YAML** (the text a save would write), **Train**,
+**Evaluate**, **Deploy**, **Params** and **Runs**. The Evaluate and Deploy tabs
+borrow the Runs table as a run picker, so all three share one renderer.
 
 - **Form ↔ YAML.** Every key of `trainer/__main__.py` is a field, grouped as in
   the preset files (Model, Data, Training, Scheduler, Staged, Loss, Output,
@@ -363,6 +365,108 @@ it picks the split, and it has to match what the checkpoint was trained with.
 The Model form's `master_seed` field is the *training* one; they are the same
 number for the same run, which is why the tab asks for it separately rather
 than guessing.
+
+#### Deploy tab
+
+The third half of the GUI: the runtime test. It is a front end for
+`deploy/export_onnx.py`, `deploy/raspi_infer.py` and `deploy/run_on_pi.sh`, and
+it answers the question the Evaluate tab cannot — not *how well* does this
+model denoise, but *what does it cost to run, and is that inside a real-time
+budget*.
+
+- **Two targets.** *This machine* runs `raspi_infer.py` here (the same script
+  the board runs, with onnxruntime and nothing else), and *Raspberry Pi over
+  SSH* hands the whole thing to `run_on_pi.sh`: copy six files, make the venv
+  on first use, measure there, copy the traces back. The host target is not a
+  substitute for the board — an Apple-silicon host is ~6× faster per window,
+  and it cannot be locked at all (see below) — but it is how you see the
+  measurement work without unplugging anything, and the two are directly
+  comparable because it is one script.
+- **The conditions come first, and they stay attached.** **Check state** reads
+  the machine without measuring anything: CPU governor, affinity, thread count,
+  throttle flag and load, each with a verdict and the reason. The same check
+  then runs before every measurement, and its result is written into the trace,
+  so the panel above the charts always describes *the numbers on screen* rather
+  than the machine as it happens to be now. Every chart title carries the
+  verdict too — **locked**, **partly locked**, **not locked**, or *conditions
+  not recorded* for a trace from before this existed, which is a different
+  thing and is shown as one. The panel ends with the sentence to paste into a
+  methods section. The controls are *pin to CPUs*, *governor* (Pi only, needs
+  passwordless sudo there) and *only measure a locked machine*, which stops the
+  run before it starts rather than producing a figure that cannot be
+  reproduced. On a host with no governor and no affinity API the pin field says
+  so instead of offering a setting that would do nothing. See
+  [the state of the machine](#0-the-state-of-the-machine-and-why-it-is-held-still)
+  for what each control is for.
+- **A run is a sequence, not a command.** Up to three steps, each its own
+  process, shown with a tick as it passes: export the checkpoint, benchmark +
+  score the test set + measure the per-hop latency, sweep the hop sizes. The
+  measurement and the sweep are separate invocations because `raspi_infer.py`
+  returns straight after `--duty_cycle` and one call could not do both. A step
+  that fails stops the ones after it, and the log is one log.
+- **The model is a trained run, not a file.** The field offers every run in
+  `runs/`, picked from the Runs table — the same picker the Evaluate tab uses,
+  with the same val loss, RRMSE and CC in front of you, because choosing what
+  to deploy is choosing among them. It used to list `deploy/artifacts/*.onnx`
+  instead: two files against twenty-nine runs, so twenty-seven models could not
+  be chosen at all. Each row says what picking it would mean — `onnx` for one
+  that is ready, `export first` for a run that has never been exported, and
+  `no export` for a `*_bi` twin, which needs the future and which the exporter
+  refuses (said here rather than two minutes into the export). Picking a run
+  with no export ticks *export first* for you, and the command preview then
+  shows the extra step; an export older than the run it is named after says so
+  and ticks it too. So train → export → measure is three clicks, and the
+  artifact is named after its run — one name for the thing at both stages.
+- **The panels say where their numbers came from.** While a run is going the
+  only live source is its output, so the figures are parsed out of the log as
+  it streams (the pill counts hops). The moment the run writes a trace the page
+  loads *that* instead — `deploy/artifacts/pi_latency/<stem>.json` has every
+  hop in it at full precision, and it is still there next week. The caption
+  under each chart names the file, and the title names the machine: host traces
+  are written as `host_<model>_hop<N>` precisely so a measurement of a laptop
+  can never be read as one of the board.
+- **Per-hop latency**, from the trace's CSV: the median per hop and, as a
+  fainter line, the worst hop in each bucket — a 40k-hop run is bucketed down
+  to something drawable, and plain decimation would drop exactly the stalls the
+  curve is read for. onnxruntime's own time, the end-to-end latency of a paced
+  run and the SoC temperature are drawn alongside when the trace has them. The
+  hop budget is drawn as a line when it fits on the axis and named in the
+  caption when it is far off the top, which on a Pi 5 at hop 32 it is.
+- **Duty cycle**, from `<stem>_duty.json`: one bar per hop size, the mean with
+  the p99 as a cap, coloured by the verdict, against the 70 % (marginal) and
+  100 % (cannot keep up) lines, with the full table below and the conclusion
+  spelled out — *real-time processing is applicable down to hop N: X ms
+  buffering + Y ms compute = Z ms total latency*.
+- **The test set, scored on the device**, in epoch and streaming mode next to
+  the untouched noisy input, with the per-SNR table. These are numpy replicas
+  of `metrics.py`, so the row the Pi prints and the row the host prints are the
+  same measurement.
+- **Old measurements are first-class.** The trace dropdown lists every saved
+  trace, newest first, labelled by machine, kind and hop; opening the tab with
+  nothing running shows the most recent one of each kind rather than a blank
+  chart. The log is mirrored to `runs/gui_deploy_<timestamp>.log`.
+- **Stop stops the whole thing.** A deploy step is not always one process —
+  `run_on_pi.sh` forks `ssh` and `scp` — and those inherit the job's output
+  pipe, which does not close while any of them holds it. So each step runs in
+  a session of its own and **Stop** signals the session, not just the command
+  it started: SIGTERM, five seconds, then SIGKILL to whatever is left. Stopping
+  a Pi run closes the connection, which is what ends the remote command. Its
+  stdin is `/dev/null`, so the Pi target needs key-based ssh — with no terminal
+  to answer it, `run_on_pi.sh` asks ssh to fail (`BatchMode`) rather than hang
+  on a prompt nobody can see. See [connecting to the Pi](#connecting-to-the-pi)
+  for what each failure means.
+
+The Pi's address is validated as `[user@]host` before it reaches `ssh`, and the
+run is started with `subprocess` rather than a shell, so nothing in the form
+reaches a command line. Training, evaluation and deployment are three
+independent jobs: a sweep that takes two minutes does not block a training run.
+
+Validation: `python -m unittest discover -s tests -p 'test_pi_tab.py'` covers
+the command builders and their refusals, the log reader against the output of a
+real run (and against what `LatencyMonitor.print_summary` prints, so the parser
+cannot drift from the printer), the trace files and their sandbox, the
+step sequence (order, a failing step, a stop between steps), the routes and the
+page's own tables.
 
 ### Which loss a run used
 
@@ -770,6 +874,98 @@ The trained sandwich model (by default the 2-layer `tcn_mla`) can be exported
 to a single ONNX file and run on a Raspberry Pi 5 with nothing but
 `numpy` + `onnxruntime` — no PyTorch on the device.
 
+Everything in this section is also in the GUI's **Deploy** tab (`python -m
+gui`), which builds these commands, runs them as one job, and draws the
+per-hop latency and the duty-cycle sweep from the traces they write — see
+[Deploy tab](#deploy-tab).
+
+### 0. The state of the machine, and why it is held still
+
+A latency figure is a statement about a model *and* about the machine it ran
+on, and the second half is usually left out. It should not be. Before anything
+is timed, `deploy/preflight.py` reads the state of the three knobs that move
+the numbers, judges them, prints the verdict, and writes it into every trace
+the run saves — so a figure and the conditions it was taken under cannot be
+separated afterwards.
+
+```bash
+python -m deploy.preflight --threads 2               # on the host
+python preflight.py --threads 2 --cpus 2-3           # on the Pi
+CHECK_ONLY=1 deploy/run_on_pi.sh pi@raspberrypi.local # over SSH, measuring nothing
+```
+
+| Control | What a reportable run needs | Why this one |
+|---|---|---|
+| **CPU governor** | `performance` on every core the process can run on | Under `ondemand` a hop that arrives after an idle gap is computed at a lower clock than one in the middle of a burst. That puts the governor's reaction time into the p99 and reports it as the network's. The duty-cycle numbers are compute ÷ period, so they scale with the clock directly. |
+| **CPU affinity** | pinned, one core per thread, **counted from the top** (`--cpus 2-3`) | A Pi 5's four Cortex-A76 are identical, so migration does not land the work on a slower core — it loses cache locality and lets the process share a core with the OS. That is exactly what makes 4 threads worse than 2 in the table below (median 20.0 ms but p95 29.7 ms, against 18.2 / 18.9 at two threads). The pin counts down from the last core because **CPU 0 is where the kernel does its housekeeping** — device interrupts, the timer tick, RCU callbacks — and a forward pass sharing it gets a tail the model did not cause. The check does not take that on faith: it reads `/proc/interrupts` and reports the share each core actually carries, warning only if the pinned set includes one that is carrying a disproportionate amount. |
+| **Thread count** | onnxruntime's `intra_op_num_threads`, set explicitly | The single largest effect here: 24.4 ms median at one thread, 18.2 at two, 17.4 at three, 20.0 at four. A run that does not record it is not comparable with one that does. See [onnxruntime's threading](#onnxruntimes-threading-is-not-openmps) — it is not the variable most people reach for. |
+| **Throttling** | `vcgencmd get_throttled` = `0x0` since boot | A board that has browned out or capped its clock was not measured at the speed it reports. |
+| **Other load** | 1-minute load average below 1.0 | Anything else running competes for the cores the measurement was pinned to. |
+
+The verdict is one of **locked** (every control held), **partial** (a warning —
+usable, but the tail is not fully reproducible) or **unlocked**. A platform that
+*cannot* hold a control is `unlocked`, not excused: macOS has neither a governor
+nor an affinity API, so a host run is a convenience and the board's run is the
+measurement. `--require-locked` refuses to measure at all unless the verdict is
+`locked`, which is what the Pi target uses by default.
+
+Pinning is done in-process with `sched_setaffinity` rather than through
+`taskset`, so the trace cannot claim an affinity the process did not have. The
+governor is the one control that needs root, so it is opt-in
+(`GOVERNOR=performance deploy/run_on_pi.sh …`, via passwordless sudo) and it
+reports what it actually managed to do — a run taken under `ondemand` while the
+report claims `performance` is worse than one that admits it. It is **not**
+restored afterwards; the log prints the command to put it back.
+
+Every trace written from now on carries an `environment` block with all of
+this, including the sentence to paste into a methods section. Traces from
+before this existed say *conditions not recorded*, which the GUI shows as its
+own state — not as a passing one.
+
+#### onnxruntime's threading is not OpenMP's
+
+The thread count is the largest single effect on these numbers, and it is the
+one most easily set to something that does nothing. Three facts about
+onnxruntime, each measured on the build this project uses (1.30), each asserted
+by a test:
+
+- **`OMP_NUM_THREADS` governs none of it.** The wheels are built without
+  OpenMP — `onnxruntime.get_build_info()` says so — so the variable has no
+  effect on the timed path. It is still set, and still reported, because it
+  governs numpy's BLAS in the same process, which is what scores the test set.
+  The environment check used to *require* it to match the thread count and
+  call that a pass; it was asserting a setting with no effect on the thing
+  being measured, and now it says which is which.
+- **`intra_op_num_threads = N` is N in total, including the thread making the
+  call.** onnxruntime starts N−1 workers and runs the rest on the caller —
+  measured as N−1 extra OS threads, and none at all at N=1. onnxruntime
+  asserts the same thing itself: it refuses `intra_op_thread_affinities`
+  unless given exactly N−1 entries. This is why N threads want N pinned cores,
+  which is the ratio `--cpus` enforces.
+- **The default is 0, which means one thread per physical core.** An unset
+  thread count is not "single-threaded"; on a Pi 5 it is the four-thread row
+  of the table above — the worst one.
+
+The fourth fact is the one that changes what a duty cycle *means*. onnxruntime's
+pool **spins** (busy-waits) before sleeping. Measured here over a paced replay,
+one 512-sample window every 125 ms:
+
+| `session.intra_op.allow_spinning` | median per hop | CPU used |
+|---|---|---|
+| `1` (onnxruntime's default) | 12.8 ms | **31 % of one core** |
+| `0` (`--no-spin`, `SPIN=0`) | 14.0 ms | **18 % of one core** |
+
+Spinning buys about a millisecond per hop and costs roughly 1.7× the CPU while
+the loop is idle between them. So the duty-cycle table below is a **latency
+budget** — compute wall-time ÷ hop period, which answers *can it keep up* — and
+it is **not** CPU occupancy. Read "14 % duty at hop 32" as "86 % of the board is
+free for an acquisition driver and a classifier" and you will be wrong by the
+spin cost. Both settings are available and every trace records which one it
+used; the default is left at onnxruntime's own so that figures measured before
+this was exposed stay comparable.
+
+Validation: `python -m unittest discover -s tests -p 'test_pi_tab.py'`.
+
 ### 1. Export on the host
 
 ```bash
@@ -803,7 +999,7 @@ check quick.
 ### 2. One-shot test over SSH
 
 With the Pi reachable by SSH, a single command from this machine copies the
-five files it needs, creates a venv there on first use, installs `numpy` +
+six files it needs, creates a venv there on first use, installs `numpy` +
 `onnxruntime`, and runs the benchmark plus the bundled test set:
 
 ```bash
@@ -816,19 +1012,75 @@ count. Re-runs reuse the venv and take a few seconds. The script refuses to
 start if the export or test set is missing and prints the command to create
 it.
 
+#### Connecting to the Pi
+
+The script proves the connection with one cheap `ssh … true` before copying
+1.2 MB of model, and when that fails it says *which* failure it was — from the
+GUI they otherwise all read as "it timed out", and they need completely
+different things done about them: a name that did not resolve, a key that is
+not on the Pi, a host key that changed, or no answer at all.
+
+Two settings are worth knowing about, because the defaults are chosen for a
+Raspberry Pi 5 on WiFi rather than for a server in a rack:
+
+| Variable | Default | Why |
+|---|---|---|
+| `SSH_CONNECT_TIMEOUT` | 20 s | This budget covers the TCP connect **and** the SSH handshake and key exchange — not just the connect. Raspberry Pi OS leaves WiFi power saving on, so the radio has to wake before any of that starts. A board on a slow link may genuinely need `SSH_CONNECT_TIMEOUT=45`. |
+| `SSH_CONNECT_ATTEMPTS` | 3 | ssh tries **once** unless told otherwise. `raspberrypi.local` is answered over mDNS — a multicast query sent at the lowest WiFi rate, which is dropped routinely — so a single try turns an ordinary lost packet into a failed run. Three tries, one second apart, is roughly the system TCP timeout in total. |
+
+The session also carries `ServerAliveInterval=15 ServerAliveCountMax=8`:
+`ConnectTimeout` governs setting the connection up and nothing after it, and a
+duty-cycle sweep runs for minutes. Without keepalives a link that dies
+mid-measurement hangs until TCP gives up, which for an idle connection behind
+NAT can be never.
+
+If `.local` is unreliable on your network — it often is — use the address
+(`hostname -I` on the Pi) rather than raising the timeout.
+
+**A Pi on a direct Ethernet cable usually has no IPv4 at all.** With no DHCP on
+that link, mDNS answers `<host>.local` with an IPv6 *link-local* address only,
+and a link-local address is meaningless without the interface to send it out
+of — so `ssh user@zcl.local` fails with `No route to host` even though the name
+resolved perfectly. Give the address with its zone:
+
+```bash
+deploy/run_on_pi.sh 'changlong@fe80::8aa2:9eff:fe56:5033%en5'
+```
+
+`scp` needs that address bracketed where `ssh` does not (it splits
+`user@host:path` on the first colon, so a bare IPv6 literal makes it try to
+resolve the host `fe80`); the script brackets the scp target itself.
+
+The script is one file but two programs: the local half, and a heredoc executed
+by a different bash on the Pi, which sees only the variables the ssh line hands
+across. Those are built from a single `REMOTE_VARS` list rather than spelled out
+twice, because the two lists had to be kept in step by hand and were not — a
+setting read by the Pi half but never sent killed the run under `set -u`, on the
+board, after the files had been copied and the governor had been changed. Two
+tests now check it both ways: one reads the two lists and compares them, and one
+runs the whole remote half here with a stub standing in for the Pi's Python.
+
 ### 3. Manual steps on the Pi
 
 ```bash
 # on the Pi (64-bit Raspberry Pi OS, Python 3.11+)
 python -m venv ~/eeg-env && source ~/eeg-env/bin/activate
 pip install -r requirements-raspi.txt        # numpy + onnxruntime (aarch64 wheels)
-python raspi_infer.py tcn_mla_eog.onnx --benchmark
-python raspi_infer.py tcn_mla_eog.onnx --input noisy.npy --output clean.npy          # (N, 512) epochs
-python raspi_infer.py tcn_mla_eog.onnx --input rec.npy --output clean.npy --stream --hop 32
+sudo cpupower frequency-set -g performance   # or let run_on_pi.sh do it: GOVERNOR=performance
+export OMP_NUM_THREADS=2
+python raspi_infer.py tcn_mla_eog.onnx --cpus 2-3 --require-locked --benchmark
+python raspi_infer.py tcn_mla_eog.onnx --cpus 2-3 --input noisy.npy --output clean.npy      # (N, 512) epochs
+python raspi_infer.py tcn_mla_eog.onnx --cpus 2-3 --input rec.npy --output clean.npy --stream --hop 32
 ```
 
-Only `raspi_infer.py`, `requirements-raspi.txt`, the `.onnx` and its `.json`
-need to be copied (plus a test `.npz`, see below). From Python:
+`--cpus` pins the process (one core per thread, counted from the top so the
+measurement stays off CPU 0 and its interrupts) and the environment check runs
+before anything is timed; `--require-locked` makes a board that is not held
+still refuse to be measured, and `--no-preflight` skips the check entirely —
+the traces then record nothing about the conditions.
+
+Only `raspi_infer.py`, `preflight.py`, `requirements-raspi.txt`, the `.onnx`
+and its `.json` need to be copied (plus a test `.npz`, see below). From Python:
 
 ```python
 from raspi_infer import EEGDenoiser, StreamingDenoiser
@@ -983,7 +1235,12 @@ duty cycle**, with no drift over the run. Hop 4 needs 64 forward passes per
 second and the board delivers ~62, so the loop falls behind at ~28 ms per
 second of signal; hop 2 is twice as bad. The default hop 32 (≈ 143 ms total
 latency, 14 % duty) leaves ample margin for an acquisition driver and a
-downstream classifier on the same board. Pushing below hop 8 would need a
+downstream classifier on the same board — though the duty cycle here is
+compute ÷ period, a latency budget rather than CPU occupancy, and the thread
+pool spins between hops by default, so the cores are busier than 14 % while the
+loop is idle. `SPIN=0` trades about a millisecond per hop for that CPU back;
+see [onnxruntime's threading](#onnxruntimes-threading-is-not-openmps).
+Pushing below hop 8 would need a
 KV cache / incremental attention so that the per-hop cost scales with the hop
 instead of the window (see below), not more threads: 3–4 threads do not make
 one 512-sample forward faster than ~15 ms on this SoC.

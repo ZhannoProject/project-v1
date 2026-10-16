@@ -43,6 +43,13 @@ LatencyMonitor      per-hop timing for either streaming path: onnxruntime time,
                     latency and its drift, deadline misses and an OK / MARGINAL /
                     FAIL verdict per hop, plus the smallest hop that is safe.
 
+--cpus / preflight  every timing run first pins the process (--cpus 0-1) and
+                    reads the state of the machine -- CPU governor, affinity,
+                    thread count, throttle flag, load -- through
+                    deploy/preflight.py.  The verdict is printed, written into
+                    every trace this run saves, and with --require-locked a
+                    machine that is not held still refuses to be measured.
+
 --testdata          scores a .npz cut by deploy/make_testdata.py (noisy, clean,
                     snr_db) with the EEGdenoiseNet metrics, in both epoch and
                     streaming mode, next to the untouched noisy input as a
@@ -54,25 +61,77 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
 
+# Copied to the Pi next to this file; it is stdlib-only and never optional for
+# a timing run, because a latency number without the state of the machine it
+# was taken on is not a measurement anyone can repeat.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import preflight                                                 # noqa: E402
+
 EPS = 1e-8
 
 
 class EEGDenoiser:
-    def __init__(self, onnx_path: str | Path, n_threads: int = 2):
+    """
+    One exported model, with its threading pinned rather than defaulted.
+
+    onnxruntime's thread model is not the OpenMP one, and three details of it
+    decide what a latency number here means:
+
+    * ``intra_op_num_threads = N`` is **N in total, including the calling
+      thread** -- ORT starts N-1 workers and runs the rest on the caller.
+      (Measured: N-1 extra OS threads, none at N=1.  ORT asserts the same
+      thing, refusing ``intra_op_thread_affinities`` unless it is given
+      exactly N-1 entries.)  So "one core per thread" means N cores for N,
+      which is what ``--cpus`` pins.
+    * the default is **0**, which means one thread per physical core -- an
+      unset thread count is not "single-threaded", it is "as many as the board
+      has", and on a Pi 5 that is the 4-thread row of the table below, the
+      worst one.
+    * the pool **spins** before sleeping.  That buys latency and costs CPU
+      while the loop is idle between hops: measured over a paced replay of one
+      window per 125 ms, spinning takes 31% of a core against 18% without, for
+      13.0 ms per hop against 14.0.  It does not change whether the loop keeps
+      up; it changes how much of the board is left for everything else.
+
+    Modern wheels carry no OpenMP at all (``get_build_info()`` says so), so
+    ``OMP_NUM_THREADS`` governs none of this -- it is still set for numpy, and
+    the preflight check reports it as that rather than as the control.
+
+    Thread counts measured on a Pi 5 (tcn_mla_eog, 512-sample window): 1 thread
+    24 ms, 2 threads 18 ms with a tight tail (p95 19 ms), 4 threads 20 ms
+    median but p95 30 ms / max 40 ms from contending with the OS for every core.
+    """
+
+    def __init__(self, onnx_path: str | Path, n_threads: int = 2, spin: bool = True):
         onnx_path = Path(onnx_path)
         opts = ort.SessionOptions()
-        # Measured on a Pi 5 (tcn_mla_eog, 512-sample window): 1 thread 24 ms,
-        # 2 threads 18 ms with a tight tail (p95 19 ms), 4 threads 20 ms median
-        # but p95 30 ms / max 40 ms from contending with the OS for every core.
         opts.intra_op_num_threads = n_threads
+        # Pinned rather than left at 0 so the trace records a number the run
+        # really used.  Sequential execution never touches the inter-op pool;
+        # it is set explicitly for the same reason.
+        opts.inter_op_num_threads = 1
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "1" if spin else "0")
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.sess = ort.InferenceSession(str(onnx_path), opts, providers=["CPUExecutionProvider"])
+        self.threads = {
+            "intra_op": n_threads,
+            "workers": max(0, n_threads - 1),      # ORT counts the caller as one of them
+            "inter_op": 1,
+            "execution_mode": "sequential",
+            "allow_spinning": bool(spin),
+            "openmp_in_build": "openmp" in ort.get_build_info().lower(),
+            "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+            "onnxruntime": ort.__version__,
+        }
 
         inp, out = self.sess.get_inputs()[0], self.sess.get_outputs()[0]
         self.input_name, self.output_name = inp.name, out.name
@@ -156,10 +215,14 @@ class LatencyMonitor:
     THERMAL = Path("/sys/class/thermal/thermal_zone0/temp")
 
     def __init__(self, hop: int, sample_rate: float, report_every: int = 0,
-                 window: int = 64, label: str = "latency"):
+                 window: int = 64, label: str = "latency",
+                 environment: dict | None = None):
         self.hop, self.fs = int(hop), float(sample_rate)
         self.budget_ms = 1e3 * self.hop / self.fs
         self.report_every, self.window, self.label = int(report_every), int(window), label
+        # The state of the machine these numbers were taken on, so the trace
+        # file carries the conditions and not only the result.
+        self.environment = environment
         self.infer_ms: list[float] = []
         self.total_ms: list[float] = []
         self.t_s: list[float] = []
@@ -258,6 +321,8 @@ class LatencyMonitor:
         if n and not np.all(np.isnan(temps)):
             s["temp_c"] = {"start": round(float(temps[0]), 1), "end": round(float(temps[-1]), 1),
                            "max": round(float(np.nanmax(temps)), 1)}
+        if self.environment is not None:
+            s["environment"] = self.environment
         return s
 
     def print_summary(self) -> dict:
@@ -376,7 +441,7 @@ def stream_realtime(d: EEGDenoiser, signal: np.ndarray, hop: int = 32,
 
 
 def duty_cycle_check(d: EEGDenoiser, signal: np.ndarray, hops=(64, 32, 16, 8, 4), seconds: float = 20.0,
-                     report_every: int = 0) -> list[dict]:
+                     report_every: int = 0, environment: dict | None = None) -> list[dict]:
     """
     Real-time applicability sweep.  For each hop size the first ``seconds`` of
     ``signal`` are replayed at the sample rate (stream_realtime), so every row
@@ -407,7 +472,8 @@ def duty_cycle_check(d: EEGDenoiser, signal: np.ndarray, hops=(64, 32, 16, 8, 4)
     print(f"       {'':>4s} {'ms':>8s} {'':>6s} | {'median':>6s} {'p99':>6s} {'max':>6s} | {'mean':>6s} {'p99':>7s} | "
           f"{'median':>7s} {'max':>7s} {'ms':>7s} | {'':>6s} |")
     for hop in hops:
-        m = LatencyMonitor(hop, d.sample_rate, report_every, label=f"duty/hop{hop}")
+        m = LatencyMonitor(hop, d.sample_rate, report_every, label=f"duty/hop{hop}",
+                           environment=environment)
         stream_realtime(d, signal, hop, m)
         s = m.summary()
         if not s["n_hops"]:
@@ -442,11 +508,19 @@ def duty_cycle_check(d: EEGDenoiser, signal: np.ndarray, hops=(64, 32, 16, 8, 4)
     return rows
 
 
-def save_duty_rows(rows: list[dict], stem: str | Path) -> tuple[Path, Path]:
+def save_duty_rows(rows: list[dict], stem: str | Path,
+                   environment: dict | None = None) -> tuple[Path, Path]:
+    """
+    Write the sweep as ``{"rows": [...], "environment": {...}}``.
+
+    Earlier sweeps were a bare list; readers accept both, but a sweep written
+    from now on carries the state of the machine it was measured on, because a
+    duty cycle is only a number about the model if the clock was held still.
+    """
     stem = Path(stem)
     stem.parent.mkdir(parents=True, exist_ok=True)
     js, csv = stem.with_suffix(".json"), stem.with_suffix(".csv")
-    js.write_text(json.dumps(rows, indent=2))
+    js.write_text(json.dumps({"rows": rows, "environment": environment}, indent=2))
     keys = [k for k in rows[0] if k != "temp_c"] if rows else []
     lines = [",".join(keys)] + [",".join(str(r[k]) for k in keys) for r in rows]
     csv.write_text("\n".join(lines) + "\n")
@@ -565,14 +639,56 @@ def main(argv=None):
                         "paced replay per hop, duty cycle + e2e latency + verdict. --input / --testdata "
                         "then only supply the signal (no scoring / denoising output)")
     p.add_argument("--duty_seconds", type=float, default=20.0, help="paced seconds per hop in --duty_cycle")
+    p.add_argument("--cpus", metavar="LIST",
+                   help="pin this process to these CPUs before measuring, e.g. 0-1 "
+                        "(Linux only; one CPU per thread)")
+    p.add_argument("--require-locked", action="store_true",
+                   help="refuse to measure unless the environment check passes: governor "
+                        "at performance, pinned CPUs, explicit thread count, no throttling")
+    p.add_argument("--no-preflight", action="store_true",
+                   help="skip the environment check — the traces then record nothing "
+                        "about the conditions the numbers were taken under")
+    p.add_argument("--no-spin", action="store_true",
+                   help="stop onnxruntime's thread pool busy-waiting between inferences. "
+                        "Measured over a paced replay: spinning costs ~31%% of a core "
+                        "against ~18%% and buys ~1 ms per hop, so it changes how much of "
+                        "the board is left for the rest of the system, not whether the "
+                        "loop keeps up. Recorded either way")
     a = p.parse_args(argv)
 
-    d = EEGDenoiser(a.onnx, a.threads)
+    # Order matters here.  Pinning first means onnxruntime's worker threads
+    # inherit the affinity mask when the session spawns them; pinning after
+    # would leave them wherever the scheduler had already put them.  The
+    # session is then built -- cheap, and nothing is timed yet -- so that the
+    # check can report the threading the session really has rather than the
+    # number that was asked for.  Only then can a run be refused.
+    if a.cpus:
+        try:
+            print(f"[preflight] pinned to CPU {preflight.format_cpu_list(preflight.pin(a.cpus))}")
+        except (ValueError, RuntimeError) as e:
+            p.error(f"--cpus {a.cpus}: {e}")
+
+    d = EEGDenoiser(a.onnx, a.threads, spin=not a.no_spin)
     print(f"[raspi] {a.onnx}: window={d.window} fs={d.sample_rate} Hz  "
-          f"providers={d.sess.get_providers()}  threads={a.threads}")
+          f"providers={d.sess.get_providers()}  "
+          f"intra_op={d.threads['intra_op']} ({d.threads['workers']} "
+          f"worker{'s' if d.threads['workers'] != 1 else ''} + the caller)  "
+          f"spinning={'on' if d.threads['allow_spinning'] else 'off'}")
+
+    env = None
+    if not a.no_preflight:
+        env = preflight.check(a.threads, runtime=d.threads)
+        preflight.emit(env)
+        if a.require_locked and env["verdict"] != preflight.LOCKED:
+            for reason in env["blockers"]:
+                print(f"[preflight]   {reason}", file=sys.stderr)
+            raise SystemExit(
+                f"[preflight] refusing to measure: the machine is {env['verdict']} and "
+                "this run was asked to be reportable (drop --require-locked to measure anyway)")
 
     def new_monitor(label):
-        return LatencyMonitor(a.hop, d.sample_rate, a.latency_every, label=label) if a.latency else None
+        return LatencyMonitor(a.hop, d.sample_rate, a.latency_every, label=label,
+                              environment=env) if a.latency else None
 
     def finish_monitor(m, stem_suffix):
         if m is None:
@@ -596,9 +712,9 @@ def main(argv=None):
         else:
             p.error("--duty_cycle needs --input (1-D .npy) or --testdata (.npz) as the signal")
         hops = [int(h) for h in a.duty_cycle.split(",")]
-        rows = duty_cycle_check(d, sig, hops, a.duty_seconds, a.latency_every)
+        rows = duty_cycle_check(d, sig, hops, a.duty_seconds, a.latency_every, environment=env)
         if a.latency_out and rows:
-            js, csv = save_duty_rows(rows, a.latency_out + "_duty")
+            js, csv = save_duty_rows(rows, a.latency_out + "_duty", environment=env)
             print(f"[duty] wrote {js} and {csv}")
         return                       # --input / --testdata were only the signal source
 

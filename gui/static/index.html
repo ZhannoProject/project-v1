@@ -157,6 +157,59 @@
   #evalFigs img { display: block; width: 100%; height: auto; background: #fff; }
   #evalFigs figcaption { font-size: 11.5px; color: var(--muted); padding: 5px 8px; display: flex; gap: 8px; align-items: center; }
   #evalFigs figcaption .grow { flex: 1; }
+  /* Deploy tab: the same control grid as Evaluate, then whatever the run measured. */
+  #tab-deploy .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 12px; margin-bottom: 10px; }
+  #tab-deploy .efield { display: grid; gap: 3px; }
+  #tab-deploy .efield label { font-size: 11.5px; color: var(--muted); }
+  #tab-deploy .efield .hint { font-size: 11px; color: var(--muted); }
+  #tab-deploy .steps { align-items: center; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; }
+  label.chk { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+  label.chk.off { color: var(--muted); }
+  #piCmd .step { display: block; margin-bottom: 3px; }
+  #piCmd .step b { color: var(--text); font-weight: 600; font: inherit; }
+  #piCmd .step.done b::before { content: "✓ "; color: var(--ok); }
+  #piCmd .step.now b::before { content: "▸ "; color: var(--accent); }
+  #piCmd .step.fail b::before { content: "✕ "; color: var(--err); }
+  #piModelBtn { width: 100%; text-align: left; display: flex; align-items: center; gap: 8px; }
+  #piModelBtn .grow { flex: 1 1 auto; min-width: 5em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #piModelBtn .none { color: var(--muted); }
+  #piModelBtn .meta { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted); }
+  #piModelBtn .caret { flex: 0 0 auto; color: var(--muted); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.marginal { color: var(--warn); border-color: var(--warn); }
+  .badge.fail { color: var(--err); border-color: var(--err); }
+  #piLatChart svg, #piDutyChart svg { display: block; width: 100%; height: auto; max-height: 280px; }
+  #piDuty td.v, #piDuty th.v { text-align: center; }
+  #piDuty tr.fail td { color: var(--err); }
+  #piDuty tr.marginal td { color: var(--warn); }
+  #piTables { display: grid; gap: 10px; margin-bottom: 10px; }
+  #piTables .box { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+  #piTables .box h4 { margin: 0 0 6px; font-size: 12.5px; font-weight: 600; }
+  #piTables .box .cap { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  #piTables tr.me td { font-weight: 600; }
+  #piLog { height: 240px; }
+  /* Measurement conditions: the state of the machine the numbers came from. */
+  #piEnv { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+  #piEnv.locked { border-color: var(--ok); }
+  #piEnv.partial { border-color: var(--warn); }
+  #piEnv.unlocked { border-color: var(--err); }
+  #piEnv .top { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  #piEnv .top .grow { flex: 1; }
+  #piEnv .where { font-size: 12px; color: var(--muted); }
+  #piEnv .checks { display: grid; gap: 2px; margin-top: 7px; font-size: 12px; }
+  #piEnv .chk { display: grid; grid-template-columns: 54px 74px 1fr; gap: 8px; align-items: baseline; }
+  #piEnv .chk .n { font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
+  #piEnv .chk .s { font-size: 10.5px; }
+  #piEnv .chk.pass .s { color: var(--ok); }
+  #piEnv .chk.warn .s { color: var(--warn); }
+  #piEnv .chk.fail .s { color: var(--err); }
+  #piEnv .chk.na .s { color: var(--muted); }
+  #piEnv .says { margin-top: 8px; font-size: 11.5px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 7px; }
+  #piEnv .says b { color: var(--text); font-weight: 600; }
+  .badge.lock { font-size: 10px; }
+  .badge.lock.locked { color: var(--ok); border-color: var(--ok); }
+  .badge.lock.partial { color: var(--warn); border-color: var(--warn); }
+  .badge.lock.unlocked { color: var(--err); border-color: var(--err); }
   /* Run picker: the Runs tab's own table, in a dialog, with the rows as the control. */
   #runPicker { width: min(1100px, 94vw); max-width: none; border: 1px solid var(--border); border-radius: 12px; padding: 0; background: var(--panel); color: var(--text); }
   #runPicker::backdrop { background: rgba(0,0,0,.45); }
@@ -213,6 +266,7 @@
       <button data-tab="yaml" class="active">YAML</button>
       <button data-tab="train">Train</button>
       <button data-tab="eval" title="Run eval.py on a finished run: per-SNR metrics, curves, waveforms, attention heatmaps, and the artifact-switch probe">Evaluate</button>
+      <button data-tab="deploy" title="Export a checkpoint to ONNX and measure what it costs to run: per-hop latency, deadline misses and the duty-cycle sweep — on this machine, or on a Raspberry Pi 5 over SSH">Deploy</button>
       <button data-tab="params" title="Parameter count of the model the form describes, broken down by stage">Params</button>
       <button data-tab="runs">Runs</button>
     </div>
@@ -340,6 +394,126 @@
       <div class="muted" style="margin-top:6px" id="evalLogNote"></div>
     </div>
 
+    <div class="tab" id="tab-deploy">
+      <div class="row">
+        <button id="btnPi" class="primary">▶ Run</button>
+        <button id="btnPiCheck" title="Read the state of the machine without measuring anything: CPU governor, affinity, thread count, throttling, load">✓ Check state</button>
+        <button id="btnPiStop" class="danger" disabled>■ Stop</button>
+        <span class="seg" id="piTarget">
+          <button data-target="host" class="active" title="Run the exported model here, with onnxruntime — the same script the Pi runs">This machine</button>
+          <button data-target="pi" title="Copy the model and the test set to a Raspberry Pi over SSH and measure it there">Raspberry Pi over SSH</button>
+        </span>
+        <span class="grow"></span>
+        <span id="piPill" class="pill"><span class="dot"></span><span>idle</span></span>
+      </div>
+
+      <div class="grid">
+        <div class="efield" id="piModelWrap">
+          <label for="piModelBtn">model</label>
+          <button id="piModelBtn" type="button" title="Pick from the Runs table — every trained run, not only the ones already exported"></button>
+          <span class="hint" id="piModelHint"></span>
+        </div>
+        <div class="efield" id="piSshWrap">
+          <label for="piSsh">Pi address</label>
+          <input type="text" id="piSsh" placeholder="pi@raspberrypi.local">
+          <span class="hint">six files are copied there; the venv is made once. A Pi on a direct cable often has no IPv4 — use its link-local address with the interface, e.g. <code>user@fe80::…%en5</code></span>
+        </div>
+        <div class="efield">
+          <label for="piTestdata">test set</label>
+          <select id="piTestdata"></select>
+          <span class="hint">scored, and replayed as the signal</span>
+        </div>
+        <div class="efield">
+          <label for="piThreads">threads</label>
+          <input type="number" id="piThreads" min="1" max="16" step="1" value="2">
+          <span class="hint">onnxruntime intra-op; 2 is best on a Pi 5</span>
+        </div>
+        <div class="efield">
+          <label for="piHop">hop</label>
+          <input type="number" id="piHop" min="1" step="1" value="32">
+          <span class="hint" id="piHopHint">buffering delay = hop / fs</span>
+        </div>
+        <div class="efield">
+          <label for="piLatencyEvery">latency_every</label>
+          <input type="number" id="piLatencyEvery" min="0" step="1" value="400">
+          <span class="hint">rolling line every N hops; 0 = summary only</span>
+        </div>
+        <div class="efield" id="piCpusWrap">
+          <label for="piCpus">pin to CPUs</label>
+          <input type="text" id="piCpus" placeholder="2-3">
+          <span class="hint" id="piCpusHint">one core per thread, so the scheduler cannot migrate the work</span>
+        </div>
+        <div class="efield" id="piGovernorWrap">
+          <label for="piGovernor">governor</label>
+          <input type="text" id="piGovernor" placeholder="leave the board's own">
+          <span class="hint">set on the Pi before measuring (needs passwordless sudo); not restored afterwards</span>
+        </div>
+      </div>
+
+      <div class="row steps">
+        <label class="chk" id="piExportWrap" title="Write deploy/artifacts/<model>.onnx from that run's best.pt first — verified against PyTorch and refused if it is not causal. Ticked for you when the model has no export yet."><input type="checkbox" id="piExport"> export first</label>
+        <span style="width:8px"></span>
+        <label class="chk" title="One invocation: a tight benchmark loop, the test set scored in epoch and streaming mode, and the per-hop latency monitor"><input type="checkbox" id="piMeasure" checked> benchmark + test set + latency</label>
+        <span style="width:8px"></span>
+        <label class="chk" title="Paced replay at each hop size: compute per hop ÷ hop period, end-to-end latency and its drift, with an OK / MARGINAL / FAIL verdict"><input type="checkbox" id="piDutyOn"> duty-cycle sweep</label>
+        <input type="text" id="piDutyHops" style="width:132px" title="hop sizes, largest first">
+        <span class="muted">for</span>
+        <input type="number" id="piDutySeconds" min="1" max="600" step="1" style="width:66px">
+        <span class="muted">s each</span>
+        <span style="width:8px"></span>
+        <span class="row" id="piRealtimeGroup" style="margin:0;gap:6px">
+          <label class="chk" title="Replay a continuous signal at the sample rate through StreamingDenoiser — the honest live-loop number, scheduler jitter included"><input type="checkbox" id="piRealtime"> paced replay</label>
+          <input type="number" id="piRealtimeS" min="1" max="3600" step="1" style="width:66px">
+          <span class="muted">s</span>
+        </span>
+        <span class="grow"></span>
+        <label class="chk" title="onnxruntime's thread pool busy-waits between inferences. Measured over a paced replay: spinning costs ~31% of a core against ~18%, and buys ~1 ms per hop. It decides how much of the board is left for an acquisition driver and a classifier, not whether the loop keeps up. Recorded either way."><input type="checkbox" id="piSpin" checked> ORT pool spins</label>
+        <label class="chk" title="Stop before measuring anything if the machine is not held still — the governor is not at performance, the process is not pinned, the thread count is not fixed, or the board has throttled"><input type="checkbox" id="piRequireLocked"> only measure a locked machine</label>
+      </div>
+
+      <div class="row" id="piExtraRow">
+        <input type="text" id="piExtra" class="grow" placeholder="extra flags for raspi_infer.py, e.g. --duty_seconds 40">
+      </div>
+      <div class="cmd" id="piCmd"></div>
+
+      <div class="row">
+        <label class="muted" for="piTrace">trace</label>
+        <select id="piTrace" title="Saved measurements in deploy/artifacts/pi_latency/ — a run's own numbers, after it has written them"></select>
+        <button id="btnPiRefresh" title="Re-read deploy/artifacts/ and the traces">Refresh</button>
+        <span class="grow"></span>
+        <span class="muted" id="piTraceNote"></span>
+      </div>
+
+      <div id="piEnv"></div>
+      <div class="facts" id="piHead" style="margin:0 0 10px"></div>
+      <div class="stats" id="piStats"></div>
+
+      <div class="chartbox" id="piLatBox">
+        <div class="head">
+          <span class="muted" id="piLatTitle">per-hop latency</span>
+          <span class="grow"></span>
+          <span class="legend" id="piLatLegend"></span>
+        </div>
+        <div id="piLatChart"></div>
+        <div class="muted" id="piLatNote" style="font-size:11.5px;min-height:14px"></div>
+      </div>
+
+      <div class="chartbox" id="piDutyBox">
+        <div class="head">
+          <span class="muted" id="piDutyTitle">duty cycle — is real-time processing applicable?</span>
+          <span class="grow"></span>
+          <span class="legend" id="piDutyLegend"></span>
+        </div>
+        <div id="piDutyChart"></div>
+        <div style="overflow:auto"><table id="piDuty"></table></div>
+        <div class="muted" id="piDutyNote" style="font-size:11.5px;margin-top:6px"></div>
+      </div>
+
+      <div id="piTables"></div>
+      <pre id="piLog"></pre>
+      <div class="muted" style="margin-top:6px" id="piLogNote"></div>
+    </div>
+
     <div class="tab" id="tab-params">
       <div class="row">
         <span class="muted" id="paramTitle">…</span>
@@ -372,7 +546,7 @@
 
 <dialog id="runPicker">
   <div class="head">
-    <h3>Choose a run to evaluate</h3>
+    <h3 id="pickTitle">Choose a run to evaluate</h3>
     <span class="seg" id="pickView">
       <button data-view="kind" class="active">Complete by kind</button>
       <button data-view="loss">Complete by loss</button>
@@ -407,8 +581,11 @@
 <script>
 (() => {
   const $ = (s, r = document) => r.querySelector(s);
-  const state = { meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {}, job: { running: false, next: 0, metrics: [], maxEpochs: null }, runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0, params: { a: null, b: null, error: null }, paramCmp: "", evalRows: [], evalRun: null, pickView: null, evalJob: { running: false, next: 0, artifacts: [] } };
-  let previewTimer = null, pollTimer = null, paramTimer = null, paramSeq = 0, evalTimer = null;
+  const state = { meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {}, job: { running: false, next: 0, metrics: [], maxEpochs: null }, runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0, params: { a: null, b: null, error: null }, paramCmp: "", evalRows: [], evalRun: null, pickView: null, pickFor: "eval", evalJob: { running: false, next: 0, artifacts: [] },
+    pi: { target: "host", model: null, testdata: null, running: false, next: 0,
+          returncode: null, parsed: {}, steps: [], step: 0, formTouched: false, seenTraces: [],
+          loaded: { latency: null, duty: null } } };
+  let previewTimer = null, pollTimer = null, paramTimer = null, paramSeq = 0, evalTimer = null, piTimer = null;
 
   // ---------- helpers ----------
   const api = async (path, body) => {
@@ -806,21 +983,31 @@
     updateEvalCmd();
   }
 
+  // The Deploy tab picks the checkpoint to export the same way, so the picker
+  // is told which field it is filling rather than knowing only one of them.
+  const PICK_FOR = {
+    eval: { title: "Choose a run to evaluate", get: () => state.evalRun, set: n => setEvalRun(n) },
+    deploy: { title: "Choose a model to deploy", get: () => state.pi.model, set: n => setPiModel(n) },
+  };
+
   function renderRunPicker() {
     const { html, note } = runsMarkup(state.pickView, "pick");
+    const target = PICK_FOR[state.pickFor] || PICK_FOR.eval;
     const t = $("#pickRuns");
     t.innerHTML = html;
     setNote($("#pickNote"), note);
     t.querySelectorAll("tr[data-pick-row]").forEach(tr => {
-      if (tr.dataset.pickRow === state.evalRun) tr.classList.add("current");
+      if (tr.dataset.pickRow === target.get()) tr.classList.add("current");
       tr.addEventListener("click", () => {
-        setEvalRun(tr.dataset.pickRow);
+        target.set(tr.dataset.pickRow);
         $("#runPicker").close();
       });
     });
   }
 
-  function openRunPicker() {
+  function openRunPicker(forWhat = "eval") {
+    state.pickFor = PICK_FOR[forWhat] ? forWhat : "eval";
+    $("#pickTitle").textContent = PICK_FOR[state.pickFor].title;
     state.pickView = state.pickView || state.runsView;
     $("#pickView").querySelectorAll("button")
       .forEach(b => b.classList.toggle("active", b.dataset.view === state.pickView));
@@ -979,6 +1166,775 @@
     }
   }
 
+  // ---------- deploy: the runtime test of an exported model ----------
+  // A front end for deploy/raspi_infer.py (here) and deploy/run_on_pi.sh (on
+  // the board), the way the Evaluate tab is one for eval.py: assemble a spec,
+  // ask the server what commands that is, tail the job.
+  //
+  // The panels below read from one of two places and always say which.  While
+  // a run is going the only live source is its output, so the numbers are
+  // parsed out of the log; the moment the run writes a trace file the page
+  // loads that instead, because the file is the record — it has every hop in
+  // it, full precision, and it is still there next week.
+  const piMeta = () => (state.meta && state.meta.pi) || { exports: [], models: [], testdata: [], traces: [], defaults: {} };
+  const piExport = () => piMeta().exports.find(e => e.name === state.pi.model) || null;
+  // The chosen model as a *run*: exported or not, stale or not, deployable or
+  // not. Only two of this project's runs have ever been exported, so a list of
+  // deploy/artifacts/ offered almost nothing — the field offers every run and
+  // arranges the export when one is missing.
+  const piModel = () => (piMeta().models || []).find(m => m.name === state.pi.model) || null;
+  const fmtPct = (x, d = 1) => x == null ? "—" : (100 * x).toFixed(d) + "%";
+  const ms = (x, d = 2) => x == null ? "—" : Number(x).toFixed(d);
+
+  function initPiControls() {
+    const d = piMeta().defaults || {};
+    $("#piThreads").value = d.threads ?? 2;
+    $("#piHop").value = d.hop ?? 32;
+    $("#piLatencyEvery").value = d.latency_every ?? 400;
+    $("#piDutyHops").value = d.duty_hops || "64,32,16,8,4";
+    $("#piDutySeconds").value = d.duty_seconds ?? 20;
+    $("#piRealtimeS").value = d.realtime_s ?? 30;
+    $("#piCpus").value = d.cpus ?? "2-3";
+    $("#piSpin").checked = d.spin !== false;
+    $("#piGovernor").value = d.governor ?? "performance";
+    try {
+      const t = localStorage.getItem("trainGui.piTarget");
+      if (t === "pi" || t === "host") state.pi.target = t;
+      const ssh = localStorage.getItem("trainGui.piSsh"); if (ssh) $("#piSsh").value = ssh;
+      const model = localStorage.getItem("trainGui.piModel"); if (model) state.pi.model = model;
+    } catch (e) {}
+    fillPiLists();
+    syncRequireLocked();
+    syncPiTarget();
+  }
+
+  // "Only measure a locked machine" is a per-target choice, and its default is
+  // whether that target *can* be locked: on for the board, off for a host with
+  // no governor and no affinity API, where it could only ever refuse.
+  const canLock = (env) => !!(env && env.supports && env.supports.governor && env.supports.affinity);
+
+  function syncRequireLocked() {
+    const key = "trainGui.piRequireLocked." + state.pi.target;
+    let v = null;
+    try { v = localStorage.getItem(key); } catch (e) {}
+    $("#piRequireLocked").checked = v !== null ? v === "1"
+      : (state.pi.target === "pi" ? !!(piMeta().defaults || {}).require_locked
+                                  : canLock(piMeta().host_environment));
+  }
+
+  function rememberRequireLocked() {
+    try {
+      localStorage.setItem("trainGui.piRequireLocked." + state.pi.target,
+                           $("#piRequireLocked").checked ? "1" : "0");
+    } catch (e) {}
+  }
+
+  // Called again after every run and on Refresh: deploy/artifacts/ gains a
+  // model when an export finishes and a trace when a measurement does.
+  function fillPiLists() {
+    const m = piMeta();
+    const keep = (sel, value, names) => {
+      sel.innerHTML = "";
+      for (const o of names) sel.appendChild(new Option(o.label, o.value));
+      if (value && names.some(o => o.value === value)) sel.value = value;
+    };
+    if (!state.pi.model || !(m.models || []).some(x => x.name === state.pi.model)) {
+      state.pi.model = (m.defaults || {}).model || null;
+    }
+    keep($("#piTestdata"), state.pi.testdata || (m.defaults || {}).testdata,
+         m.testdata.map(t => ({ value: t.name, label: `${t.name} · ${t.size_kb} kB` })));
+    state.pi.testdata = $("#piTestdata").value || null;
+
+    const sel = $("#piTrace");
+    const chosen = sel.value;
+    sel.innerHTML = "";
+    sel.appendChild(new Option("this run (live)", ""));
+    for (const t of m.traces) sel.appendChild(new Option(piTraceLabel(t), t.name));
+    sel.value = m.traces.some(t => t.name === chosen) ? chosen : "";
+    renderPiModelButton();
+  }
+
+  function setPiModel(name) {
+    state.pi.model = name || null;
+    try { if (name) localStorage.setItem("trainGui.piModel", name); } catch (e) {}
+    // The box follows the model rather than carrying over from the last one:
+    // a run with no export cannot be measured without one, an export older
+    // than its run does not describe it, and an export that is current has
+    // nothing to redo. The command preview shows the step either way, so
+    // nothing is decided quietly — and it stays overridable afterwards.
+    const m = piModel();
+    if (m) $("#piExport").checked = !m.exported || m.stale;
+    renderPiModelButton();
+    syncPiTarget();
+  }
+
+  function renderPiModelButton() {
+    const btn = $("#piModelBtn"), m = piModel(), name = state.pi.model;
+    btn.innerHTML = "";
+    const main = document.createElement("span");
+    main.className = "grow";
+    main.textContent = name || "Choose a model…";
+    if (!name) main.classList.add("none");
+    btn.append(main);
+    if (m) {
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent = [m.variant, m.artifact].filter(Boolean).join(" · ");
+      btn.append(meta);
+    }
+    const caret = document.createElement("span");
+    caret.className = "caret"; caret.textContent = "⌄";
+    btn.append(caret);
+    btn.title = name ? `${name}\nClick to choose another from the Runs table`
+                     : "Pick a model from the Runs table";
+    renderPiModelHint();
+  }
+
+  function piTraceLabel(t) {
+    const when = new Date(t.mtime * 1000);
+    const stamp = when.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    const what = t.kind === "duty"
+      ? `duty sweep · ${(t.hops || []).length} hops${t.best_hop ? ` · OK down to ${t.best_hop}` : ""}`
+      : `latency · hop ${t.hop} · ${fmtN(t.n_hops)} hops${t.realtime ? " · paced" : ""}`;
+    return `${t.host ? "this machine" : "Pi"} · ${what} · ${stamp}`;
+  }
+
+  // The field's job is to say what will happen to the thing you picked: run it,
+  // export it first, or refuse it.
+  function renderPiModelHint() {
+    const hint = $("#piModelHint"), m = piModel(), e = piExport();
+    const models = piMeta().models || [];
+    if (!models.length) { hint.textContent = "no runs and no exports yet"; return; }
+    if (!m) { hint.innerHTML = `one of <b>${models.length}</b> trained runs`; return; }
+    if (m.bidirectional) {
+      hint.innerHTML = "<b>non-causal</b> — it needs the future, so the exporter "
+        + "refuses it and it could not run online";
+      return;
+    }
+    if (!m.exported) {
+      hint.innerHTML = "a trained run with <b>no ONNX export yet</b> — it will be "
+        + "exported first (verified against PyTorch, and refused if it is not causal)";
+      return;
+    }
+    const bits = [e && e.params != null ? `${fmtK(e.params)} params` : null,
+                  e && e.window ? `${e.window}-sample window` : null,
+                  e && e.artifact ? `trained on ${e.artifact}` : null,
+                  e ? `${e.size_kb} kB` : null];
+    hint.innerHTML = (m.stale
+      ? "<b>the export is older than the run</b> — tick export to rewrite it · " : "")
+      + bits.filter(Boolean).join(" · ");
+  }
+
+  function syncPiTarget() {
+    const onPi = state.pi.target === "pi";
+    $("#piTarget").querySelectorAll("button").forEach(b =>
+      b.classList.toggle("active", (b.dataset.target === "pi") === onPi));
+    $("#piSshWrap").style.display = onPi ? "" : "none";
+    $("#piRealtimeGroup").style.display = onPi ? "" : "none";
+    // run_on_pi.sh is one script with its settings in the environment, so the
+    // extra-flags escape hatch only applies to the local invocation.
+    $("#piExtraRow").style.display = onPi ? "none" : "";
+    const m = $("#piMeasure");
+    m.disabled = onPi;
+    if (onPi) m.checked = true;
+    m.parentElement.classList.toggle("off", onPi);
+    m.parentElement.title = onPi
+      ? "run_on_pi.sh always benchmarks and scores the test set — the sweep and the paced replay are what it switches on"
+      : "One invocation: a tight benchmark loop, the test set scored in epoch and streaming mode, and the per-hop latency monitor";
+    $("#piGovernorWrap").style.display = onPi ? "" : "none";
+    const hop = Number($("#piHop").value);
+    const fs = (piExport() || {}).sample_rate_hz || 256;
+    $("#piHopHint").textContent = hop > 0
+      ? `buffering delay ${(1e3 * hop / fs).toFixed(1)} ms at ${fs} Hz`
+      : "buffering delay = hop / fs";
+    // Affinity is a Linux control. Offering it on a host that has no such API
+    // would be offering a setting that quietly does nothing, so the field says
+    // what the machine can actually hold.
+    const canPin = onPi || ((piMeta().host_environment || {}).supports || {}).affinity;
+    const cpus = $("#piCpus");
+    cpus.disabled = !canPin;
+    cpus.parentElement.classList.toggle("off", !canPin);
+    const threads = Number($("#piThreads").value) || 2;
+    $("#piCpusHint").textContent = canPin
+      ? `one core per thread (${threads} wanted), counted from the top — CPU 0 takes the `
+        + `interrupts and the timer tick, so the measurement is kept off it`
+      : `${(piMeta().host_environment || {}).platform?.system || "this host"} has no CPU `
+        + "affinity API — only the Pi can be pinned";
+    paintPiCmd();
+  }
+
+  function piSpec(check_only = false) {
+    const num = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
+    const onPi = state.pi.target === "pi";
+    return {
+      target: state.pi.target,
+      model: state.pi.model || "",
+      testdata: $("#piTestdata").value,
+      threads: num("#piThreads"),
+      hop: num("#piHop"),
+      latency_every: num("#piLatencyEvery"),
+      measure: $("#piMeasure").checked || onPi,
+      duty: $("#piDutyOn").checked,
+      duty_hops: $("#piDutyHops").value,
+      duty_seconds: num("#piDutySeconds"),
+      realtime: onPi && $("#piRealtime").checked,
+      realtime_s: num("#piRealtimeS"),
+      export: $("#piExport").checked,
+      export_run: state.pi.model || "",
+      ssh: $("#piSsh").value.trim(),
+      remote_dir: (piMeta().defaults || {}).remote_dir || "eeg",
+      extra_args: onPi ? "" : $("#piExtra").value,
+      // The locked state: pinned cores, a governor to set on the board, and
+      // whether an unlocked machine may be measured at all.  A disabled pin
+      // field still holds its text, and sending it would ask a platform with
+      // no affinity API to do something it cannot.
+      cpus: $("#piCpus").disabled ? "" : $("#piCpus").value.trim(),
+      governor: onPi ? $("#piGovernor").value.trim() : "",
+      require_locked: $("#piRequireLocked").checked,
+      spin: $("#piSpin").checked,
+      check_only: !!check_only,
+    };
+  }
+
+  // #piCmd belongs to the preview until something runs, then to the steps
+  // themselves (with their exit marks) until the form is touched again.
+  function paintPiCmd() {
+    if ((state.pi.steps || []).length && !state.pi.formTouched) renderPiSteps();
+    else renderPiPreview();
+  }
+
+  let piPreviewSeq = 0;
+  async function renderPiPreview() {
+    const seq = ++piPreviewSeq;
+    try {
+      const r = await api("/api/pi/preview", piSpec());
+      if (seq !== piPreviewSeq) return;
+      $("#piCmd").innerHTML = r.steps.map(s =>
+        `<span class="step"><b>${escHtml(s.label)}</b>${s.note ? " — " + escHtml(s.note) : ""}<br>${escHtml(s.command)}</span>`
+      ).join("");
+    } catch (e) {
+      if (seq === piPreviewSeq) $("#piCmd").textContent = "— " + e.message;
+    }
+  }
+
+  function renderPiSteps() {
+    const steps = state.pi.steps || [];
+    $("#piCmd").innerHTML = steps.map((st, i) => {
+      const cls = st.returncode === 0 ? "done" : st.returncode != null ? "fail"
+        : (state.pi.running && i === state.pi.step) ? "now" : "";
+      return `<span class="step ${cls}"><b>${escHtml(st.label)}</b><br>${escHtml(st.command)}</span>`;
+    }).join("");
+  }
+
+  async function runPi(checkOnly = false) {
+    try {
+      const spec = piSpec(checkOnly);
+      const s = await api("/api/pi/run", spec);
+      state.pi.ranExport = (spec.export && !checkOnly) ? spec.export_run : null;
+      state.pi.checkOnly = checkOnly;
+      $("#piLog").textContent = "";
+      state.pi.next = 0; state.pi.parsed = {}; state.pi.seenTraces = [];
+      if (!checkOnly) {
+        // This run's own numbers, not last week's: the panels go back to live
+        // and reload themselves as soon as it writes a trace.  A state check
+        // measures nothing, so it leaves whatever was on screen alone.
+        state.pi.loaded = { latency: null, duty: null };
+        $("#piTrace").value = "";
+      }
+      state.pi.formTouched = false;
+      applyPiStatus(s); showTab("deploy"); startPiPolling();
+    } catch (e) { banner(e.message); }
+  }
+
+  async function stopPi() {
+    try { applyPiStatus(await api("/api/pi/stop", {})); } catch (e) { banner(e.message); }
+  }
+
+  function startPiPolling() { clearInterval(piTimer); piTimer = setInterval(pollPi, 1000); pollPi(); }
+
+  async function pollPi() {
+    try {
+      const s = await api(`/api/pi/status?since=${state.pi.next}`);
+      applyPiStatus(s);
+      if (!s.running) { clearInterval(piTimer); piTimer = null; refreshPiMeta(); }
+    } catch (e) { clearInterval(piTimer); }
+  }
+
+  function applyPiStatus(s) {
+    const log = $("#piLog");
+    if (s.lines && s.lines.length) {
+      const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+      log.textContent += (log.textContent ? "\n" : "") + s.lines.join("\n");
+      if (atBottom) log.scrollTop = log.scrollHeight;
+    }
+    state.pi.next = s.next ?? state.pi.next;
+    state.pi.running = s.running;
+    state.pi.returncode = s.returncode;
+    if (s.steps && s.steps.length) state.pi.steps = s.steps;
+    state.pi.step = s.step ?? 0;
+    if (s.parsed) state.pi.parsed = s.parsed;
+    $("#piLogNote").textContent = s.log_path ? `Mirrored to ${s.log_path}` : "";
+    $("#btnPi").disabled = s.running;
+    $("#btnPiCheck").disabled = s.running;
+    $("#btnPiStop").disabled = !s.running;
+    paintPiCmd();
+    updatePiPill();
+    for (const name of ((s.parsed || {}).traces || [])) {
+      if (!(state.pi.seenTraces || []).includes(name)) {
+        state.pi.seenTraces = [...(state.pi.seenTraces || []), name];
+        loadPiTrace(name, true);
+      }
+    }
+    renderPi();
+  }
+
+  function updatePiPill() {
+    const p = $("#piPill"), s = state.pi;
+    if (s.running) {
+      const n = (s.steps || []).length;
+      const prog = (s.parsed || {}).progress;
+      p.className = "pill running";
+      p.lastElementChild.textContent = (n > 1 ? `step ${s.step + 1}/${n}` : "running")
+        + (prog ? ` · hop ${fmtN(prog.hops)}` : "");
+    } else if (s.returncode == null) {
+      p.className = "pill"; p.lastElementChild.textContent = "idle";
+    } else if (s.returncode === 0) {
+      p.className = "pill ok"; p.lastElementChild.textContent = "finished";
+    } else {
+      p.className = "pill err"; p.lastElementChild.textContent = `exit ${s.returncode}`;
+    }
+  }
+
+  async function refreshPiMeta() {
+    try {
+      state.meta.pi = await api("/api/pi/meta");
+      // A run that exported leaves the form pointing at the old model, which
+      // would then describe something the run never touched.
+      const made = state.pi.ranExport;
+      if (made && (state.meta.pi.exports || []).some(e => e.name === made)) {
+        state.pi.model = made;
+        state.pi.ranExport = null;
+        try { localStorage.setItem("trainGui.piModel", made); } catch (e) {}
+      }
+      fillPiLists();
+      renderPi();
+    } catch (e) { banner(e.message); }
+  }
+
+  // A trace goes into the slot for its kind, so a run that measured latency
+  // and swept the hop sizes fills both panels from its own files.
+  async function loadPiTrace(name, quiet = false) {
+    if (!name) { state.pi.loaded = { latency: null, duty: null }; renderPi(); return; }
+    try {
+      const t = await api(`/api/pi/trace?name=${encodeURIComponent(name)}`);
+      state.pi.loaded[t.kind] = t;
+      renderPi();
+    } catch (e) { if (!quiet) banner(e.message); }
+  }
+
+  async function loadLatestPiTraces() {
+    const seen = new Set();
+    for (const t of piMeta().traces) {
+      if (seen.has(t.kind)) continue;
+      seen.add(t.kind);
+      await loadPiTrace(t.name, true);
+    }
+  }
+
+  // ---- what the panels draw, and where it came from ----
+  // Host traces are written with a ``host_`` prefix precisely so that a
+  // measurement of this laptop can never be read as one of the board — the
+  // two differ by 6× and sit next to each other in the same list.
+  const piMachine = (src) => !src ? null : /pi_latency\/host_/.test(src) ? "this machine" : "the Pi";
+
+  function piLatencySource() {
+    const t = state.pi.loaded.latency;
+    if (t) return { summary: t.summary, series: t.series, source: t.path, file: true,
+                    environment: t.environment || (t.summary || {}).environment || null };
+    const live = ((state.pi.parsed || {}).latency) || [];
+    const last = live[live.length - 1];
+    return { summary: last || null, series: null, source: "this run's log", file: false,
+             environment: (state.pi.parsed || {}).environment || null };
+  }
+
+  function piDutySource() {
+    const t = state.pi.loaded.duty;
+    if (t) return { rows: t.rows || [], source: t.path, file: true,
+                    environment: t.environment || null };
+    const d = (state.pi.parsed || {}).duty || {};
+    return { rows: d.rows || [], source: "this run's log", file: false, setup: d.setup,
+             environment: (state.pi.parsed || {}).environment || null };
+  }
+
+  // ---- the conditions the numbers were taken under ----
+  // A latency figure is a statement about a model and about a machine, and the
+  // second half is the one that usually goes missing. Every number on this tab
+  // carries the verdict of the machine it came from, and a number whose
+  // conditions were never recorded says that rather than looking like a
+  // passing one.
+  const LOCK_LABEL = { locked: "locked", partial: "partly locked", unlocked: "not locked" };
+
+  function lockBadge(env, extra = "") {
+    const v = (env || {}).verdict;
+    if (!v) {
+      return `<span class="badge lock" title="this measurement predates the environment check — `
+        + `its conditions are unknown, which is not the same as unlocked">conditions not recorded</span>`;
+    }
+    const why = ((env.checks || []).filter(c => c.status !== "pass")
+      .map(c => `${c.name}: ${c.detail}`).join("\n")) || "every control held";
+    return `<span class="badge lock ${v}" title="${escHtml(why)}">${LOCK_LABEL[v] || v}${extra}</span>`;
+  }
+
+  function renderPiConditions(lat) {
+    const box = $("#piEnv");
+    // What the panel describes, in order: the conditions of the numbers on
+    // screen, then the ones of the run that just went, then — when nothing has
+    // been measured — this machine as it is right now, labelled as a preview.
+    const checked = state.pi.checkOnly ? (state.pi.parsed || {}).environment : null;
+    const measured = checked || lat.environment;
+    const env = measured || piMeta().host_environment;
+    if (!env) { box.style.display = "none"; return; }
+    box.style.display = "";
+    box.className = env.verdict || "";
+    // When the numbers on screen recorded no conditions, the panel falls back
+    // to this machine's current state — which is emphatically *not* what those
+    // numbers were taken under, and has to say so.
+    const orphan = !measured && !!lat.summary;
+    const where = checked ? "checked just now · nothing was measured"
+      : measured ? (lat.file ? `measured — ${escHtml(lat.source)}` : "measured — this run")
+      : orphan ? "this machine right now — <b>not</b> the conditions of the numbers below, "
+                 + "which recorded none"
+      : "this machine right now · nothing has been measured yet";
+    const checks = (env.checks || []).map(c =>
+      `<div class="chk ${c.status.replace("/", "")}"><span class="n">${escHtml(c.name)}</span>`
+      + `<span class="s">${escHtml(c.status === "n/a" ? "n/a" : c.status.toUpperCase())}</span>`
+      + `<span>${escHtml(c.detail)}</span></div>`).join("");
+    box.innerHTML = `<div class="top">${lockBadge(env)}`
+      + `<b>${escHtml(env.board || "")}</b>`
+      + `<span class="grow"></span><span class="where">${where}</span></div>`
+      + `<div class="checks">${checks}</div>`
+      + `<div class="says"><b>For the report:</b> ${escHtml(env.summary || "")}</div>`;
+  }
+
+  function renderPi() {
+    const lat = piLatencySource(), duty = piDutySource();
+    renderPiConditions(lat);
+    renderPiHead();
+    renderPiStats(lat);
+    renderPiLatency(lat);
+    renderPiDuty(duty);
+    renderPiTables();
+    const loaded = Object.entries(state.pi.loaded).filter(([, v]) => v).map(([k]) => k);
+    $("#piTraceNote").textContent = loaded.length
+      ? `${loaded.join(" + ")} read from the trace file${loaded.length > 1 ? "s" : ""}`
+      : (lat.summary || duty.rows.length ? "numbers parsed from the run's log" : "");
+  }
+
+  // The model the *run* used, not whatever the form has selected now: a run
+  // that exports first then measures the file it just wrote, and the
+  // verification facts printed beside those numbers have to belong to it.
+  function piRunExport() {
+    const onnx = ((state.pi.parsed || {}).model || {}).onnx;
+    if (onnx) {
+      const stem = onnx.split("/").pop().replace(/\.onnx$/, "");
+      const hit = piMeta().exports.find(x => x.name === stem);
+      if (hit) return hit;
+    }
+    return piExport();
+  }
+
+  function renderPiHead() {
+    const p = state.pi.parsed || {}, e = piRunExport(), facts = [];
+    if (e) {
+      facts.push(`<b>${escHtml(e.name)}</b>`
+        + (e.variant ? ` · ${escHtml(e.variant)}` : "")
+        + (e.n_attn_layers != null ? ` · L${e.n_attn_layers}` : "")
+        + (e.kv_lora_rank != null ? ` · rank ${e.kv_lora_rank}` : "")
+        + (e.params != null ? ` · <b>${fmtK(e.params)}</b> params` : "")
+        + (e.window ? ` · ${e.window} samples at ${e.sample_rate_hz || 256} Hz` : "")
+        + (e.checkpoint ? ` · from ${escHtml(e.checkpoint)}` : ""));
+      if (e.sidecar) {
+        facts.push(`export verified: agrees with PyTorch to <b>${e.max_abs_diff_vs_torch != null ? e.max_abs_diff_vs_torch.toExponential(1) : "—"}</b>`
+          + `, and a perturbation of a future sample moves the past by <b>${fmt(e.causality_past_diff, 3)}</b>`
+          + (e.causality_past_diff === 0 ? " — strictly causal" : " — <b>not causal</b>")
+          + (e.host_latency_ms_median != null ? ` · ${ms(e.host_latency_ms_median)} ms per window on the export host` : ""));
+      } else {
+        facts.push("no sidecar beside this .onnx — it can be run, but nothing records what it was verified against");
+      }
+    }
+    if (p.board) facts.push(`board: <b>${escHtml(p.board)}</b>`);
+    if (p.model) {
+      // "intra-op", because that is what the number is: onnxruntime counts the
+      // calling thread as one of them, so N threads occupy N cores.
+      facts.push(`running: window ${p.model.window} · ${p.model.sample_rate_hz} Hz · `
+        + (p.model.threads != null
+            ? `${p.model.threads} onnxruntime intra-op thread${p.model.threads === 1 ? "" : "s"} · ` : "")
+        + (p.model.spinning != null
+            ? `pool ${p.model.spinning ? "spinning" : "not spinning"} · ` : "")
+        + escHtml(p.model.providers));
+    }
+    const t = p.thermal || {};
+    if (t.before || t.after) {
+      facts.push(`SoC: ${t.before ? `${ms(t.before.temp_c, 1)} °C before` : ""}`
+        + `${t.after ? ` → ${ms(t.after.temp_c, 1)} °C after ${escHtml(t.after.detail || "")}` : ""}`);
+    }
+    $("#piHead").innerHTML = facts.map(f => `<div>${f}</div>`).join("");
+  }
+
+  function renderPiStats(lat) {
+    const s = lat.summary, p = state.pi.parsed || {}, tiles = [];
+    const tile = (v, k, d = "") => tiles.push(
+      `<div class="stat"><b>${v}</b><span class="k">${k}</span>${d ? `<div class="d">${d}</div>` : ""}</div>`);
+    if (p.bench) {
+      tile(`${ms(p.bench.median_ms)} ms`, "one window, back-to-back",
+           `p95 ${ms(p.bench.p95_ms)} · max ${ms(p.bench.max_ms)}`);
+    }
+    if (s) {
+      const tot = s.total_ms || {};
+      tile(`${ms(tot.median)} ms`, `per hop of ${s.hop} samples`,
+           `p95 ${ms(tot.p95)} · p99 ${ms(tot.p99)} · max ${ms(tot.max)}`);
+      if (s.duty_cycle) {
+        tile(fmtPct(s.duty_cycle.mean), `duty cycle — compute ÷ ${ms(s.hop_budget_ms, 1)} ms period`,
+             `p99 ${fmtPct(s.duty_cycle.p99)}`);
+      }
+      const misses = s.deadline_misses;
+      tiles.push(`<div class="stat"><b>${misses == null ? "—" : fmtN(misses)}</b>`
+        + `<span class="k">deadline misses in ${fmtN(s.n_hops)} hops</span>`
+        + `<div class="d ${misses ? "up" : "down"}">`
+        + `${s.realtime_headroom_x != null ? `${s.realtime_headroom_x}× headroom at p95` : ""}</div></div>`);
+      if (s.e2e_latency_ms) {
+        tile(`${ms(s.e2e_latency_ms.median)} ms`, "end-to-end: sample available → output emitted",
+             `max ${ms(s.e2e_latency_ms.max)}${s.e2e_drift_ms != null
+               ? ` · drift ${s.e2e_drift_ms > 0 ? "+" : ""}${ms(s.e2e_drift_ms)} over the run` : ""}`);
+      }
+      // What a live loop actually waits: the hop has to fill before the
+      // forward pass can start, so the two add up.
+      const compute = (s.e2e_latency_ms || {}).median ?? tot.median;
+      if (compute != null && s.hop_budget_ms != null) {
+        tile(`${ms(s.hop_budget_ms + compute, 1)} ms`, "total algorithmic latency",
+             `${ms(s.hop_budget_ms, 1)} ms buffering + ${ms(compute)} ms compute`);
+      }
+      if (s.temp_c) tile(`${ms(s.temp_c.end, 1)} °C`, "SoC at the end", `peak ${ms(s.temp_c.max, 1)}`);
+    }
+    $("#piStats").innerHTML = tiles.join("");
+  }
+
+  const piPlaceholder = (text) =>
+    `<svg viewBox="0 0 720 150"><text x="360" y="75" text-anchor="middle" font-size="13" `
+    + `fill="${cssVar("--muted")}">${escHtml(text)}</text></svg>`;
+
+  const PI_LINES = [
+    { k: "total_ms", label: "per hop", css: "var(--accent)" },
+    { k: "infer_ms", label: "onnxruntime", css: "var(--muted)" },
+    { k: "e2e_latency_ms", label: "end-to-end", css: "var(--ok)" },
+  ];
+
+  function renderPiLatency(lat) {
+    const box = $("#piLatChart"), legend = $("#piLatLegend"), note = $("#piLatNote");
+    const s = lat.summary, ser = lat.series;
+    const where = piMachine(lat.source);
+    // The badge rides with the title: there is no way to read a latency number
+    // on this tab without seeing what the machine was doing at the time.
+    $("#piLatTitle").innerHTML = s
+      ? escHtml(`per-hop latency — hop ${s.hop}, ${fmtN(s.n_hops)} hops`
+                + (lat.file ? ` · ${where}` : " (live)")) + " " + lockBadge(lat.environment)
+      : "per-hop latency";
+    legend.innerHTML = "";
+    if (!s) {
+      box.innerHTML = piPlaceholder("run a measurement, or load a saved trace");
+      note.textContent = "";
+      return;
+    }
+    if (!ser || !ser.points.length) {
+      box.innerHTML = piPlaceholder("the per-hop trace appears when the run writes it");
+      note.textContent = `summary from ${lat.source}; the trace file carries every hop`;
+      legend.innerHTML = `<span class="item">median <b>${ms((s.total_ms || {}).median)} ms</b></span>`
+        + `<span class="item">p95 <b>${ms((s.total_ms || {}).p95)} ms</b></span>`;
+      return;
+    }
+    const pts = ser.points, cols = ser.columns || [];
+    const hasTemp = cols.includes("temp_c") && pts.some(p => p.temp_c != null);
+    const W = 720, H = 230, L = 50, R = hasTemp ? 46 : 14, T = 14, B = 26;
+    const xs = pts.map(p => p.hop), x0 = Math.min(...xs), x1 = Math.max(...xs, x0 + 1);
+    // Fitted to the bulk rather than to the worst hop: a single 16 ms stall in
+    // a 2.8 ms run would otherwise flatten the whole curve. The note says when
+    // the band is clipped, and the maxima are what the clipping hides.
+    const tot = s.total_ms || {};
+    const bulk = Math.max(tot.p99 || 0, ...pts.map(p => p.total_ms || 0));
+    const peak = Math.max(...pts.map(p => p.total_ms_max || 0), bulk);
+    const hi = Math.min(peak, Math.max(1.6 * bulk, 1.05 * bulk)) * 1.08 || 1;
+    const X = v => L + (v - x0) / (x1 - x0) * (W - L - R);
+    const Y = v => T + (1 - Math.min(v, hi) / hi) * (H - T - B);
+
+    let g = "";
+    for (const t of niceTicks(0, hi)) {
+      const y = Y(t).toFixed(1);
+      g += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="${cssVar("--border")}"/>`
+         + `<text x="${L - 6}" y="${y}" text-anchor="end" dominant-baseline="central" font-size="10.5" fill="${cssVar("--muted")}">${(+t).toFixed(1)}</text>`;
+    }
+    const step = Math.max(1, Math.round((x1 - x0) / 6));
+    for (let v = x0; v <= x1; v += step) {
+      g += `<text x="${X(v).toFixed(1)}" y="${H - B + 14}" text-anchor="middle" font-size="10.5" fill="${cssVar("--muted")}">${fmtN(v)}</text>`;
+    }
+    g += `<text x="${(L + W - R) / 2}" y="${H - 2}" text-anchor="middle" font-size="10" fill="${cssVar("--muted")}">hop</text>`;
+    const budgetOnAxis = s.hop_budget_ms != null && s.hop_budget_ms <= hi;
+    if (budgetOnAxis) {
+      const y = Y(s.hop_budget_ms).toFixed(1);
+      g += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="${cssVar("--err")}" stroke-dasharray="4 3"/>`
+         + `<text x="${W - R - 2}" y="${+y - 4}" text-anchor="end" font-size="10" fill="${cssVar("--err")}">hop budget ${ms(s.hop_budget_ms, 1)} ms</text>`;
+    }
+
+    let paths = "";
+    const line = (key, css, width, opacity) => {
+      const p = pts.filter(q => q[key] != null).map(q => `${X(q.hop).toFixed(1)},${Y(q[key]).toFixed(1)}`);
+      if (p.length) paths += `<polyline points="${p.join(" ")}" fill="none" stroke="${css}" `
+        + `stroke-width="${width}" stroke-linejoin="round" opacity="${opacity}"/>`;
+    };
+    line("total_ms_max", "var(--accent)", 1, 0.4);
+    for (const sr of PI_LINES) if (cols.includes(sr.k)) line(sr.k, sr.css, 1.6, 1);
+
+    let right = "";
+    if (hasTemp) {
+      const temps = pts.map(p => p.temp_c).filter(v => v != null);
+      const lo2 = Math.min(...temps) - 1, hi2 = Math.max(...temps) + 1;
+      const Y2 = v => T + (1 - (v - lo2) / (hi2 - lo2 || 1)) * (H - T - B);
+      const p = pts.filter(q => q.temp_c != null).map(q => `${X(q.hop).toFixed(1)},${Y2(q.temp_c).toFixed(1)}`);
+      right += `<polyline points="${p.join(" ")}" fill="none" stroke="${cssVar("--warn")}" stroke-width="1.4" stroke-dasharray="3 2" opacity="0.6"/>`;
+      for (const t of [lo2, (lo2 + hi2) / 2, hi2]) {
+        right += `<text x="${W - R + 5}" y="${Y2(t).toFixed(1)}" dominant-baseline="central" font-size="10" fill="${cssVar("--warn")}">${t.toFixed(0)}°</text>`;
+      }
+    }
+
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="per-hop latency">`
+      + `<clipPath id="piplot"><rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}"/></clipPath>`
+      + g + `<g clip-path="url(#piplot)">${paths}</g>` + right + `</svg>`;
+
+    legend.innerHTML = PI_LINES.filter(sr => cols.includes(sr.k)).map(sr => {
+      const stat = sr.k === "total_ms" ? tot : sr.k === "infer_ms" ? s.infer_ms : s.e2e_latency_ms;
+      return `<span class="item"><i style="background:${sr.css}"></i>${sr.label} `
+        + `<b>${ms((stat || {}).median)} ms</b></span>`;
+    }).join("") + (hasTemp ? `<span class="item"><i style="background:${cssVar("--warn")}"></i>SoC °C</span>` : "");
+
+    const bits = [`${fmtN(ser.n_hops)} hops drawn as ${pts.length} point${pts.length === 1 ? "" : "s"}`
+      + (ser.bucket > 1 ? ` (${ser.bucket} per point; the faint line is the worst hop in each)` : "")];
+    if (peak > hi) bits.push(`the axis is fitted to the bulk — the worst hop (${ms(peak)} ms) runs off the top`);
+    if (!budgetOnAxis && s.hop_budget_ms != null) {
+      bits.push(`the ${ms(s.hop_budget_ms, 1)} ms hop budget is far off the top of this axis`
+        + (s.realtime_headroom_x != null ? ` (${s.realtime_headroom_x}× headroom at p95)` : ""));
+    }
+    bits.push(`from ${lat.source}`);
+    note.textContent = bits.join(" · ");
+  }
+
+  const DUTY_COLOUR = { OK: "var(--ok)", MARGINAL: "var(--warn)", FAIL: "var(--err)" };
+
+  function renderPiDuty(d) {
+    const rows = [...(d.rows || [])].sort((a, b) => b.hop - a.hop);
+    const chart = $("#piDutyChart"), table = $("#piDuty"), note = $("#piDutyNote");
+    $("#piDutyTitle").innerHTML = rows.length
+      ? escHtml(`duty cycle — ${rows.length} hop size${rows.length === 1 ? "" : "s"}, paced replay`
+                + (d.file ? ` · ${piMachine(d.source)}` : " (live)")) + " " + lockBadge(d.environment)
+      : "duty cycle — is real-time processing applicable?";
+    $("#piDutyLegend").innerHTML = rows.length
+      ? Object.entries(DUTY_COLOUR).map(([k, c]) => `<span class="item"><i style="background:${c};height:8px;width:8px;border-radius:2px"></i>${k}</span>`).join("")
+      : "";
+    if (!rows.length) {
+      chart.innerHTML = piPlaceholder("tick the duty-cycle sweep, or load a saved sweep");
+      table.innerHTML = "";
+      note.textContent = "Every hop costs one full-window forward pass, so halving the hop doubles the duty cycle.";
+      return;
+    }
+
+    // Bars rather than a line: the x axis is a handful of chosen hop sizes,
+    // and the verdict is a property of each one.
+    const W = 720, H = 190, L = 44, R = 14, T = 16, B = 34;
+    const hi = Math.max(110, ...rows.map(r => 100 * r.duty_p99)) * 1.02;
+    const Y = v => T + (1 - v / hi) * (H - T - B);
+    const bw = (W - L - R) / rows.length;
+    let g = "";
+    for (const t of niceTicks(0, hi, 5)) {
+      const y = Y(t).toFixed(1);
+      g += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="${cssVar("--border")}"/>`
+         + `<text x="${L - 6}" y="${y}" text-anchor="end" dominant-baseline="central" font-size="10.5" fill="${cssVar("--muted")}">${(+t).toFixed(0)}%</text>`;
+    }
+    for (const [v, css, label] of [[70, "--warn", "70% — marginal"], [100, "--err", "100% — cannot keep up"]]) {
+      if (v > hi) continue;
+      const y = Y(v).toFixed(1);
+      g += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="${cssVar(css)}" stroke-dasharray="4 3"/>`
+         + `<text x="${W - R - 2}" y="${+y - 3}" text-anchor="end" font-size="10" fill="${cssVar(css)}">${label}</text>`;
+    }
+    let bars = "";
+    rows.forEach((r, i) => {
+      const x = L + i * bw, c = DUTY_COLOUR[r.verdict] || "var(--muted)";
+      const yMean = Y(Math.min(100 * r.duty_mean, hi)), yP99 = Y(Math.min(100 * r.duty_p99, hi));
+      bars += `<rect x="${(x + bw * 0.22).toFixed(1)}" y="${yMean.toFixed(1)}" width="${(bw * 0.56).toFixed(1)}" `
+        + `height="${Math.max(1, H - B - yMean).toFixed(1)}" fill="${c}" opacity="0.75" rx="2"/>`
+        + `<line x1="${(x + bw * 0.22).toFixed(1)}" y1="${yP99.toFixed(1)}" x2="${(x + bw * 0.78).toFixed(1)}" `
+        + `y2="${yP99.toFixed(1)}" stroke="${c}" stroke-width="1.6"/>`
+        + `<text x="${(x + bw / 2).toFixed(1)}" y="${(yP99 - 5).toFixed(1)}" text-anchor="middle" font-size="10.5" fill="${c}">${(100 * r.duty_mean).toFixed(0)}%</text>`
+        + `<text x="${(x + bw / 2).toFixed(1)}" y="${H - B + 14}" text-anchor="middle" font-size="11" fill="${cssVar("--text")}">${r.hop}</text>`
+        + `<text x="${(x + bw / 2).toFixed(1)}" y="${H - B + 26}" text-anchor="middle" font-size="9.5" fill="${cssVar("--muted")}">${ms(r.hop_budget_ms, 1)} ms</text>`;
+    });
+    chart.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="duty cycle per hop size">`
+      + `<line x1="${L}" y1="${Y(0).toFixed(1)}" x2="${W - R}" y2="${Y(0).toFixed(1)}" stroke="${cssVar("--border")}"/>`
+      + g + bars + `</svg>`;
+
+    const head = `<tr><th class="num">hop</th>`
+      + `<th class="num" title="hop / fs — how long the hop takes to arrive, and the deadline for processing it">period</th>`
+      + `<th class="num">hops/s</th>`
+      + `<th class="num" title="wall time of one hop: the forward pass plus the buffer roll and normalisation">compute</th>`
+      + `<th class="num">cmp p99</th><th class="num">cmp max</th>`
+      + `<th class="num" title="compute ÷ period. Above 100% the loop cannot keep up">duty</th>`
+      + `<th class="num">duty p99</th>`
+      + `<th class="num" title="sample available → its denoised value emitted, scheduler jitter included">e2e</th>`
+      + `<th class="num">e2e max</th>`
+      + `<th class="num" title="how much later the loop emits at the end of the run than at the start — a backlog building up">drift</th>`
+      + `<th class="num">misses</th><th class="num" title="period (buffering) + measured end-to-end cost">total</th>`
+      + `<th class="v">verdict</th></tr>`;
+    table.innerHTML = head + rows.map(r => `<tr class="${(r.verdict || "").toLowerCase()}">`
+      + `<td class="num">${r.hop}</td><td class="num">${ms(r.hop_budget_ms, 1)} ms</td><td class="num">${r.hops_per_s}</td>`
+      + `<td class="num">${ms(r.compute_median_ms)}</td><td class="num">${ms(r.compute_p99_ms)}</td><td class="num">${ms(r.compute_max_ms)}</td>`
+      + `<td class="num">${fmtPct(r.duty_mean, 0)}</td><td class="num">${fmtPct(r.duty_p99, 0)}</td>`
+      + `<td class="num">${ms(r.e2e_median_ms)}</td><td class="num">${ms(r.e2e_max_ms)}</td>`
+      + `<td class="num">${r.e2e_drift_ms > 0 ? "+" : ""}${ms(r.e2e_drift_ms)}</td>`
+      + `<td class="num">${fmtN(r.deadline_misses)}</td>`
+      + `<td class="num">${ms(r.hop_budget_ms + (r.e2e_median_ms ?? 0), 1)} ms</td>`
+      + `<td class="v"><span class="badge ${(r.verdict || "").toLowerCase()}">${r.verdict || "—"}</span></td></tr>`).join("");
+
+    const ok = rows.filter(r => r.verdict === "OK");
+    const best = ok.length ? ok.reduce((a, b) => (b.hop < a.hop ? b : a)) : null;
+    note.innerHTML = (best
+      ? `Real-time processing is applicable down to <b>hop ${best.hop}</b>: `
+        + `${ms(best.hop_budget_ms, 1)} ms buffering + ${ms(best.e2e_median_ms)} ms compute `
+        + `= <b>${ms(best.hop_budget_ms + best.e2e_median_ms, 1)} ms</b> total latency at ${fmtPct(best.duty_mean, 0)} duty cycle.`
+      : "No hop size in this sweep is comfortably real-time on this board.")
+      + ` Each hop costs one full-window forward pass, so halving the hop doubles the duty cycle.`
+      + ` The bar is the mean, the cap the p99. From ${escHtml(d.source || "")}.`;
+  }
+
+  function renderPiTables() {
+    const t = (state.pi.parsed || {}).test;
+    const box = $("#piTables");
+    if (!t || !t.rows.length) { box.innerHTML = ""; return; }
+    const row = r => `<tr class="${/epoch mode/.test(r.name) ? "me" : ""}"><td>${escHtml(r.name)}</td>`
+      + `<td class="num">${fmt(r.rrmse_t, 4)}</td><td class="num">${fmt(r.rrmse_s, 4)}</td><td class="num">${fmt(r.acc, 4)}</td></tr>`;
+    const head = `<tr><th>mode</th><th class="num">RRMSE_t</th><th class="num">RRMSE_f</th><th class="num">CC</th></tr>`;
+    let html = `<div class="box"><h4>${escHtml(t.file)} — ${t.n_epochs} epochs, SNR ${fmt(t.snr_db[0], 1)} to ${fmt(t.snr_db[1], 1)} dB</h4>`
+      + `<table>${head}${t.rows.map(row).join("")}</table>`
+      + `<div class="cap">The streaming row lays independent 2-s epochs end to end, so every window straddles`
+      + ` two unrelated signals: a pessimistic bound, not what a continuous recording would give.`
+      + ` These are numpy replicas of metrics.py, so they are directly comparable with the host's.</div></div>`;
+    if (t.per_snr.length) {
+      html += `<div class="box"><h4>per SNR, epoch mode</h4><table>`
+        + `<tr><th class="num">SNR dB</th><th class="num">n</th><th class="num">RRMSE_t</th><th class="num">RRMSE_f</th><th class="num">CC</th></tr>`
+        + t.per_snr.map(r => `<tr><td class="num">${r.snr_db > 0 ? "+" : ""}${fmt(r.snr_db, 1)}</td>`
+          + `<td class="num">${r.n}</td><td class="num">${fmt(r.rrmse_t, 4)}</td>`
+          + `<td class="num">${fmt(r.rrmse_s, 4)}</td><td class="num">${fmt(r.acc, 4)}</td></tr>`).join("")
+        + `</table></div>`;
+    }
+    box.innerHTML = html;
+  }
+
   // ---------- live metric chart ----------
   const SERIES = [
     { k: "rrmse_t", label: "RRMSE_t", css: "var(--accent)" },
@@ -1079,6 +2035,7 @@
       const dl = $("#dl_teacher_ckpt"); if (dl) { dl.innerHTML = ""; for (const r of runs) dl.appendChild(new Option(r.checkpoint)); }
       fillParamCmp();
       fillEvalRuns();
+      renderPiModelButton();
       renderRuns();
     } catch (e) { banner(e.message); }
   }
@@ -1138,6 +2095,16 @@
               ? "loss_fn recorded by the run itself"
               : "loss_fn recovered from the weights by trainer.identify_loss"}">${r.loss_fn}</span>`
           : '<span class="badge loss" title="this run recorded no loss_fn and it could not be recovered — its val loss is not comparable with anything">loss ?</span>');
+    // Choosing a model to deploy is choosing among runs, so the table says
+    // which of them can already be run and which would be exported first —
+    // the distinction the Deploy tab's model field is about.
+    const deployBadge = (state.pickFor === "deploy" && mode === "pick")
+      ? (r.bidirectional
+          ? '<span class="badge fail" title="non-causal: it needs the future, so the ONNX exporter refuses it">no export</span>'
+          : (piMeta().models || []).some(m => m.name === r.name && m.exported)
+            ? '<span class="badge ok" title="an ONNX export already exists for this run">onnx</span>'
+            : '<span class="badge" title="no ONNX export yet — picking this one exports it first">export first</span>')
+      : "";
     // "tab": the Runs tab's own actions.  "pick": the run picker, where those
     // would navigate away mid-choice, so the row itself is the control.
     const plot = (mode === "tab" && r.status !== "interrupted")
@@ -1147,7 +2114,7 @@
       : `<td><button data-ckpt="${r.checkpoint}">Use as teacher</button></td>`;
     const rowAttrs = mode === "pick" ? ` class="pickable" data-pick-row="${r.name}"` : "";
     return `<tr${rowAttrs}>
-      <td>${when}${r.name}${badges}${plot}</td>
+      <td>${when}${r.name}${badges}${deployBadge}${plot}</td>
       ${paramCell(r.params)}
       ${seedCell(r.master_seed)}
       <td class="num">${r.epochs ?? "—"}</td><td class="num">${r.best_epoch ?? "—"}</td>
@@ -1465,7 +2432,8 @@
     try { localStorage.setItem("trainGui.evalMode", $("#evalMode").value); } catch (e) {}
     syncEvalMode();
   });
-  $("#evalRunBtn").addEventListener("click", openRunPicker);
+  $("#evalRunBtn").addEventListener("click", () => openRunPicker("eval"));
+  $("#piModelBtn").addEventListener("click", () => openRunPicker("deploy"));
   $("#pickCancel").addEventListener("click", () => $("#runPicker").close());
   $("#pickView").querySelectorAll("button").forEach(b => b.addEventListener("click", () => {
     state.pickView = b.dataset.view;
@@ -1477,6 +2445,33 @@
                     "#evalVisSnr", "#evalNSamples", "#evalAttnSample", "#evalExtra"]) {
     $(id).addEventListener("input", updateEvalCmd);
     $(id).addEventListener("change", updateEvalCmd);
+  }
+  $("#btnPi").addEventListener("click", () => runPi(false));
+  $("#btnPiCheck").addEventListener("click", () => runPi(true));
+  $("#btnPiStop").addEventListener("click", stopPi);
+  $("#btnPiRefresh").addEventListener("click", refreshPiMeta);
+  $("#piTarget").querySelectorAll("button").forEach(b => b.addEventListener("click", () => {
+    state.pi.target = b.dataset.target;
+    try { localStorage.setItem("trainGui.piTarget", state.pi.target); } catch (e) {}
+    state.pi.formTouched = true;
+    syncRequireLocked();
+    syncPiTarget();
+  }));
+  $("#piRequireLocked").addEventListener("change", rememberRequireLocked);
+  $("#piTrace").addEventListener("change", e => loadPiTrace(e.target.value));
+  $("#piTestdata").addEventListener("change", e => { state.pi.testdata = e.target.value; });
+  $("#piSsh").addEventListener("change", e => {
+    try { localStorage.setItem("trainGui.piSsh", e.target.value.trim()); } catch (err) {}
+  });
+  // Every control the command is built from: the preview is refetched from the
+  // server on each keystroke, so it cannot drift from what would run.
+  for (const id of ["#piTestdata", "#piThreads", "#piHop", "#piLatencyEvery",
+                    "#piExport", "#piMeasure", "#piDutyOn", "#piDutyHops", "#piDutySeconds",
+                    "#piRealtime", "#piRealtimeS", "#piSsh", "#piExtra",
+                    "#piCpus", "#piGovernor", "#piRequireLocked", "#piSpin"]) {
+    for (const ev of ["input", "change"]) {
+      $(id).addEventListener(ev, () => { state.pi.formTouched = true; syncPiTarget(); });
+    }
   }
   document.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); save(); } });
   window.addEventListener("beforeunload", e => { if (state.dirty) { e.preventDefault(); e.returnValue = ""; } });
@@ -1491,8 +2486,10 @@
       try { const c = localStorage.getItem("trainGui.paramCmp"); if (c) state.paramCmp = c; } catch (e) {}
       fillParamCmp();
       initEvalControls();
+      initPiControls();
       renderRuns();
       renderChart();
+      renderPi();
       $("#envNote").textContent = `${state.meta.env.project_root} · ${state.meta.env.python} · device ${state.meta.env.device} · ⌘S saves`;
       let first = state.meta.configs[0];
       try { const saved = localStorage.getItem("trainGui.config"); if (saved && state.meta.configs.includes(saved)) first = saved; } catch (e) {}
@@ -1501,6 +2498,15 @@
       if (s.running || s.returncode != null) { applyStatus(s); if (s.running) startPolling(); }
       const e = await api("/api/eval/status?since=0");
       if (e.running || e.returncode != null) { applyEvalStatus(e); if (e.running) startEvalPolling(); }
+      const p = await api("/api/pi/status?since=0");
+      if (p.running || p.returncode != null) {
+        state.pi.formTouched = false;
+        applyPiStatus(p);
+        if (p.running) startPiPolling();
+      }
+      // Nothing has run in this session yet: show the most recent saved
+      // measurement, so the tab opens on numbers rather than on a blank chart.
+      if (!p.running && p.returncode == null) await loadLatestPiTraces();
     } catch (e) { banner("Could not load: " + e.message); }
   })();
 })();
