@@ -5,10 +5,23 @@ Cut a small, self-contained test set out of EEGdenoiseNet for the Pi.
 
 Writes deploy/testdata/<artifact>_test<N>.npz (about 4 KB per epoch) with
 
-    noisy   (N, 512) float32   artifact-contaminated EEG, raw scale
-    clean   (N, 512) float32   ground truth, raw scale
-    snr_db  (N,)     float32   the SNR each epoch was mixed at
-    fs      ()       int       256 Hz
+    noisy        (N, 512) float32   artifact-contaminated EEG, raw scale
+    clean        (N, 512) float32   ground truth, raw scale
+    snr_db       (N,)     float32   the SNR each epoch was mixed at
+    fs           ()       int       256 Hz
+    master_seed  ()       int       the split this was cut from
+    artifact     ()       str       EOG | EMG | BOTH
+    split        ()       str       always "test"
+    split_ratios (3,)     float32   the split proportions it was cut under
+
+The last four are provenance, and they are the point of the file being
+checkable at all.  Which epochs land in "test" is a function of master_seed,
+artifact and split_ratios together, so a set cut under one combination is
+training data under another.  That used to live only in the filename, which
+nothing enforced and a rename could silently invalidate; now
+``raspi_infer.py --testdata`` reads it out of the array and refuses a model it
+does not match.  Files written before this carry no provenance and are scored
+with a warning rather than a guarantee.
 
 The epochs are the first N items of the project's own *test* split
 (data/Dataloader.py) at --master_seed, which must be the seed the model being
@@ -42,9 +55,10 @@ SAMPLE_RATE_HZ = 256
 
 def make_testdata(data_dir: str, artifact: str = "EOG", n: int = 100,
                   out_dir: str | Path = PROJECT_ROOT / "deploy" / "testdata",
-                  master_seed: int = 42) -> Path:
+                  master_seed: int = 42,
+                  split_ratios: tuple = (0.7, 0.15, 0.15)) -> Path:
     ds = EEGDenoiseDataset(data_dir=data_dir, artifact_type=artifact, split="test",
-                           master_seed=master_seed)
+                           split_ratios=split_ratios, master_seed=master_seed)
     n = min(n, len(ds))
     if n % len(ds.snr_grid):
         print(f"[testdata] note: n={n} is not a multiple of the {len(ds.snr_grid)}-point SNR grid, "
@@ -65,9 +79,15 @@ def make_testdata(data_dir: str, artifact: str = "EOG", n: int = 100,
     # scoring against it would be measuring the model on what it learned from.
     stem = f"{artifact}_test{n}" + ("" if master_seed == 42 else f"_s{master_seed}")
     path = out_dir / f"{stem}.npz"
+    # Provenance travels inside the file, not in its name: the name is a
+    # convention and a rename breaks it silently, while this is read back by
+    # the scorer and checked against the model it is about to grade.
     np.savez_compressed(path, noisy=np.stack(noisy).astype(np.float32),
                         clean=np.stack(clean).astype(np.float32),
-                        snr_db=np.asarray(snr, dtype=np.float32), fs=SAMPLE_RATE_HZ)
+                        snr_db=np.asarray(snr, dtype=np.float32), fs=SAMPLE_RATE_HZ,
+                        master_seed=int(master_seed), artifact=str(artifact),
+                        split="test",
+                        split_ratios=np.asarray(split_ratios, dtype=np.float32))
     levels = sorted(set(np.round(snr, 2)))
     print(f"[testdata] wrote {path}  ({path.stat().st_size / 1024:.0f} KB): {n} epochs x 512 samples, "
           f"{artifact} test split at master_seed {master_seed}, "

@@ -72,7 +72,10 @@ def run_native(host: str = "127.0.0.1", port: int = 0, verbose: bool = False,
 
     # Anything closing the window would kill: a training run, an evaluation, or
     # a deploy run (which may be driving a Raspberry Pi over SSH).
-    jobs = ((_server.JOB, "training run"), (_server.EVAL_JOB, "evaluation"),
+    # TRAIN_JOBS is a registry rather than one job -- there can be several runs
+    # going at once -- but it answers ``running`` the same way, so the guard
+    # does not need to know the difference.
+    jobs = ((_server.TRAIN_JOBS, "training run"), (_server.EVAL_JOB, "evaluation"),
             (_server.DEPLOY_JOB, "deploy run"))
 
     def on_closing():

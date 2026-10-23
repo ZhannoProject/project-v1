@@ -189,7 +189,14 @@ class CausalMLA(nn.Module):
                     instead of full K and V (size 2 * d_model). For BCI
                     streaming on embedded hardware, this is a real win.
 
-    Default kv_lora_rank = d_model // 4 gives 4x KV cache compression.
+    Cache per step is kv_lora_rank floats against MHA's 2 * d_model (MHA has
+    to keep both K and V), so the compression is 2 * d_model / kv_lora_rank.
+    Note that d_model here is the *squeezed* width: the sandwich variants
+    compress 64 TCN channels by bottleneck_ratio 0.5 first, so d_model is 32
+    and the constructor default d_model // 4 is rank 8, i.e. 8x.  Every YAML
+    preset and every trained checkpoint sets kv_lora_rank: 16 instead, which
+    is the 4x the README reports.  Measured by models/incremental.py, which
+    is the only path that actually holds a cache.
 
     Input  : (B, T, d_model)
     Output : (B, T, d_model)

@@ -29,12 +29,15 @@ Evaluate tab is a front end for ``eval.py``.
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import io
 import json
 import re
 import shlex
 import sys
 from pathlib import Path
+from typing import Optional
 
 from deploy import preflight
 from gui import config_io
@@ -160,9 +163,24 @@ def list_models() -> list[dict]:
         e, r = exports.get(name), runs.get(name)
         row = {"name": name, "exported": e is not None, "run": r is not None,
                "variant": (e or {}).get("variant") or (r or {}).get("variant"),
-               "artifact": (e or {}).get("artifact") or (r or {}).get("artifact"),
+               # The run's own record wins: a sidecar's artifact used to come from
+               # the exporter's --artifact flag, so an old export can still claim
+               # the wrong one. The run reads it from the training config.
+               "artifact": (r or {}).get("artifact") or (e or {}).get("artifact"),
                "params": (e or {}).get("params") or (r or {}).get("params"),
                "bidirectional": bool((r or {}).get("bidirectional")),
+               # A bounded-lookahead rung is not bidirectional, and the
+               # exporter refuses it just the same: it reads samples that have
+               # not arrived. Running one online means delaying the output by
+               # that many samples, and no path here implements that contract.
+               "lookahead": (r or {}).get("lookahead"),
+               # The split this model was fitted on, for the test-set pairing
+               # check. None for runs trained before the seed was recorded.
+               "master_seed": (r or {}).get("master_seed"),
+               # The one-sample graph is a separate artifact from the windowed
+               # one, and the Pi needs it to stream: the page has to be able
+               # to say whether this model has one yet.
+               "step_exported": (ARTIFACTS_DIR / f"{name}_step.onnx").is_file(),
                "stale": False}
         if e and r:
             ckpt = RUNS_DIR / name / "best.pt"
@@ -173,18 +191,151 @@ def list_models() -> list[dict]:
                 pass
         row["needs"] = ("none" if row["exported"] and not row["stale"]
                         else "re-export" if row["exported"] else "export")
-        row["deployable"] = row["exported"] or (row["run"] and not row["bidirectional"])
+        # Derived from both, and defaulting to exportable when a row says
+        # neither: the gate is "can the exporter take this", which is false
+        # for an unbounded teacher and for a bounded rung alike.
+        row["exportable"] = not row["bidirectional"] and row["lookahead"] is None
+        row["deployable"] = row["exported"] or (row["run"] and row["exportable"])
         rows.append(row)
     return rows
 
 
 def list_testdata() -> list[dict]:
-    """One row per ``deploy/testdata/*.npz`` -- the scored sets, and the signal
-    the duty-cycle sweep is replayed from."""
+    """
+    One row per ``deploy/testdata/*.npz`` -- the scored sets, and the signal
+    the duty-cycle sweep is replayed from.
+
+    Each row carries the split it was cut from, so the page can refuse a pair
+    before a Pi run rather than after one.  ``raspi_infer`` checks the same
+    thing again at scoring time; this is the earlier, friendlier half of a
+    check that has to exist on the board regardless.
+    """
     if not TESTDATA_DIR.is_dir():
         return []
-    return [{"name": p.name, "size_kb": round(p.stat().st_size / 1024, 1)}
-            for p in sorted(TESTDATA_DIR.glob("*.npz"))]
+    rows = []
+    for p in sorted(TESTDATA_DIR.glob("*.npz")):
+        row = {"name": p.name, "size_kb": round(p.stat().st_size / 1024, 1)}
+        try:
+            from deploy import raspi_infer          # numpy + onnxruntime; imported lazily
+            row.update(raspi_infer.testdata_provenance(p))
+        except Exception:
+            # numpy missing, or a file that is not a readable npz: the tab still
+            # lists it and the scorer will say what is wrong with it.
+            row.update({"source": "unknown", "artifact": None,
+                        "master_seed": None, "split": None})
+        rows.append(row)
+    return rows
+
+
+def cut_testdata_for(model_name: str, n: int = 100, overwrite: bool = False) -> dict:
+    """
+    Cut the test set that matches a model's split, from the model.
+
+    The pairing rules make picking a set a small research question -- which
+    seed was this run trained at, which artifact, does a matching file exist
+    yet -- and the answer is already recorded in the run.  So rather than
+    report a mismatch and leave the operator to translate it into a
+    ``make_testdata`` command, this reads the artifact and ``master_seed`` off
+    the model and cuts the right file.
+
+    A run whose seed was never recorded is refused rather than cut at the
+    default: guessing 42 would produce a file that *looks* matched, which is
+    the failure this whole check exists to prevent.
+
+    Returns ``{"name", "created", "artifact", "master_seed", "n"}``.  An
+    existing matching file is returned with ``created: False`` instead of
+    being rewritten -- it is already the right epochs, and rewriting it would
+    churn a file that recorded measurements may refer to.
+    """
+    model = next((m for m in list_models() if m["name"] == model_name), None)
+    if model is None:
+        raise ValueError(f"no model called {model_name!r}")
+
+    seed, artifact = model.get("master_seed"), model.get("artifact")
+    if seed is None:
+        raise ValueError(
+            f"{model_name} does not record the seed it was trained at (the run predates "
+            f"master_seed being saved), so the matching split cannot be worked out. Cut one "
+            f"by hand with python -m deploy.make_testdata --artifact <EOG|EMG|BOTH> "
+            f"--master_seed <seed> once you know it.")
+    if artifact not in ("EOG", "EMG", "BOTH"):
+        raise ValueError(f"{model_name} does not record which artifact it was trained on")
+    if not 10 <= int(n) <= 2000:
+        raise ValueError(f"epochs must be between 10 and 2000, got {n}")
+
+    from deploy.make_testdata import make_testdata
+
+    n = int(n)
+    stem = f"{artifact}_test{n}" + ("" if int(seed) == 42 else f"_s{int(seed)}")
+    target = TESTDATA_DIR / f"{stem}.npz"
+    if target.is_file() and not overwrite:
+        return {"name": target.name, "created": False, "artifact": artifact,
+                "master_seed": int(seed), "n": n}
+
+    data_dir = PROJECT_ROOT / "data" / "EEGdenoisenet" / "data"
+    if not (data_dir / "EEG_all_epochs.npy").is_file():
+        raise FileNotFoundError(
+            f"the EEGdenoiseNet .npy files are not in {data_dir} — see the Data section of "
+            f"the README; a test set is cut from them, not shipped with the code")
+
+    # make_testdata prints a summary line; the caller wants the result, and the
+    # page has nowhere to show a stdout line.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        path = make_testdata(str(data_dir), artifact, n,
+                             out_dir=TESTDATA_DIR, master_seed=int(seed))
+    return {"name": Path(path).name, "created": True, "artifact": artifact,
+            "master_seed": int(seed), "n": n, "log": buf.getvalue().strip()}
+
+
+def split_mismatch(model_name: str, testdata_name: str) -> Optional[dict]:
+    """
+    Why this model and this test set should not be scored together, if so.
+
+    "Test split" is only meaningful relative to a seed: EEGDenoiseDataset
+    permutes the epoch pool with ``master_seed`` before slicing it, so the
+    seed-42 test epochs are 69% of them in the seed-67 *training* split.
+    Scoring across that line returns an inflated number with nothing visibly
+    wrong, which is why it is caught here and again on the board.
+
+    Returns ``None`` when the pair is fine, else ``{"level", "text"}`` --
+    ``error`` for a seed mismatch (the score would be meaningless), ``warn``
+    for a pair that cannot be verified or is a deliberate cross-artifact probe.
+    """
+    sets = {t["name"]: t for t in list_testdata()}
+    t = sets.get(testdata_name)
+    if t is None:
+        return None
+    model = next((m for m in list_models() if m["name"] == model_name), None)
+    if model is None:
+        return None
+
+    seed, artifact = model.get("master_seed"), model.get("artifact")
+    if t.get("split") not in (None, "test"):
+        return {"level": "error",
+                "text": f"{testdata_name} is the '{t['split']}' split, not the test split"}
+    if seed is None or t.get("master_seed") is None:
+        why = ("this run predates the seed being recorded"
+               if seed is None else f"{testdata_name} carries no recorded provenance")
+        return {"level": "warn",
+                "text": f"cannot verify the split — {why}. If the seeds differ these epochs "
+                        f"are {model_name}'s training data and the score means nothing."}
+    if int(seed) != int(t["master_seed"]):
+        return {"level": "error",
+                "text": f"{model_name} was trained at master_seed {seed} but {testdata_name} was "
+                        f"cut from the master_seed {t['master_seed']} split — most of these epochs "
+                        f"are in that model's training set. Cut a matching set: "
+                        f"python -m deploy.make_testdata --artifact {t.get('artifact') or artifact} "
+                        f"--master_seed {seed}"}
+    if t.get("artifact") and artifact and t["artifact"] != artifact:
+        return {"level": "warn",
+                "text": f"{model_name} was trained on {artifact} but {testdata_name} is "
+                        f"{t['artifact']} — a cross-artifact probe, not a like-for-like score"}
+    if t.get("source") == "filename":
+        return {"level": "warn",
+                "text": f"{testdata_name} has no recorded provenance; its split was read off the "
+                        f"filename. Re-cut it to stamp the provenance in."}
+    return None
 
 
 def trace_kind(name: str) -> str:
@@ -223,7 +374,9 @@ def list_traces() -> list[dict]:
                        median_ms=(data.get("total_ms") or {}).get("median"),
                        deadline_misses=data.get("deadline_misses"),
                        realtime=("e2e_latency_ms" in data),
-                       environment=data.get("environment"))
+                       environment=data.get("environment"),
+                       scores=data.get("scores"),
+                       inference=data.get("inference"))
         # The verdict the dropdown shows: a trace from before this was recorded
         # says "unknown", which is not the same as "unlocked" and must not read
         # as it.
@@ -232,6 +385,197 @@ def list_traces() -> list[dict]:
         rows.append(row)
     rows.sort(key=lambda r: r["mtime"], reverse=True)
     return rows
+
+
+#: ``{host|latency}_<model>_hop<N>[_duty|_realtime].json``.  The model name is
+#: a run directory name and carries underscores and digits of its own
+#: (``tcn_mla_both_s67``), so the match is anchored on the ``_hop<N>`` at the
+#: end rather than on the first underscore.
+_TRACE_NAME = re.compile(
+    r"^(?P<where>host|latency|incremental)_(?P<model>.+)_hop(?P<hop>\d+)"
+    r"(?P<extra>_duty|_realtime)?\.json$")
+
+#: Sampling rate the epochs were cut at, for turning a hop into a deadline.
+TRACE_FS = 256.0
+
+
+def _scores_from_logs() -> dict:
+    """
+    ``{trace name: scores}`` recovered from the Deploy tab's job logs.
+
+    Accuracy used to be printed and dropped: ``evaluate_testdata`` returned
+    it, ``main`` ignored the return, and only the timings reached a file.  The
+    trace now carries it, but the measurements already on disk predate that,
+    and their numbers are not lost -- they are in the job log that produced
+    them, which also names the traces that run wrote.  That is the join.
+
+    Newest log wins, because a trace is overwritten by whichever run wrote it
+    last and the newest log is the one that describes the file now on disk.
+    Scraped text, so it is marked ``log`` rather than ``trace`` and the page
+    says which.
+    """
+    out: dict[str, dict] = {}
+    for log in list_deploy_logs():                 # newest first
+        path = RUNS_DIR / log["name"]
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        scan = LogScan()
+        for line in text.splitlines():
+            scan.feed(line)
+        state = scan.state()
+        test = state.get("test") or {}
+        rows = {r["name"]: r for r in (test.get("rows") or [])}
+        if not rows:
+            continue
+        scores = {
+            "testdata": test.get("file"),
+            "n_epochs": test.get("n_epochs"),
+            "modes": {name: {k: r[k] for k in ("rrmse_t", "rrmse_s", "acc") if r.get(k) is not None}
+                      for name, r in rows.items()},
+            "source": "log",
+            "from_log": log["name"],
+        }
+        for name in state.get("traces") or []:
+            out.setdefault(name, scores)           # first = newest
+    return out
+
+
+def list_deploy_runs() -> list[dict]:
+    """
+    Deploy runs for the Runs tab: one row per measurement, newest first.
+
+    The Runs tab is this project's history of what was actually done, and
+    until now it held only half of it -- every training run, and none of the
+    measurements made from them.  A deploy run is the other half: a model, a
+    machine, a hop, and the latency it achieved there.
+
+    A measurement is keyed by ``(where, model, hop)`` and gathers the three
+    traces a single run can write -- the per-hop latency trace, the duty-cycle
+    sweep beside it, and the real-time replay -- because they are one run's
+    output, not three runs.
+
+    Every row carries the environment verdict, which is the point: a latency
+    figure is a statement about a model *and* about the machine, and a row
+    that cannot say which is marked ``unknown`` rather than passing silently.
+    ``host`` runs are this laptop and are never the measurement -- macOS has
+    no governor and no affinity control -- so they are labelled, not hidden.
+    """
+    groups: dict[tuple, dict] = {}
+    for t in list_traces():
+        m = _TRACE_NAME.match(t["name"])
+        if not m:
+            continue
+        # The filename prefix names the method for an incremental trace and
+        # the machine for the other two, which is not enough on its own: a
+        # step graph runs on the board as well as here. The environment block
+        # the run recorded is authoritative, because it read the machine it
+        # was actually on; the prefix is only the fallback for traces written
+        # before that existed.
+        prefix = m.group("where")
+        board = ((t.get("environment") or {}).get("board") or "")
+        if board:
+            where = "pi" if "raspberry" in board.lower() else "host"
+        else:
+            where = "pi" if prefix == "latency" else "host"
+        hop = int(m.group("hop"))
+        key = (where, m.group("model"), hop)
+        row = groups.setdefault(key, {
+            "model": m.group("model"), "where": where, "hop": hop,
+            # 2dp, not 1: hop 8 is 31.25 ms and rounding that to 31.2 would
+            # make the deadline the row is judged against slightly wrong.
+            "budget_ms": round(hop / TRACE_FS * 1000, 2),
+            "mtime": 0.0, "traces": [], "duty": None, "realtime": False,
+            "median_ms": None, "n_hops": None, "deadline_misses": None,
+            "verdict": None, "csv": False, "scores": None,
+            # Filled from the trace's own inference block; "windowed" is the
+            # fallback for traces written before it was recorded, which is
+            # what every one of them was.
+            "mode": "incremental" if prefix == "incremental" else "windowed",
+            "inference": None,
+        })
+        row["mtime"] = max(row["mtime"], t["mtime"])
+        row["traces"].append(t["name"])
+        if t.get("scores") and not row.get("scores"):
+            row["scores"] = {**t["scores"], "source": "trace"}
+        if t.get("inference") and not row.get("inference"):
+            row["inference"] = t["inference"]
+            row["mode"] = t["inference"].get("mode", row["mode"])
+        row["csv"] = row["csv"] or bool(t.get("csv"))
+        # A verdict from any of a run's traces describes the same run; prefer
+        # one that exists over the None of an older sibling.
+        row["verdict"] = row["verdict"] or t.get("verdict")
+
+        if m.group("extra") == "_duty":
+            if prefix == "incremental":
+                # A step graph has no hop to sweep, so a duty trace under its
+                # stem is not part of this measurement: it is a leftover from
+                # before the combination was refused, or from a run that used
+                # the same stem earlier. Merging it put "duty sweep · safe
+                # from hop 16" on rows whose run never swept anything.
+                continue
+            row["duty"] = {"best_hop": t.get("best_hop"), "n_rows": t.get("n_rows"),
+                           "hops": t.get("hops")}
+        elif m.group("extra") == "_realtime":
+            row["realtime"] = True
+        else:
+            row.update(median_ms=t.get("median_ms"), n_hops=t.get("n_hops"),
+                       deadline_misses=t.get("deadline_misses"))
+            # The per-hop trace is the measurement; its duty and realtime
+            # siblings are extras taken during the same run. ``traces`` is in
+            # whatever order the directory listing gave, so name the one a
+            # reader should be shown rather than leaving it to position.
+            row["primary"] = t["name"]
+
+    # Accuracy for the rows whose traces predate it being saved.
+    from_logs = _scores_from_logs()
+    for row in groups.values():
+        if row.get("scores"):
+            continue
+        for name in row["traces"]:
+            if name in from_logs:
+                row["scores"] = from_logs[name]
+                break
+
+    # What the model is, so the row reads as a measurement of something rather
+    # than of a filename.
+    models = {x["name"]: x for x in list_models()}
+    for row in groups.values():
+        mod = models.get(row["model"]) or {}
+        row.setdefault("primary", row["traces"][0] if row["traces"] else None)
+        row.update(variant=mod.get("variant"), artifact=mod.get("artifact"),
+                   params=mod.get("params"), master_seed=mod.get("master_seed"),
+                   known=bool(mod))
+        if row["median_ms"] is not None and row["budget_ms"]:
+            row["duty_cycle"] = round(row["median_ms"] / row["budget_ms"], 4)
+            row["realtime_ok"] = row["median_ms"] < row["budget_ms"]
+        else:
+            row["duty_cycle"] = None
+            row["realtime_ok"] = None
+
+    return sorted(groups.values(), key=lambda r: r["mtime"], reverse=True)
+
+
+def list_deploy_logs() -> list[dict]:
+    """
+    The Deploy tab's job logs, newest first.
+
+    A run that failed before it measured anything leaves one of these and no
+    trace, so counting them is how the Runs tab can say that a deploy was
+    attempted more often than it succeeded.
+    """
+    if not RUNS_DIR.is_dir():
+        return []
+    out = []
+    for f in sorted(RUNS_DIR.glob("gui_deploy_*.log")):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        out.append({"name": f.name, "mtime": st.st_mtime,
+                    "size_kb": round(st.st_size / 1024, 1)})
+    return sorted(out, key=lambda r: r["mtime"], reverse=True)
 
 
 def trace_path(name: str) -> Path:
@@ -418,6 +762,19 @@ def _testdata_name(spec: dict) -> str:
         raise FileNotFoundError(
             f"deploy/testdata/{name} does not exist — cut one with "
             "python -m deploy.make_testdata --artifact EOG --n 100")
+
+    # Checked here as well as in the page, because the page can be stale and
+    # the API can be called directly. raspi_infer refuses the same pair again
+    # on the board; this just saves a round trip to the Pi to find out.
+    #
+    # Only on the path that actually produces a number. A preview is read-only,
+    # and refusing it would replace the command text with an error the banner
+    # above it is already showing -- and hide the command from someone who
+    # means to copy it and add --allow-split-mismatch.
+    if spec.get("_enforce_split") and not spec.get("allow_split_mismatch"):
+        bad = split_mismatch((spec.get("model") or "").strip(), name)
+        if bad and bad["level"] == "error":
+            raise ValueError(bad["text"])
     return name
 
 
@@ -479,9 +836,18 @@ def _export_step(spec: dict) -> dict:
     ckpt = RUNS_DIR / run / "best.pt"
     if not ckpt.is_file():
         raise FileNotFoundError(f"runs/{run} has no best.pt — nothing to export")
-    # Said here rather than two minutes into the export: a *_bi twin needs the
-    # future, and the exporter refuses it for that reason.
-    if any(m["name"] == run and m["bidirectional"] for m in list_models()):
+    # Said here rather than two minutes into the export: a model that reads
+    # ahead is refused by the exporter, and the two kinds are refused for
+    # reasons worth telling apart.
+    blocked = next((m for m in list_models()
+                    if m["name"] == run and not m.get("exportable", not m["bidirectional"])), None)
+    if blocked and blocked.get("lookahead"):
+        raise ValueError(
+            f"{run} is a bounded-lookahead rung: it reads {blocked['lookahead']} samples past "
+            f"the one it emits ({1000 * blocked['lookahead'] / 256:.1f} ms), so the ONNX "
+            f"exporter refuses it. Running one online means delaying the output by that much, "
+            f"and no path here implements that yet")
+    if blocked:
         raise ValueError(f"{run} is non-causal (its attention or its convolutions see "
                          "ahead) — the ONNX exporter refuses it, and it could not be "
                          "run online anyway")
@@ -516,6 +882,14 @@ def build_steps(spec: dict) -> list[dict]:
     hop = _int(spec, "hop", 32, 1, MAX_HOP)
     every = _int(spec, "latency_every", 400, 0, 1_000_000)
     measure, duty = bool(spec.get("measure")), bool(spec.get("duty"))
+    incremental = bool(spec.get("incremental"))
+    if duty and incremental:
+        raise ValueError(
+            "the duty-cycle sweep and incremental inference measure different things and "
+            "cannot be combined: the sweep asks which hop size keeps up, and a step graph "
+            "has no hop — it emits on every sample, so its duty cycle is the single number "
+            "the latency run already reports. Sweep the windowed graph, or measure the step "
+            "graph on its own.")
     check_only = bool(spec.get("check_only"))
     extra = shlex.split(spec.get("extra_args") or "")
 
@@ -547,6 +921,18 @@ def build_steps(spec: dict) -> list[dict]:
         step = _export_step(spec)
         name = step.pop("name")
         steps.append(step)
+        if incremental:
+            # A separate artifact and a separate command: the step graph is a
+            # different signature, not a flag on the windowed one, and the Pi
+            # needs it specifically. Exported after, so a failure here leaves
+            # the windowed export standing.
+            step_export = _export_step(spec)
+            step_export.pop("name", None)
+            step_export["command"] = step_export["command"] + ["--incremental"]
+            step_export["label"] = "export the one-sample step graph"
+            step_export["note"] = ("state in, state out; verified against "
+                                   "models/incremental.py before it is written")
+            steps.append(step_export)
     else:
         name = _model_name(spec)
         # The model is a trained run that has never been exported.  Say which
@@ -564,6 +950,13 @@ def build_steps(spec: dict) -> list[dict]:
         if extra:
             raise ValueError("run_on_pi.sh takes no extra flags — the Pi run is "
                              "tuned with hop, threads and the sweep settings")
+        if (incremental and not spec.get("export")
+                and not (ARTIFACTS_DIR / f"{name}_step.onnx").is_file()):
+            raise FileNotFoundError(
+                f"deploy/artifacts/{name}_step.onnx does not exist. The Pi runs the step "
+                f"graph, not models/incremental.py (it has no torch), so the graph has to be "
+                f"exported first: python -m deploy.export_onnx --ckpt runs/{name}/best.pt "
+                f"--name {name} --incremental")
         ssh = (spec.get("ssh") or "").strip()
         if not ssh:
             raise ValueError("the Pi's address is needed, e.g. pi@raspberrypi.local")
@@ -577,7 +970,8 @@ def build_steps(spec: dict) -> list[dict]:
         governor = (spec.get("governor") or "").strip()
         if governor and not NAME_RE.match(governor):
             raise ValueError(f"not a governor name: {governor!r}")
-        env = {"REMOTE_DIR": remote, "TESTDATA": testdata, "HOP": str(hop),
+        env = {"INCREMENTAL": "1" if incremental else "",
+               "REMOTE_DIR": remote, "TESTDATA": testdata, "HOP": str(hop),
                "THREADS": str(threads), "LATENCY_EVERY": str(every),
                "REALTIME_S": str(realtime),
                "DUTY_HOPS": _hop_list(spec) if duty else "",
@@ -594,17 +988,41 @@ def build_steps(spec: dict) -> list[dict]:
             # run_on_pi.sh always benchmarks and scores the test set; the sweep
             # and the paced replay are the parts it switches on.
             "note": "environment check only, nothing is measured" if check_only else
-                    ("benchmark + test set + per-hop latency"
+                    (("one sample at a time, state in the graph — "
+                      if incremental else "")
+                     + "benchmark + test set + per-hop latency"
                      + (", duty-cycle sweep" if duty else "")
                      + (f", {realtime} s paced replay" if realtime else "")),
         })
         return steps
 
     # --- this machine ---
-    if not (measure or duty or steps):
+    if not (measure or duty or incremental or steps):
         raise ValueError("nothing to run — tick a measurement")
+
+    if incremental:
+        # On this machine either path is available, and they compute the same
+        # function: models/incremental.py is the reference the step graph was
+        # verified against. The torch one is used because it also reports the
+        # cache breakdown; the Pi runs the graph, which is the point of it.
+        ckpt = RUNS_DIR / name / "best.pt"
+        if not ckpt.is_file():
+            raise FileNotFoundError(
+                f"runs/{name}/best.pt does not exist — incremental inference runs the trained "
+                f"checkpoint in torch, not the exported graph")
+        steps.append({
+            "label": "incremental inference on this machine (PyTorch, one sample at a time)",
+            "command": [sys.executable, "-m", "deploy.bench_incremental",
+                        "--ckpt", f"runs/{name}/best.pt",
+                        "--hops", str(hop), "--threads", str(threads), "--trace",
+                        *(["--no-preflight"] if not require_locked else [])],
+            "env": lock_env,
+            "note": "per-sample cost and the real KV cache, against the windowed path at "
+                    f"hop {hop}; PyTorch, so it cannot run on the Pi",
+        })
+
     if not (measure or duty):
-        return steps                                   # export on its own
+        return steps                                   # export / incremental on their own
     testdata = _testdata_name(spec)
     if not spec.get("export") and not (ARTIFACTS_DIR / f"{name}.onnx").is_file():
         raise FileNotFoundError(

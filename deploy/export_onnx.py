@@ -97,9 +97,19 @@ def infer_arch_from_state_dict(sd: dict) -> dict:
     hidden = sd[first_conv].shape[0]
     cfg["hidden_channels"] = int(hidden)
 
+    # The SE gate is visible in the weights: a tcn_se checkpoint carries
+    # se.fc1/se.fc2 that a plain tcn does not. Without this it would be read
+    # back as "tcn", and the strict load would fail on the extra keys -- or
+    # worse, a future non-strict path would quietly drop the gate.
+    se_key = next((k for k in sd if k.endswith("se.fc1.weight")), None)
+    if se_key is not None:
+        # (C/r, C, 1): the squeeze ratio is the shape, not a stored number.
+        hidden_se, chans = sd[se_key].shape[0], sd[se_key].shape[1]
+        cfg["se_reduction"] = max(1, int(round(chans / hidden_se)))
+
     block_ids = {int(k.split(".")[2]) for k in sd if k.startswith("decoder.blocks.")}
     if not block_ids:
-        cfg["variant"] = "tcn"
+        cfg["variant"] = "tcn_se" if se_key is not None else "tcn"
         return cfg
     cfg["n_attn_layers"] = max(block_ids) + 1
 
@@ -157,8 +167,12 @@ def load_checkpoint_model(ckpt_path: str | Path, config_path: str | Path | None 
         n_heads if n_heads is not None
         else stored.get("n_heads", yaml_cfg.get("n_heads", DEFAULT_N_HEADS))
     )
-    if arch["variant"] == "tcn":
-        arch.pop("n_heads")
+    # Attention-free variants take no head count. Keyed on whether the weights
+    # showed an attention decoder, not on the name being exactly "tcn": tcn_se
+    # is also attention-free and would otherwise be handed an argument its
+    # constructor does not accept.
+    if "n_attn_layers" not in arch:
+        arch.pop("n_heads", None)
 
     # Sanity: anything the checkpoint claims about itself must agree with the weights.
     # The weights can only reveal the base architecture, so a rank alias such as
@@ -204,6 +218,61 @@ def _prepare_for_export(model: torch.nn.Module) -> None:
         if isinstance(m, (CausalMHA, CausalMLA)):
             m.turboquant = None
             m.capture_weights(False)
+
+
+def export_step_to_onnx(model: torch.nn.Module, onnx_path: str | Path,
+                        opset: int = DEFAULT_OPSET) -> dict:
+    """
+    Export one incremental step: ``(x_t, state...) -> (y_t, new_state...)``.
+
+    The windowed export recomputes a whole 512-sample window per call and
+    carries no state, which is why its sidecar has to say "the graph has no
+    KV cache".  This one declares the cache as graph inputs and outputs, so
+    onnxruntime allocates it on the board and the compression MLA was chosen
+    for is finally a property of something running rather than an estimate.
+
+    Exported through the TorchScript path rather than dynamo: the step is
+    twenty-odd state tensors in and out, and the older exporter handles that
+    signature without the dynamic-shape bookkeeping the new one wants for a
+    graph that has no dynamic shapes at all.
+
+    Verified against ``models/incremental.py`` by the caller, which is itself
+    pinned to the batch model -- so a step graph is never trusted because it
+    exported cleanly.
+    """
+    import onnx
+    from models.step_graph import StepGraph
+
+    onnx_path = Path(onnx_path)
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    _prepare_for_export(model)
+
+    graph = StepGraph(model).eval()
+    spec = graph.state_spec
+    state = graph.initial_state(1)
+    names = [s["name"] for s in spec]
+
+    with torch.no_grad():
+        torch.onnx.export(
+            graph, (torch.zeros(1, 1, 1), *state), str(onnx_path),
+            input_names=["x_t", *names],
+            output_names=["y_t", *(f"{n}_out" for n in names)],
+            opset_version=opset, dynamo=False, verbose=False)
+
+    loaded = onnx.load(str(onnx_path))
+    return {
+        "opset": opset,
+        "exporter": "torchscript",
+        "mode": "incremental",
+        "n_nodes": len(loaded.graph.node),
+        "file_size_kb": round(onnx_path.stat().st_size / 1024, 1),
+        "window": graph.window,
+        "topology": graph.topology,
+        "state": spec,
+        "state_tensors": len(spec),
+        "state_floats": int(sum(int(torch.tensor(s["shape"]).prod()) for s in spec)),
+        "mask_fill": __import__("models.step_graph", fromlist=["MASK_FILL"]).MASK_FILL,
+    }
 
 
 def export_to_onnx(model: torch.nn.Module, onnx_path: str | Path, seq_len: int = 512,
@@ -406,12 +475,85 @@ def evaluate_backends(backends: dict, data_dir: str, artifact: str = "EOG",
 # ============================================================
 # 4. One-call pipeline + CLI
 # ============================================================
+def _export_step_checkpoint(model, arch, raw, ckpt, out_dir, name, artifact, opset,
+                            trained_artifact):
+    """
+    The incremental export, and the check that it is the same function.
+
+    A step graph is verified against ``models/incremental.py`` rather than
+    against the batch model directly: that wrapper is already pinned to the
+    batch pass from both ends, so it is the stricter oracle, and it is the
+    thing this graph is supposed to be a port of.  Both warmup and the steady
+    state are covered -- the run is longer than the attention window, so the
+    validity mask is exercised filling up and full.
+    """
+    import numpy as np
+    import onnxruntime
+    from models.incremental import IncrementalModel
+    from models.step_graph import StepGraph
+
+    path = out_dir / f"{name}_step.onnx"
+    info = export_step_to_onnx(model, path, opset)
+    print(f"[export] wrote {path}  ({info['file_size_kb']} KB, {info['n_nodes']} nodes, "
+          f"{info['state_tensors']} state tensors, {info['state_floats']:,} floats of state)")
+
+    print("[verify] onnxruntime step loop vs models/incremental.py ...")
+    torch.manual_seed(0)
+    probe = torch.randn(int(info["window"]) + 128 if info["window"] else 400)
+    reference = IncrementalModel(model).run(probe).numpy()
+
+    sess = onnxruntime.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    in_names = [i.name for i in sess.get_inputs()]
+    state = {n: t.numpy() for n, t in zip(in_names[1:], StepGraph(model).initial_state(1))}
+    got = np.empty(len(probe), dtype=np.float32)
+    for t in range(len(probe)):
+        out = sess.run(None, {"x_t": probe[t].view(1, 1, 1).numpy(), **state})
+        got[t] = out[0].reshape(())
+        state = dict(zip(in_names[1:], out[1:]))
+    max_diff = float(np.abs(reference - got).max())
+    print(f"         max|onnx-incremental| = {max_diff:.2e} over {len(probe)} steps")
+    if max_diff > 1e-3:
+        raise ValueError(
+            f"the exported step graph does not reproduce models/incremental.py "
+            f"(max|diff| = {max_diff:.2e}); refusing to ship a graph that computes "
+            f"something else")
+
+    sidecar = {
+        "model": {"checkpoint": str(ckpt), "epoch": raw.get("epoch"),
+                  "val_loss": raw.get("val_loss"), **arch,
+                  "n_params": sum(p.numel() for p in model.parameters())},
+        "export": {**info, "torch": torch.__version__},
+        "io": {"input": {"name": "x_t", "shape": [1, 1, 1], "dtype": "float32"},
+               "output": {"name": "y_t", "shape": [1, 1, 1], "dtype": "float32"},
+               "state": info["state"]},
+        "provenance": {
+            "trained_master_seed": (raw.get("run_config") or {}).get("master_seed"),
+            "trained_artifact": trained_artifact or artifact,
+        },
+        "preprocessing": {
+            "sample_rate_hz": SAMPLE_RATE_HZ,
+            "window_samples": info["window"],
+            "artifact_trained_on": artifact,
+            "normalise": "x_in = x / sigma; x_out = y * sigma, with sigma per epoch for "
+                         "scoring and a running or calibrated value for a live stream",
+            "causal": True,
+            "streaming": "feed one sample and the state; keep the output and the new state",
+        },
+        "verification": {"max_abs_diff_vs_incremental": max_diff, "n_steps": len(probe)},
+    }
+    json_path = out_dir / f"{name}_step.json"
+    json_path.write_text(json.dumps(sidecar, indent=2))
+    print(f"[export] wrote {json_path}")
+    return sidecar
+
+
 def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "deploy" / "artifacts",
                       name: str | None = None, config: str | None = None, n_heads: int | None = None,
                       seq_len: int | None = None, opset: int = DEFAULT_OPSET, dynamic_batch: bool = True,
                       data_dir: str | None = None, artifact: str = "EOG",
                       master_seed: int = 42,
-                      max_batches: int | None = None) -> dict:
+                      max_batches: int | None = None,
+                      incremental: bool = False) -> dict:
     """
     Checkpoint -> verified ONNX -> sidecar JSON.
     Returns the sidecar dict.  This is the function to call from other code.
@@ -425,9 +567,25 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
     model, arch, raw = load_checkpoint_model(ckpt, config, n_heads)
     seq_len = seq_len or arch.get("max_seq_len", 512)
 
+    # What the model was actually trained on beats what the command line said.
+    # --artifact only ever chose the verification batch, but its value was
+    # written into the sidecar as "artifact_trained_on", so exporting a BOTH
+    # model without the flag stamped it "EOG" and nothing noticed. The
+    # checkpoint knows; ask it, and say so when the two disagree.
+    trained_artifact = (raw.get("run_config") or {}).get("artifact")
+    if trained_artifact and trained_artifact != artifact:
+        print(f"[export] checkpoint was trained on {trained_artifact}, not the --artifact "
+              f"{artifact} given; using {trained_artifact} for the sidecar and the "
+              f"verification batch")
+        artifact = trained_artifact
+
     print(f"[export] checkpoint : {ckpt}  (epoch {raw.get('epoch', '?')}, val_loss {raw.get('val_loss', float('nan')):.4f})")
     print(f"[export] architecture: {arch}")
     print(f"[export] params      : {sum(p.numel() for p in model.parameters()):,}")
+
+    if incremental:
+        return _export_step_checkpoint(model, arch, raw, ckpt, out_dir, name,
+                                       artifact, opset, trained_artifact)
 
     fp32_path = out_dir / f"{name}.onnx"
     export_info = export_to_onnx(model, fp32_path, seq_len, opset, dynamic_batch)
@@ -447,6 +605,18 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
                    "torch": torch.__version__, "onnx": onnx.__version__, "onnxruntime": onnxruntime.__version__},
         "io": {"input": {"name": INPUT_NAME, "shape": ["batch" if dynamic_batch else 1, 1, seq_len], "dtype": "float32"},
                "output": {"name": OUTPUT_NAME, "shape": ["batch" if dynamic_batch else 1, 1, seq_len], "dtype": "float32"}},
+        # What split this model was fitted on. The scorer compares it against the
+        # provenance stamped into a test set, because "test" is only test
+        # relative to a seed: EEGDenoiseDataset permutes by master_seed, so a set
+        # cut at 42 is training data for a run trained at 67. Taken from the
+        # checkpoint's own run_config, not from the CLI --master_seed (which
+        # only picks the verification batch) and not from the run's name.
+        "provenance": {
+            "trained_master_seed": (raw.get("run_config") or {}).get("master_seed"),
+            "trained_artifact": (raw.get("run_config") or {}).get("artifact"),
+            "note": "null means the run predates run_config; a test set cannot be "
+                    "checked against it and is scored with a warning",
+        },
         "preprocessing": {
             "sample_rate_hz": SAMPLE_RATE_HZ,
             "window_samples": seq_len,
@@ -485,6 +655,10 @@ def main(argv=None):
     p.add_argument("--static_batch", action="store_true", help="fix batch=1 instead of a dynamic batch axis")
     p.add_argument("--data_dir", default=None, help="EEGdenoiseNet .npy dir; enables test-set metrics")
     p.add_argument("--artifact", default="EOG", choices=["EOG", "EMG", "BOTH"])
+    p.add_argument("--incremental", action="store_true",
+                   help="export the one-sample step graph instead: state in, state out, "
+                        "a real KV cache. Runs on the Pi with onnxruntime alone, and is the "
+                        "only exported form whose cache size is a property of the graph.")
     p.add_argument("--max_batches", type=int, default=None, help="limit test batches for a quick check")
     p.add_argument("--master_seed", type=int, default=42,
                    help="the split the test metrics are measured on; it must be the seed "
@@ -495,7 +669,8 @@ def main(argv=None):
     # of the signature would otherwise silently shift what follows it.
     export_checkpoint(a.ckpt, a.out_dir, a.name, a.config, a.n_heads, a.seq_len, a.opset,
                       not a.static_batch, data_dir=a.data_dir, artifact=a.artifact,
-                      master_seed=a.master_seed, max_batches=a.max_batches)
+                      master_seed=a.master_seed, max_batches=a.max_batches,
+                      incremental=a.incremental)
 
 
 if __name__ == "__main__":

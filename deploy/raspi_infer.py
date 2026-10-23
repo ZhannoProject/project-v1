@@ -62,6 +62,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -76,6 +77,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import preflight                                                 # noqa: E402
 
 EPS = 1e-8
+#: The rate the epochs were cut at. Only a fallback: a sidecar that records
+#: its own sample_rate_hz wins, because the model is what decides it.
+SAMPLE_RATE_HZ = 256
 
 
 class EEGDenoiser:
@@ -140,7 +144,8 @@ class EEGDenoiser:
 
         sidecar = onnx_path.with_suffix(".json")
         self.meta = json.loads(sidecar.read_text()) if sidecar.exists() else {}
-        self.sample_rate = self.meta.get("preprocessing", {}).get("sample_rate_hz", 256)
+        self.sample_rate = self.meta.get("preprocessing", {}).get("sample_rate_hz",
+                                                                   SAMPLE_RATE_HZ)
 
         self.last_run_s = 0.0        # wall time of the most recent sess.run (read by LatencyMonitor)
 
@@ -191,6 +196,148 @@ class EEGDenoiser:
         return out
 
 
+class IncrementalDenoiser:
+    """
+    The step graph, driven one sample at a time with numpy and onnxruntime.
+
+    ``EEGDenoiser`` above runs the windowed export: a whole 512-sample window
+    per call, no state, so each hop recomputes everything and the KV cache
+    MLA was chosen for does not exist on the board at all.  This runs
+    ``<model>_step.onnx``, which declares its state as graph inputs and hands
+    it back as outputs.  The cache is then a tensor onnxruntime allocates
+    here, and its size is a property of the model rather than an estimate
+    made about it on a laptop.
+
+    No torch: the state buffers are read straight off the graph's own input
+    shapes, so this needs nothing the Pi does not already have.
+
+    What it buys is latency, not throughput.  A windowed run at hop 32 emits
+    nothing until 32 samples have arrived -- 125 ms at 256 Hz -- and divides
+    one call across all of them. This emits on every sample, and pays a whole
+    graph call to do it. At hop 32 the windowed path is therefore the cheaper
+    one; the step graph wins as the hop shrinks, and at a hop of one sample it
+    is the only one that keeps up.
+    """
+
+    def __init__(self, onnx_path: str | Path, n_threads: int = 2, spin: bool = True):
+        onnx_path = Path(onnx_path)
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = int(n_threads)
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "1" if spin else "0")
+        self.sess = ort.InferenceSession(str(onnx_path), opts,
+                                         providers=["CPUExecutionProvider"])
+        self.threads = {"intra_op": int(n_threads), "workers": max(0, int(n_threads) - 1),
+                        "allow_spinning": bool(spin)}
+
+        inputs = self.sess.get_inputs()
+        self.x_name = inputs[0].name
+        self.state_names = [i.name for i in inputs[1:]]
+        self.state_shapes = [tuple(i.shape) for i in inputs[1:]]
+        self.out_names = [o.name for o in self.sess.get_outputs()]
+
+        sidecar = onnx_path.with_suffix(".json")
+        self.meta = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+        self.sample_rate = ((self.meta.get("preprocessing") or {}).get("sample_rate_hz")
+                            or SAMPLE_RATE_HZ)
+        self.window = int((self.meta.get("preprocessing") or {}).get("window_samples") or 0)
+        self.last_run_s = 0.0
+
+        # The mask starts fully closed: no position is valid until the stream
+        # has fed one. Matching models/incremental.py exactly, which slices
+        # its ring to what it has written.
+        self.mask_fill = float(((self.meta.get("export") or {}).get("mask_fill")) or -1e9)
+
+    # -- state ------------------------------------------------
+    def initial_state(self) -> dict:
+        """Zeroed buffers and a closed mask, named as the graph expects them."""
+        state = {}
+        for name, shape in zip(self.state_names, self.state_shapes):
+            fill = self.mask_fill if name.startswith("attn_mask") else 0.0
+            state[name] = np.full(shape, fill, dtype=np.float32)
+        return state
+
+    def state_bytes(self) -> int:
+        return int(sum(np.prod(s) for s in self.state_shapes)) * 4
+
+    def state_summary(self) -> dict:
+        """
+        What the graph carries between steps, split by what it is.
+
+        The KV half is the part MLA shrinks; the convolution half is the same
+        in every variant and does not, so an embedded budget needs both
+        numbers rather than the ratio of the first one alone.
+        """
+        kv = conv = 0
+        window = max(1, self.window)
+        for name, shape in zip(self.state_names, self.state_shapes):
+            n = int(np.prod(shape))
+            if name.startswith("kv_"):
+                kv += n
+            elif not name.startswith("attn_mask"):
+                conv += n
+        return {"kv_floats_per_step": kv // window if kv else 0,
+                "kv_cache_bytes": kv * 4,
+                "conv_state_bytes": conv * 4,
+                "total_state_bytes": self.state_bytes(),
+                "state_tensors": len(self.state_names)}
+
+    # -- stepping ---------------------------------------------
+    def step(self, x_t: float, state: dict) -> tuple[float, dict]:
+        """One sample in, one sample out, and the state that follows it."""
+        feed = {self.x_name: np.array([[[x_t]]], dtype=np.float32), **state}
+        t0 = time.perf_counter()
+        out = self.sess.run(None, feed)
+        self.last_run_s = time.perf_counter() - t0
+        return float(out[0].reshape(())), dict(zip(self.state_names, out[1:]))
+
+    def denoise_epochs(self, x: np.ndarray, monitor: "LatencyMonitor | None" = None) -> np.ndarray:
+        """
+        ``(N, T)`` raw-scale epochs -> the same, denoised.
+
+        The state is reset per epoch because the epochs are independent 2 s
+        segments: carrying state across them would feed one recording's
+        history into another's first samples. That is also what makes this
+        directly comparable with the windowed path's epoch mode.
+        """
+        x = np.asarray(x, dtype=np.float32)
+        single = x.ndim == 1
+        x = x.reshape(1, -1) if single else x
+        out = np.empty_like(x)
+        for e in range(x.shape[0]):
+            sigma = max(float(x[e].std()), EPS)
+            state = self.initial_state()
+            for t in range(x.shape[1]):
+                t0 = time.perf_counter()
+                y, state = self.step(float(x[e, t]) / sigma, state)
+                if monitor is not None:
+                    monitor.record_hop(self.last_run_s, time.perf_counter() - t0)
+                out[e, t] = y * sigma
+        return out.reshape(-1) if single else out
+
+    def denoise_stream(self, signal: np.ndarray, sigma: float | None = None,
+                       monitor: "LatencyMonitor | None" = None) -> np.ndarray:
+        """
+        A continuous 1-D signal, one sample at a time.
+
+        ``sigma`` is the caller's: a live stream has no future to take a
+        standard deviation over, so it has to carry a running or calibrated
+        one. Defaulting to the whole signal's is an offline convenience and
+        is not what a deployed system could do.
+        """
+        signal = np.asarray(signal, dtype=np.float32).reshape(-1)
+        if sigma is None:
+            sigma = max(float(signal.std()), EPS)
+        state = self.initial_state()
+        out = np.empty_like(signal)
+        for t in range(signal.shape[0]):
+            t0 = time.perf_counter()
+            y, state = self.step(float(signal[t]) / sigma, state)
+            if monitor is not None:
+                monitor.record_hop(self.last_run_s, time.perf_counter() - t0)
+            out[t] = y * sigma
+        return out
+
+
 class LatencyMonitor:
     """
     Per-hop latency recorder for the streaming path -- what a live BCI loop
@@ -216,13 +363,35 @@ class LatencyMonitor:
 
     def __init__(self, hop: int, sample_rate: float, report_every: int = 0,
                  window: int = 64, label: str = "latency",
-                 environment: dict | None = None):
+                 environment: dict | None = None, model_window: int | None = None,
+                 mode: str = "windowed", kv_cache: bool | None = None,
+                 state: dict | None = None):
+        self.mode = mode
+        # Whether this model carries a KV cache at all. The baseline has
+        # convolution state and no attention, so "incremental" must not be
+        # taken to imply one -- the whole point of recording it is that the
+        # cache is the thing being claimed.
+        self.kv_cache = kv_cache
+        # How big that cache actually is, read off the graph's own state
+        # tensors. This is the MLA claim's number, and the board is where it
+        # is worth having: measured here, not computed about the model
+        # somewhere else.
+        self.state = state
         self.hop, self.fs = int(hop), float(sample_rate)
+        # The model's window, as distinct from ``window`` above, which is the
+        # rolling size of the printed average. Recorded so the trace can say
+        # how the numbers were produced.
+        self.model_window = None if model_window is None else int(model_window)
         self.budget_ms = 1e3 * self.hop / self.fs
         self.report_every, self.window, self.label = int(report_every), int(window), label
         # The state of the machine these numbers were taken on, so the trace
         # file carries the conditions and not only the result.
         self.environment = environment
+        # What the model scored on the test set during this same run. Latency
+        # and accuracy are two halves of one measurement -- "15 ms a hop" only
+        # means something next to what the model got for it -- and they were
+        # being printed and dropped while the timings were saved.
+        self.scores: dict | None = None
         self.infer_ms: list[float] = []
         self.total_ms: list[float] = []
         self.t_s: list[float] = []
@@ -321,8 +490,32 @@ class LatencyMonitor:
         if n and not np.all(np.isnan(temps)):
             s["temp_c"] = {"start": round(float(temps[0]), 1), "end": round(float(temps[-1]), 1),
                            "max": round(float(np.nanmax(temps)), 1)}
+        # How these milliseconds were produced, not only what they were. The
+        # environment block exists so a latency figure cannot be separated
+        # from the machine; this is the same argument for the algorithm.
+        # Without it a reader has to know which files reach the board to work
+        # out that this is the hop-and-recompute path and not a cached one.
+        incremental = self.mode == "incremental"
+        s["inference"] = {
+            "mode": self.mode,
+            "runtime": "onnxruntime",
+            "window": self.model_window,
+            "hop": self.hop,
+            "kv_cache": (self.kv_cache if self.kv_cache is not None else False),
+            **(self.state or {}),
+            "recompute_factor": (1.0 if incremental else
+                                 (round(self.model_window / self.hop, 2)
+                                  if self.model_window and self.hop else None)),
+            "note": ("one sample per call, state carried in and out of the graph; nothing "
+                     "is recomputed and the KV cache is a tensor onnxruntime allocates"
+                     if incremental else
+                     "each hop re-runs the whole window; the exported graph has no cache "
+                     "inputs or outputs, so no state carries between calls"),
+        }
         if self.environment is not None:
             s["environment"] = self.environment
+        if self.scores is not None:
+            s["scores"] = self.scores
         return s
 
     def print_summary(self) -> dict:
@@ -558,41 +751,207 @@ def metrics(pred, clean):
             "acc": acc(pred, clean)}
 
 
+#: Filenames deploy/make_testdata.py writes: <ARTIFACT>_test<N>[_s<SEED>].npz
+_TESTDATA_NAME = re.compile(r"^(EOG|EMG|BOTH)_test(\d+)(?:_s(\d+))?\.npz$")
+
+
+def testdata_provenance(npz_path: str | Path, data=None) -> dict:
+    """
+    Which split a test set was cut from, and how confidently that is known.
+
+    ``source`` is ``"recorded"`` when the arrays carry it (make_testdata stamps
+    ``master_seed`` / ``artifact`` / ``split`` into the file), ``"filename"``
+    when it had to be read off the name, and ``"unknown"`` when neither works.
+    Only ``recorded`` is a guarantee: a name is a convention, and renaming a
+    file changes what it claims without changing what it holds.
+    """
+    path = Path(npz_path)
+    data = np.load(path) if data is None else data
+    keys = set(getattr(data, "files", []) or data.keys())
+
+    if "master_seed" in keys:
+        return {"source": "recorded",
+                "master_seed": int(data["master_seed"]),
+                "artifact": str(data["artifact"]) if "artifact" in keys else None,
+                "split": str(data["split"]) if "split" in keys else "test"}
+
+    m = _TESTDATA_NAME.match(path.name)
+    if m:
+        # No suffix means the default seed, which is the convention
+        # make_testdata writes under.
+        return {"source": "filename", "artifact": m.group(1),
+                "master_seed": int(m.group(3)) if m.group(3) else 42, "split": "test"}
+    return {"source": "unknown", "artifact": None, "master_seed": None, "split": None}
+
+
+def check_split(meta: dict, prov: dict, *, strict: bool = True) -> list[str]:
+    """
+    Refuse to score a model on epochs it may have trained on.
+
+    "Test set" is not a property of a file on its own.  ``EEGDenoiseDataset``
+    permutes the epoch pool with ``master_seed`` and slices train/val/test out
+    of that permutation, so a set cut at seed 42 is 70% *training data* for a
+    run trained at seed 67.  Scoring across that boundary does not fail, warn,
+    or look odd — it quietly returns a better number than the model earns,
+    which is the worst way for a measurement to be wrong.
+
+    Returns the problems found.  With ``strict`` a seed mismatch raises, since
+    the resulting figure is not a test score at all; everything else is
+    reported and left to the caller, because a deliberate cross-artifact probe
+    is a legitimate thing to run.
+    """
+    problems, warnings = [], []
+    model = (meta or {}).get("provenance") or {}
+    trained_seed = model.get("trained_master_seed")
+    trained_artifact = (model.get("trained_artifact")
+                        or ((meta or {}).get("preprocessing") or {}).get("artifact_trained_on"))
+
+    if prov["split"] not in (None, "test"):
+        problems.append(f"this file is the '{prov['split']}' split, not the test split")
+
+    if prov["master_seed"] is None or trained_seed is None:
+        why = ("the model's checkpoint predates run_config, so the seed it trained at was not recorded"
+               if trained_seed is None else
+               f"{Path(prov.get('path', 'the test set')).name} carries no provenance")
+        warnings.append(f"cannot verify the split: {why}. If the two seeds differ, "
+                        f"these epochs are the model's training data and the score is meaningless.")
+    elif int(prov["master_seed"]) != int(trained_seed):
+        problems.append(
+            f"LEAK: the test set was cut from the master_seed {prov['master_seed']} split, but this "
+            f"model was trained at master_seed {trained_seed}. The splits are different permutations "
+            f"of the same pool, so most of these epochs are in that model's training set and the "
+            f"score would be inflated. Cut a matching set with: python -m deploy.make_testdata "
+            f"--artifact {prov['artifact'] or 'EOG'} --master_seed {trained_seed}")
+
+    if prov["artifact"] and trained_artifact and prov["artifact"] != trained_artifact:
+        warnings.append(f"the model was trained on {trained_artifact} but this set is "
+                        f"{prov['artifact']} — a cross-artifact probe, not a like-for-like score")
+
+    if prov["source"] == "filename":
+        warnings.append(f"split read from the filename, not from the file — rename it and this "
+                        f"check is wrong. Re-cut it to stamp the provenance in.")
+
+    for w in warnings:
+        print(f"[test] WARNING: {w}")
+    if problems:
+        joined = "\n       ".join(problems)
+        if strict:
+            raise ValueError(f"refusing to score this pair:\n       {joined}\n       "
+                             f"pass --allow-split-mismatch to score it anyway")
+        for x in problems:
+            print(f"[test] WARNING (forced): {x}")
+    return problems + warnings
+
+
 def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_snr: bool = True,
-                      monitor: LatencyMonitor | None = None) -> dict:
+                      monitor: LatencyMonitor | None = None, strict_split: bool = True) -> dict:
     data = np.load(npz_path)
+    # Before anything is scored: are these epochs this model has never seen?
+    prov = testdata_provenance(npz_path, data)
+    prov["path"] = str(npz_path)
+    check_split(d.meta, prov, strict=strict_split)
     noisy, clean, snr = data["noisy"], data["clean"], data["snr_db"]
     n, T = noisy.shape
-    if T != d.window:
+    stepping = isinstance(d, IncrementalDenoiser)
+    if not stepping and T != d.window:
+        # The windowed graph's input is a fixed 512 wide, so an epoch of any
+        # other length cannot be fed to it at all. A step graph takes one
+        # sample at a time and will consume an epoch of any length -- its
+        # ``window`` is how far back an output reaches, not a required shape.
         raise ValueError(f"test data has {T}-sample epochs but the model window is {d.window}")
+    if stepping and T < d.window:
+        print(f"[test] note: {T}-sample epochs are shorter than this model's {d.window}-sample "
+              f"history, so no output in them sees a full receptive field")
 
     t0 = time.perf_counter()
-    y_epoch = d.denoise_epochs(noisy)
+    y_epoch = d.denoise_epochs(noisy) if not stepping else d.denoise_epochs(noisy, monitor)
     t_epoch = time.perf_counter() - t0
-    t0 = time.perf_counter()
-    y_stream = d.denoise_stream(noisy.reshape(-1), hop, monitor).reshape(n, T)
-    t_stream = time.perf_counter() - t0
 
-    modes = {"noisy input (no model)": noisy, "epoch mode": y_epoch, f"stream mode (hop {hop})": y_stream}
+    if stepping:
+        # There is no second mode to compare: a step graph emits on every
+        # sample, so "epoch mode" and "stream mode" are the same computation.
+        # Reporting a separate stream row would be the same numbers twice.
+        #
+        # Named for what produced it. The windowed path's "epoch mode" is one
+        # batched 512-wide forward per epoch; this never does that, it steps a
+        # sample at a time and resets its state between epochs. The scoring
+        # protocol is the same -- independent epochs, each normalised by its
+        # own sigma -- which is what keeps the two numbers comparable, and the
+        # suffix is there so the mechanism is not read off the label wrongly.
+        t_stream = 0.0
+        modes = {"noisy input (no model)": noisy, "epoch mode (stepped)": y_epoch}
+    else:
+        t0 = time.perf_counter()
+        y_stream = d.denoise_stream(noisy.reshape(-1), hop, monitor).reshape(n, T)
+        t_stream = time.perf_counter() - t0
+        modes = {"noisy input (no model)": noisy, "epoch mode": y_epoch,
+                 f"stream mode (hop {hop})": y_stream}
     results = {name: metrics(y, clean) for name, y in modes.items()}
 
-    print(f"[test] {Path(npz_path).name}: {n} epochs x {T} samples, SNR {snr.min():+.1f}..{snr.max():+.1f} dB")
+    print(f"[test] {Path(npz_path).name}: {n} epochs x {T} samples, SNR {snr.min():+.1f}..{snr.max():+.1f} dB"
+          + (f", {prov['artifact']} test split at master_seed {prov['master_seed']}"
+             f" ({prov['source']})" if prov["master_seed"] is not None else ""))
     print(f"       {'':<26s} {'RRMSE_t':>8s} {'RRMSE_f':>8s} {'CC':>7s}")
     for name, m in results.items():
         print(f"       {name:<26s} {m['rrmse_t'].mean():8.4f} {m['rrmse_s'].mean():8.4f} {m['acc'].mean():7.4f}")
-    print(f"       epoch mode: {1e3 * t_epoch / n:.2f} ms/epoch (batched)   "
-          f"stream mode: {1e3 * t_stream / (n * T / hop):.2f} ms/hop, {t_stream:.2f} s for {n * T / d.sample_rate:.0f} s of signal")
-    print("       note: the stream row concatenates independent epochs, so every window straddles two unrelated "
-          "signals at different scales; it is a pessimistic bound, not what a continuous recording would give.")
+    if stepping:
+        print(f"       stepped {n * T:,} samples in {t_epoch:.2f} s "
+              f"({1e3 * t_epoch / (n * T):.3f} ms/sample, "
+              f"{n * T / d.sample_rate:.0f} s of signal); state reset per epoch")
+    else:
+        print(f"       epoch mode: {1e3 * t_epoch / n:.2f} ms/epoch (batched)   "
+              f"stream mode: {1e3 * t_stream / (n * T / hop):.2f} ms/hop, {t_stream:.2f} s for {n * T / d.sample_rate:.0f} s of signal")
+        print("       note: the stream row concatenates independent epochs, so every window straddles two unrelated "
+              "signals at different scales; it is a pessimistic bound, not what a continuous recording would give.")
 
     if per_snr:
-        m = results["epoch mode"]
-        print(f"       per SNR (epoch mode):  {'SNR dB':>7s} {'n':>3s} {'RRMSE_t':>8s} {'RRMSE_f':>8s} {'CC':>7s}")
+        # Whichever epoch row this run produced: "epoch mode" from the
+        # windowed path, "epoch mode (stepped)" from the step graph.
+        epoch_label = next(k for k in results if k.startswith("epoch mode"))
+        m = results[epoch_label]
+        print(f"       per SNR ({epoch_label}):  {'SNR dB':>7s} {'n':>3s} "
+              f"{'RRMSE_t':>8s} {'RRMSE_f':>8s} {'CC':>7s}")
         for level in np.unique(np.round(snr, 2)):
             sel = np.isclose(np.round(snr, 2), level)
             print(f"       {'':<22s} {level:+7.1f} {sel.sum():3d} {m['rrmse_t'][sel].mean():8.4f} "
                   f"{m['rrmse_s'][sel].mean():8.4f} {m['acc'][sel].mean():7.4f}")
-    return {name: {k: float(v.mean()) for k, v in m.items()} for name, m in results.items()}
+    return {
+        "testdata": Path(npz_path).name,
+        "n_epochs": int(n),
+        "hop": int(hop),
+        "split": {k: prov.get(k) for k in ("artifact", "master_seed", "source")},
+        "modes": {name: {k: float(v.mean()) for k, v in m.items()}
+                  for name, m in results.items()},
+    }
+
+
+def benchmark_steps(d: "IncrementalDenoiser", n_iter: int = 2000) -> dict:
+    """
+    Time one step of the incremental graph, warmed up.
+
+    The state is advanced for a while first: a step graph's cost is flat in
+    how full its cache is (every call attends over the whole window, masked),
+    but the allocator and the thread pool are not warm on the first calls and
+    reporting those as the cost would be unfair to it.
+    """
+    state = d.initial_state()
+    for _ in range(min(200, n_iter // 4)):
+        _, state = d.step(0.0, state)
+    times = []
+    for _ in range(n_iter):
+        t0 = time.perf_counter()
+        _, state = d.step(0.0, state)
+        times.append((time.perf_counter() - t0) * 1e3)
+    t = np.asarray(times)
+    budget = 1e3 / d.sample_rate
+    med = float(np.median(t))
+    return {"n_iter": n_iter, "median_ms": round(med, 4),
+            "p95_ms": round(float(np.percentile(t, 95)), 4),
+            "max_ms": round(float(t.max()), 4),
+            "budget_ms": round(budget, 3), "sample_rate_hz": d.sample_rate,
+            "realtime_headroom_x": round(budget / med, 1) if med else None,
+            "max_fs_hz": round(1e3 / med, 1) if med else None,
+            "state_bytes": d.state_bytes()}
 
 
 def benchmark(d: EEGDenoiser, n_iter: int = 200, hop: int = 32) -> dict:
@@ -624,6 +983,14 @@ def main(argv=None):
     p.add_argument("--threads", type=int, default=2, help="onnxruntime intra-op threads (2 is best on a Pi 5)")
     p.add_argument("--benchmark", action="store_true")
     p.add_argument("--testdata", help=".npz from deploy/make_testdata.py; prints benchmark metrics")
+    p.add_argument("--incremental", action="store_true",
+                   help="drive <model>_step.onnx one sample at a time, carrying its state, "
+                        "instead of re-running a whole window per hop. The only path with a "
+                        "real KV cache; emits on every sample, so it has no hop buffering.")
+    p.add_argument("--allow-split-mismatch", action="store_true",
+                   help="score even when the test set was cut from a different split than the "
+                        "model trained on. The number is then not a test score — the epochs are "
+                        "in the model's training set. For debugging only.")
     p.add_argument("--latency", action="store_true",
                    help="per-hop latency monitor for --stream / --testdata: onnxruntime time, total hop time, "
                         "deadline misses against hop/fs, temperature; prints a summary")
@@ -668,12 +1035,25 @@ def main(argv=None):
         except (ValueError, RuntimeError) as e:
             p.error(f"--cpus {a.cpus}: {e}")
 
-    d = EEGDenoiser(a.onnx, a.threads, spin=not a.no_spin)
-    print(f"[raspi] {a.onnx}: window={d.window} fs={d.sample_rate} Hz  "
-          f"providers={d.sess.get_providers()}  "
-          f"intra_op={d.threads['intra_op']} ({d.threads['workers']} "
-          f"worker{'s' if d.threads['workers'] != 1 else ''} + the caller)  "
-          f"spinning={'on' if d.threads['allow_spinning'] else 'off'}")
+    if a.incremental:
+        d = IncrementalDenoiser(a.onnx, a.threads, spin=not a.no_spin)
+        # Same shape as the windowed line above, deliberately: the GUI's log
+        # parser matches one pattern, and the step-graph detail goes in the
+        # trailing part it already passes through rather than in the middle
+        # of the fields it reads.
+        print(f"[raspi] {a.onnx}: window={d.window} fs={d.sample_rate} Hz  "
+              f"providers={d.sess.get_providers()}  "
+              f"intra_op={d.threads['intra_op']}  "
+              f"spinning={'on' if d.threads['allow_spinning'] else 'off'}  "
+              f"incremental step graph, {len(d.state_names)} state tensors, "
+              f"{d.state_bytes():,} B")
+    else:
+        d = EEGDenoiser(a.onnx, a.threads, spin=not a.no_spin)
+        print(f"[raspi] {a.onnx}: window={d.window} fs={d.sample_rate} Hz  "
+              f"providers={d.sess.get_providers()}  "
+              f"intra_op={d.threads['intra_op']} ({d.threads['workers']} "
+              f"worker{'s' if d.threads['workers'] != 1 else ''} + the caller)  "
+              f"spinning={'on' if d.threads['allow_spinning'] else 'off'}")
 
     env = None
     if not a.no_preflight:
@@ -687,8 +1067,18 @@ def main(argv=None):
                 "this run was asked to be reportable (drop --require-locked to measure anyway)")
 
     def new_monitor(label):
-        return LatencyMonitor(a.hop, d.sample_rate, a.latency_every, label=label,
-                              environment=env) if a.latency else None
+        # Stepping emits on every sample, so its deadline is one sample
+        # period rather than a hop of them. Recording hop=1 is what makes the
+        # duty cycle comparable with a windowed run at any hop.
+        return LatencyMonitor(1 if a.incremental else a.hop,
+                              d.sample_rate, a.latency_every, label=label,
+                              environment=env,
+                              model_window=d.window,
+                              mode="incremental" if a.incremental else "windowed",
+                              kv_cache=(any(n.startswith("kv_") for n in d.state_names)
+                                        if a.incremental else False),
+                              state=(d.state_summary() if a.incremental else None),
+                              ) if a.latency else None
 
     def finish_monitor(m, stem_suffix):
         if m is None:
@@ -698,11 +1088,36 @@ def main(argv=None):
             js, csv = m.save(a.latency_out + stem_suffix)
             print(f"[{m.label}] wrote {js} and {csv}")
 
-    if a.benchmark:
+    if a.benchmark and isinstance(d, IncrementalDenoiser):
+        # The windowed benchmark times one forward over a whole window, which
+        # a step graph has no equivalent of: it advances one sample. Timing
+        # the step is the comparable thing, and the per-sample figure is what
+        # the two paths are judged on anyway.
+        r = benchmark_steps(d)
+        print(f"[bench] median {r['median_ms']} ms | p95 {r['p95_ms']} ms | max {r['max_ms']} ms "
+              f"per sample;  one sample = {r['budget_ms']} ms at {r['sample_rate_hz']:g} Hz "
+              f"-> {r['realtime_headroom_x']}x real-time headroom, "
+              f"{r['max_fs_hz']:,.0f} Hz ceiling")
+    elif a.benchmark:
         r = benchmark(d, hop=a.hop)
         print(f"[bench] median {r['median_ms']} ms | p95 {r['p95_ms']} ms | max {r['max_ms']} ms per "
               f"{r['window']}-sample window;  hop {r['hop']} = {r['hop_budget_ms']} ms budget "
               f"-> {r['realtime_headroom_x']}x real-time headroom")
+
+    if a.duty_cycle and a.incremental:
+        # The sweep answers "which hop can this keep up at", and a step graph
+        # has no hop to sweep: it emits on every sample, so its hop is 1 and
+        # its duty cycle is one number the latency run already reports.
+        #
+        # Worse than meaningless, it was wrong. duty_cycle_check wraps the
+        # denoiser in the windowed StreamingDenoiser, which feeds it a whole
+        # window per hop -- so the step graph re-stepped 125 samples for every
+        # emitted hop, recomputing exactly what carrying state exists to
+        # avoid, and the result came out as a clean OK/FAIL table.
+        print("[duty] ERROR: --duty_cycle sweeps hop sizes, and --incremental has no hop: it "
+              "emits on every sample. Its duty cycle is in the latency run (hop 1). Run the "
+              "sweep against the windowed graph instead.", file=sys.stderr)
+        return 2
 
     if a.duty_cycle:
         if a.input:
@@ -720,7 +1135,16 @@ def main(argv=None):
 
     if a.testdata:
         m = new_monitor("latency/testdata")
-        evaluate_testdata(d, a.testdata, a.hop, monitor=m)
+        try:
+            scores = evaluate_testdata(d, a.testdata, a.hop, monitor=m,
+                                       strict_split=not a.allow_split_mismatch)
+            if m is not None:
+                m.scores = scores
+        except ValueError as exc:
+            # This runs over SSH on a board; a traceback here is noise around a
+            # sentence the operator needs to read. The GUI tails these lines too.
+            print(f"[test] ERROR: {exc}", file=sys.stderr)
+            return 1
         finish_monitor(m, "_testdata" if a.input and a.stream else "")
 
     if a.input:
@@ -742,4 +1166,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

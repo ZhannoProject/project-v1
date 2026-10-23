@@ -14,6 +14,7 @@ from models.variants import (BIDIRECTIONAL_VARIANTS, base_variant, build_model,
                              build_model_from_config, variant_is_causal)
 from trainer.checkpoint import save_checkpoint
 from trainer.distillation import (DistillationLoss, FeatureProjector, FeatureTap, KDTrainer,
+                                  default_feature_layers,
                                   init_student_from_teacher, load_teacher,
                                   parse_feature_layers, probe_feature_shapes)
 from trainer.losses import build_loss
@@ -368,6 +369,55 @@ class CompressedStudentTests(unittest.TestCase):
             self.assertEqual(len(kd.kd_projectors), 0)
             self.assertTrue(kd._projectors["decoder"].is_identity)
             self.assertEqual([g["name"] for g in kd.optimizer.param_groups], ["all"])
+
+
+class FeatureLayerDefaultTests(unittest.TestCase):
+    """
+    The default place to match features has to exist on the model.
+
+    ``decoder`` was the default for every variant, but it is a module only the
+    attention families have. Switching feature distillation on for tcn or
+    tcn_se therefore failed with "'decoder' is not a submodule of TCNWithSE" --
+    so the one knob that makes KD do something other than chase the teacher's
+    output was unusable on exactly the models being compared.
+    """
+
+    def test_the_default_is_a_module_the_model_has(self):
+        for variant in ("tcn", "tcn_se", "tcn_mla", "tcn_mha", "tcn_mha_par", "tcn_mla_par"):
+            with self.subTest(variant=variant):
+                model = build_model(variant)
+                for layer in default_feature_layers(model):
+                    self.assertTrue(hasattr(model, layer),
+                                    f"{variant}'s default feature layer {layer!r} does not exist")
+
+    def test_attention_variants_still_match_at_the_decoder(self):
+        """Where a bidirectional teacher actually differs."""
+        for variant in ("tcn_mla", "tcn_mha_par"):
+            with self.subTest(variant=variant):
+                self.assertEqual(default_feature_layers(build_model(variant)), ["decoder"])
+
+    def test_the_tcn_families_match_at_the_backbone(self):
+        """They have no decoder; the trunk is the only representation."""
+        for variant in ("tcn", "tcn_se"):
+            with self.subTest(variant=variant):
+                self.assertEqual(default_feature_layers(build_model(variant)), ["backbone"])
+
+    def test_the_default_can_actually_be_probed(self):
+        """A name that exists but cannot be matched would fail just as late."""
+        for variant in ("tcn_se", "tcn_mla"):
+            with self.subTest(variant=variant):
+                student = build_model(variant).eval()
+                teacher = build_model(variant + "_bi").eval()
+                pairs = parse_feature_layers(default_feature_layers(student))
+                shapes = probe_feature_shapes(student, teacher, pairs, 512)
+                self.assertTrue(shapes)
+
+    def test_a_named_layer_is_still_used_as_given(self):
+        """Only the default adapts; an explicit choice stays explicit."""
+        with self.assertRaisesRegex(ValueError, "not a submodule"):
+            probe_feature_shapes(build_model("tcn_se").eval(),
+                                 build_model("tcn_se_bi").eval(),
+                                 parse_feature_layers(["decoder"]), 512)
 
 
 if __name__ == "__main__":

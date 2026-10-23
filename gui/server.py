@@ -12,6 +12,7 @@ Local HTTP server behind the training GUI (stdlib only).
     GET  /api/runs/times         every run, newest first, grouped by day
     GET  /api/runs/losses        complete runs only, grouped by loss_fn x artifact
     GET  /api/runs/optimizers    complete runs only, grouped by optimizer recipe
+    GET  /api/runs/deploys       one row per Pi/host measurement, newest first
     GET  /api/runs/history?name=X    one finished run's per-epoch curve, for the chart
     POST /api/params             {values} → parameter breakdown of that model
     GET  /api/params/run?name=X  the same breakdown for a finished run's checkpoint
@@ -26,6 +27,14 @@ Local HTTP server behind the training GUI (stdlib only).
                                  run has reported writing so far
     GET  /api/eval/figure?path=X one file from figures/ (png / svg / json)
     GET  /api/pi/meta            exports, test sets and latency traces on disk
+    POST /api/pi/testdata        {model, n} → cut the test set matching that model's
+                                 split, and the refreshed list
+    GET  /api/rf/meta            the receptive-field ladder and its defaults
+    GET  /api/rf/results         one row per trained rung: reach vs metrics, over seeds
+    POST /api/rf/preview         {variant, rungs, …} → the training commands
+    POST /api/rf/run             the same, but starts them
+    POST /api/rf/stop
+    GET  /api/rf/status?since=N  incremental log lines for the sweep
     POST /api/pi/preview         {target, model, …} → the commands a run would use
     POST /api/pi/run             the same, but starts them
     POST /api/pi/stop
@@ -56,7 +65,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from gui import config_io, params, pi
+from gui import config_io, lookahead, params, pi, rfsweep
+# The one place the "seed 42 keeps the bare name" rule is written down; the
+# run titles have to derive the same path the trainer will.
+from trainer.__main__ import DEFAULT_MASTER_SEED
 from gui.config_io import PROJECT_ROOT, RUNS_DIR
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -91,6 +103,10 @@ class Job:
         self._lines: collections.deque = collections.deque(maxlen=self.MAX_LINES)
         self._offset = 0                       # index of _lines[0] in the full stream
         self.command: list[str] = []
+        # Identity, for the kinds of job there can be several of at once. A
+        # lone job keeps the defaults and never has to be addressed by id.
+        self.id: str = ""
+        self.title: str = ""
         self.steps: list[dict] = []            # [{label, command, env, returncode}]
         self.step = 0                          # index of the step in progress
         self.started: str | None = None
@@ -345,6 +361,7 @@ class Job:
         return {
             **extra,
             "kind": self.KIND,
+            "id": self.id, "title": self.title,
             "running": self.running,
             "returncode": self.returncode,
             "command": " ".join(shlex.quote(c) for c in self.command),
@@ -421,6 +438,169 @@ class TrainingJob(Job):
             return list(self._metrics)
 
 
+class TooManyJobs(RuntimeError):
+    """
+    The concurrent-run cap was reached.
+
+    A conflict rather than a bad request: the call was well formed and would
+    succeed once a run finishes, which is the distinction 409 carries and the
+    page relies on to tell "wait" from "you asked for something impossible".
+    """
+
+
+class TrainingJobs:
+    """
+    Several training runs at once, each with its own log, buffer and curve.
+
+    The tab used to hold one run because the server held one ``TrainingJob``,
+    and a second **Train** was refused with a 409.  That is the wrong shape for
+    what this project actually does: a seed repeat is three runs of the same
+    config, and a lookahead ladder is one run per rung, so the common task is
+    *n* runs that differ in one flag and are read side by side.  Waiting for
+    each to finish before starting the next made that a sequence of sittings.
+
+    What it does not do is make them free.  They share one machine, and on MPS
+    one accelerator, so concurrent runs contend: the per-epoch wall times in
+    each log stop being comparable with a run that had the box to itself, and
+    on a laptop three at once is slower in total than three in a row.  The
+    metrics are unaffected -- each run has its own seed, data and weights --
+    which is why this is allowed at all. ``MAX_ACTIVE`` keeps it from becoming
+    absurd, and the page says what concurrency costs rather than hiding it.
+
+    A finished job is kept so its log and curve can still be read; the oldest
+    are dropped once there are ``MAX_KEPT`` of them. Jobs still running are
+    never dropped.
+    """
+
+    #: Concurrent runs. Four is already more than a laptop wants; the point of
+    #: the cap is that an accidental loop cannot spawn fifty.
+    MAX_ACTIVE = 4
+    #: Finished runs kept for reading back, newest first.
+    MAX_KEPT = 16
+
+    def __init__(self, factory=TrainingJob):
+        self._factory = factory
+        self._lock = threading.Lock()
+        self._jobs: "collections.OrderedDict[str, Job]" = collections.OrderedDict()
+
+    # ---- identity ----
+    def _new_id(self, stamp: str) -> str:
+        """``gui_train_<stamp>``, with a suffix if that second is taken."""
+        base = f"gui_train_{stamp}"
+        if base not in self._jobs:
+            return base
+        n = 2
+        while f"{base}_{n}" in self._jobs:
+            n += 1
+        return f"{base}_{n}"
+
+    # ---- lifecycle ----
+    def room(self) -> int:
+        """
+        How many more runs may start now.
+
+        Asked before a batch rather than discovered during one: starting two
+        of three seeds and refusing the third leaves a half-finished request
+        that reads like a failure of the runs that did start.
+        """
+        with self._lock:
+            return self.MAX_ACTIVE - len([j for j in self._jobs.values() if j.running])
+
+    def start(self, command: list[str], cwd: Path, runs_dir: Path, title: str = "") -> Job:
+        with self._lock:
+            active = [j for j in self._jobs.values() if j.running]
+            if len(active) >= self.MAX_ACTIVE:
+                raise TooManyJobs(
+                    f"{len(active)} training runs are already going, which is the limit "
+                    f"({self.MAX_ACTIVE}). Stop one, or wait for it to finish — they share "
+                    f"one machine and slow each other down.")
+            job_id = self._new_id(datetime.now().strftime("%Y%m%d_%H%M%S"))
+            job = self._factory()
+            job.id = job_id
+            # Two live runs deriving one directory is a real thing that
+            # happens -- a preset run twice with nothing overridden -- and the
+            # second will write over the first. The switcher cannot fix that,
+            # but it must not show two identical pills while it happens.
+            label = title or job_id
+            taken = {j.title for j in self._jobs.values() if j.running}
+            if label in taken:
+                n = 2
+                while f"{label} #{n}" in taken:
+                    n += 1
+                label = f"{label} #{n}"
+            job.title = label
+            self._jobs[job_id] = job
+            self._prune()
+        job.start(command, cwd, runs_dir / f"{job_id}.log")
+        return job
+
+    def _prune(self):
+        """Drop the oldest finished jobs. Caller holds the lock."""
+        done = [k for k, j in self._jobs.items() if not j.running]
+        for key in done[: max(0, len(done) - self.MAX_KEPT)]:
+            del self._jobs[key]
+
+    def get(self, job_id: str | None) -> Job | None:
+        """
+        One job by id, or the one the page means when it does not say.
+
+        Without an id this is the newest *running* job, falling back to the
+        newest of any state — which is what a page that has just loaded, or an
+        older client that never sent one, is asking for.
+        """
+        with self._lock:
+            if job_id:
+                return self._jobs.get(job_id)
+            running = [j for j in self._jobs.values() if j.running]
+            if running:
+                return running[-1]
+            return next(reversed(self._jobs.values()), None) if self._jobs else None
+
+    def summaries(self) -> list[dict]:
+        """
+        One small record per job for the switcher: enough to label a pill and
+        show how far along it is, without shipping anybody's log.
+        """
+        with self._lock:
+            jobs = list(self._jobs.values())
+        out = []
+        for j in jobs:
+            metrics = j.metrics() if hasattr(j, "metrics") else []
+            best = min((m for m in metrics if m.get("val_loss") is not None),
+                       key=lambda m: m["val_loss"], default=None)
+            out.append({
+                "id": j.id, "title": j.title, "running": j.running,
+                "returncode": j.returncode, "started": j.started,
+                "epoch": metrics[-1]["epoch"] if metrics else None,
+                "max_epochs": j.status(0).get("max_epochs") if j.running or metrics else None,
+                "best_val_loss": best["val_loss"] if best else None,
+                "rrmse_t": metrics[-1].get("rrmse_t") if metrics else None,
+            })
+        out.reverse()                           # newest first, as the page lists them
+        return out
+
+    def stop(self, job_id: str | None = None) -> bool:
+        job = self.get(job_id)
+        return bool(job and job.stop())
+
+    def stop_all(self) -> int:
+        with self._lock:
+            jobs = [j for j in self._jobs.values() if j.running]
+        return sum(1 for j in jobs if j.stop())
+
+    @property
+    def running(self) -> bool:
+        """True while any run is going — what the window-close guard asks."""
+        with self._lock:
+            return any(j.running for j in self._jobs.values())
+
+    def reset(self):
+        """Forget every job. For tests, and for nothing else."""
+        self.stop_all()
+        with self._lock:
+            self._jobs.clear()
+
+
 class EvalJob(Job):
     """
     An ``eval.py`` subprocess, with the files it reports writing collected as
@@ -485,9 +665,13 @@ class DeployJob(Job):
             return self._scan_state.state()
 
 
-JOB = TrainingJob()
+TRAIN_JOBS = TrainingJobs()
 EVAL_JOB = EvalJob()
 DEPLOY_JOB = DeployJob()
+#: The receptive-field sweep: a list of ordinary training runs, run in order.
+#: Its own job rather than the training one, because a sweep is many runs and
+#: Stop has to mean the sweep rather than whichever run is going.
+SWEEP_JOB = DeployJob()
 
 
 # ============================================================
@@ -665,6 +849,55 @@ def build_eval_command(spec: dict) -> tuple[list[str], str]:
     return cmd, save_dir
 
 
+def _train_title(config_name: str, command: list[str]) -> str:
+    """
+    What to call a run on the switcher: the directory it will write.
+
+    The save_dir is the run's identity everywhere else in this project -- it
+    carries the variant, the artifact and the seed -- so it is the one label
+    that tells apart runs of the same preset that differ in one flag, which is
+    the case the switcher exists for.
+
+    Naming it after the *preset* instead, which this did when the command
+    carried no ``--save_dir``, labels every run from one file identically:
+    six pills reading ``mla_rank_sweep_eog`` and no way to tell which is
+    which. It also hid something worth seeing. A preset with no ``save_dir``
+    has the trainer derive one from the variant, artifact and seed, so those
+    six runs were not six experiments -- they were six runs deriving the same
+    directory and overwriting each other. The derivation is repeated here,
+    from the same three keys in the same order of precedence, so the label is
+    the path the run will really write and a collision is visible before it
+    happens rather than afterwards in the Runs tab.
+    """
+    def flag(name: str):
+        return command[command.index(name) + 1] if name in command else None
+
+    if flag("--save_dir"):
+        return flag("--save_dir").rstrip("/").split("/")[-1]
+    try:
+        values = config_io.read_config(config_name).get("values") or {}
+    except (ValueError, FileNotFoundError, OSError):
+        values = {}
+    if values.get("save_dir"):                 # the preset names one itself
+        return str(values["save_dir"]).rstrip("/").split("/")[-1]
+
+    variant = flag("--variant") or values.get("variant")
+    artifact = flag("--artifact") or values.get("artifact")
+    if not variant or not artifact:            # nothing to derive from
+        return config_name[:-5] if config_name.endswith(".yaml") else config_name
+    seed = flag("--master_seed")
+    if seed is None:
+        seed = values.get("master_seed")
+    name = f"{variant}_{str(artifact).lower()}"
+    if flag("--teacher_ckpt") or values.get("teacher_ckpt"):
+        name += "_kd"                          # as trainer/__main__.py does
+    # The default seed keeps the bare name, every other seed gets a suffix --
+    # the rule the trainer and the Lookahead tab both follow.
+    if seed is not None and int(seed) != DEFAULT_MASTER_SEED:
+        name += f"_s{int(seed)}"
+    return name
+
+
 def build_train_command(config_name: str, extra_args: str = "") -> list[str]:
     """`python -m trainer --config configs/<name> [extra flags]` with this interpreter."""
     config_io.config_path(config_name)                 # validates the name
@@ -683,6 +916,11 @@ def meta() -> dict:
         "times": config_io.runs_by_time(runs),
         "losses": config_io.runs_by_loss(runs),
         "optimizers": config_io.runs_by_optimizer(runs),
+        # The other half of what this project did: the measurements made from
+        # those runs. Cheap (a directory of small JSON files), so it rides
+        # along with the training runs rather than needing its own refresh.
+        "deploys": pi.list_deploy_runs(),
+        "deploy_logs": pi.list_deploy_logs(),
         "schema": config_io.schema_as_json(),
         "choices": {
             "variants": list(VARIANT_REGISTRY),
@@ -785,7 +1023,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"runs": runs, "kinds": config_io.runs_by_kind(runs),
                                    "times": config_io.runs_by_time(runs),
                                    "losses": config_io.runs_by_loss(runs),
-                                   "optimizers": config_io.runs_by_optimizer(runs)})
+                                   "optimizers": config_io.runs_by_optimizer(runs),
+                                   "deploys": pi.list_deploy_runs(),
+                                   "deploy_logs": pi.list_deploy_logs()})
+            if url.path == "/api/lookahead/meta":
+                return self._json(lookahead.meta())
             if url.path == "/api/runs/kinds":
                 return self._json({"kinds": config_io.runs_by_kind()})
             if url.path == "/api/runs/times":
@@ -794,6 +1036,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"losses": config_io.runs_by_loss()})
             if url.path == "/api/runs/optimizers":
                 return self._json({"optimizers": config_io.runs_by_optimizer()})
+            if url.path == "/api/runs/deploys":
+                return self._json({"deploys": pi.list_deploy_runs(),
+                                   "deploy_logs": pi.list_deploy_logs()})
             if url.path == "/api/runs/history":
                 return self._json(config_io.read_run_history(q.get("name", "")))
             if url.path == "/api/params/run":
@@ -807,7 +1052,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self._file(path, kinds.get(path.suffix.lower(),
                                                   "application/octet-stream"))
             if url.path == "/api/train/status":
-                return self._json(JOB.status(int(q.get("since", 0))))
+                # One request serves the whole tab: the selected run's new
+                # lines, and a small record per run for the switcher. Polling
+                # each job separately would scale the request count with the
+                # number of runs for no gain -- only one of them is on screen.
+                job = TRAIN_JOBS.get(q.get("id"))
+                status = job.status(int(q.get("since", 0))) if job else {
+                    "running": False, "lines": [], "since": 0, "next": 0, "metrics": [],
+                    "id": "", "title": "", "returncode": None, "command": "",
+                    "steps": [], "step": 0, "started": None, "log_path": None,
+                    "max_epochs": None, "kind": "train"}
+                return self._json({**status, "jobs": TRAIN_JOBS.summaries(),
+                                   "max_active": TrainingJobs.MAX_ACTIVE})
+            if url.path == "/api/rf/meta":
+                return self._json(rfsweep.meta())
+            if url.path == "/api/rf/results":
+                return self._json({"rows": rfsweep.results(
+                    q.get("variant", "tcn"), q.get("artifact", "BOTH"),
+                    int(q["seed"]) if q.get("seed") else None,
+                    int(q.get("hidden_channels") or rfsweep.DEFAULT_HIDDEN))})
+            if url.path == "/api/rf/status":
+                return self._json(SWEEP_JOB.status(int(q.get("since", 0))))
             if url.path == "/api/pi/meta":
                 return self._json(pi.meta())
             if url.path == "/api/pi/status":
@@ -835,15 +1100,64 @@ class Handler(BaseHTTPRequestHandler):
                                    "configs": config_io.list_configs()})
             if url.path == "/api/params":
                 return self._json(params.report(body.get("values", {})))
+            if url.path == "/api/pi/testdata":
+                # Cutting 100 epochs takes ~40 ms, so this answers inline
+                # rather than going through the job machinery.
+                out = pi.cut_testdata_for(body.get("model", ""),
+                                          int(body.get("n") or 100),
+                                          bool(body.get("overwrite")))
+                out["testdata"] = pi.list_testdata()
+                return self._json(out)
+            if url.path == "/api/lookahead/measure":
+                # Builds a model per rung and probes it; nothing is trained and
+                # no checkpoint is read, so this is a plain request rather than
+                # a job.
+                return self._json(lookahead.measure(body))
+            if url.path == "/api/lookahead/train":
+                # Resolved here and handed to the ordinary training runner, so a
+                # rung is launched by the same path as every other run rather
+                # than by a second entry point that could drift from it.
+                plan = lookahead.train_plan(body)
+                runs = plan["runs"]
+                if plan["taken"] and not body.get("overwrite"):
+                    taken = ", ".join(plan["taken"])
+                    return self._error(
+                        f"{taken} already {'holds' if len(plan['taken']) == 1 else 'hold'} a run; "
+                        f"the trainer's own guard would refuse it. Untick "
+                        f"{'that seed' if len(plan['taken']) == 1 else 'those seeds'}, or tick "
+                        f"overwrite.", 409)
+                # Both checks run before anything starts, so the request is
+                # either all launched or all refused.
+                room = TRAIN_JOBS.room()
+                if len(runs) > room:
+                    return self._error(
+                        f"{len(runs)} seeds is more than there is room for: "
+                        f"{TRAIN_JOBS.MAX_ACTIVE - room} of {TRAIN_JOBS.MAX_ACTIVE} runs are "
+                        f"already going. Start {room if room else 'fewer'} now, or wait — they "
+                        f"share one machine and slow each other down.", 409)
+                started = [TRAIN_JOBS.start(build_train_command(r["config"], r["extra"]),
+                                            PROJECT_ROOT, RUNS_DIR,
+                                            title=r["save_dir"].split("/")[-1])
+                           for r in runs]
+                # The first one's status, so the page opens on the run it will
+                # watch; the rest are pills beside it.
+                return self._json({**started[0].status(0), "planned": plan,
+                                   "started": [j.id for j in started],
+                                   "jobs": TRAIN_JOBS.summaries()})
+            if url.path == "/api/lookahead/preview":
+                return self._json(lookahead.train_plan(body))
             if url.path == "/api/train":
-                if JOB.running:
-                    return self._error("a training run is already in progress", 409)
                 cmd = build_train_command(body["name"], body.get("extra_args", ""))
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                JOB.start(cmd, PROJECT_ROOT, RUNS_DIR / f"gui_train_{stamp}.log")
-                return self._json(JOB.status(0))
+                job = TRAIN_JOBS.start(cmd, PROJECT_ROOT, RUNS_DIR,
+                                       title=_train_title(body["name"], cmd))
+                return self._json({**job.status(0), "jobs": TRAIN_JOBS.summaries()})
             if url.path == "/api/train/stop":
-                return self._json({"stopped": JOB.stop(), **JOB.status(0)})
+                # No id stops the newest running run, which is what a page that
+                # has only ever shown one means by "Stop".
+                stopped = TRAIN_JOBS.stop(body.get("id"))
+                job = TRAIN_JOBS.get(body.get("id"))
+                return self._json({"stopped": stopped, **(job.status(0) if job else {}),
+                                   "jobs": TRAIN_JOBS.summaries()})
             if url.path == "/api/eval/preview":
                 cmd, save_dir = build_eval_command(body)
                 return self._json({"command": " ".join(shlex.quote(c) for c in cmd),
@@ -857,19 +1171,32 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({**EVAL_JOB.status(0), "save_dir": save_dir})
             if url.path == "/api/eval/stop":
                 return self._json({"stopped": EVAL_JOB.stop(), **EVAL_JOB.status(0)})
+            if url.path == "/api/rf/preview":
+                return self._json({"steps": pi.describe(rfsweep.build_steps(body))})
+            if url.path == "/api/rf/run":
+                if SWEEP_JOB.running:
+                    return self._error("a sweep is already in progress", 409)
+                steps = rfsweep.build_steps(body)
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                SWEEP_JOB.start_steps(steps, PROJECT_ROOT, RUNS_DIR / f"gui_rfsweep_{stamp}.log")
+                return self._json({**SWEEP_JOB.status(0), "planned": pi.describe(steps)})
+            if url.path == "/api/rf/stop":
+                return self._json({"stopped": SWEEP_JOB.stop(), **SWEEP_JOB.status(0)})
             if url.path == "/api/pi/preview":
                 return self._json({"steps": pi.describe(pi.build_steps(body))})
             if url.path == "/api/pi/run":
                 if DEPLOY_JOB.running:
                     return self._error("a deploy run is already in progress", 409)
-                steps = pi.build_steps(body)
+                # The split check bites here, not on preview: this is the call
+                # that goes on to produce a score.
+                steps = pi.build_steps({**body, "_enforce_split": True})
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 DEPLOY_JOB.start_steps(steps, PROJECT_ROOT, RUNS_DIR / f"gui_deploy_{stamp}.log")
                 return self._json({**DEPLOY_JOB.status(0), "planned": pi.describe(steps)})
             if url.path == "/api/pi/stop":
                 return self._json({"stopped": DEPLOY_JOB.stop(), **DEPLOY_JOB.status(0)})
             return self._error("not found", 404)
-        except FileExistsError as e:
+        except (FileExistsError, TooManyJobs) as e:
             return self._error(e, 409)
         except (ValueError, FileNotFoundError, KeyError, RuntimeError) as e:
             return self._error(e, 400)

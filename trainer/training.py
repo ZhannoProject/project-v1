@@ -89,6 +89,16 @@ class Trainer:
         self.best_val_loss = float("inf")
         # ``config`` records what produced these numbers.  val_loss is only comparable
         # across runs that share loss_fn, artifact, snr_range_db and master_seed.
+        #
+        # ``arch`` is the shape of the model, read off the model itself rather than
+        # off the config that was meant to build it.  Without it a run records the
+        # training recipe and not the thing trained, and the two can disagree: a CLI
+        # override, a config edited after the run, a variant whose name pins a value.
+        # This project has the scar — every MLA run here was trained with 4 attention
+        # layers and 2 heads while its YAML said 2 and 4, so the headline MHA/MLA
+        # ablation differs in depth, head count and parameter count, and nothing in
+        # any run said so.  Taken from the built model, it cannot drift from the
+        # weights beside it.
         self.history = {"train_loss": [], "val_loss": [], "rrmse_t": [], "rrmse_s": [], "acc": [],
                         "config": {"loss_fn": loss_fn,
                                    # the optimizer class actually built, not the one
@@ -99,12 +109,28 @@ class Trainer:
                                                "learning_rate", "attn_lr_scale", "weight_decay",
                                                "sched_warmup_epochs", "eta_min",
                                                "snr_range_db", "master_seed",
-                                               "staged", "teacher_ckpt")}}}
+                                               "staged", "teacher_ckpt")},
+                                   "arch": self._architecture(),
+                                   "n_params": sum(p.numel() for p in self.model.parameters())}}
 
         self.writer = create_tb_writer(self.save_dir, use_tensorboard)
 
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"[Trainer] Trainable params: {n_params:,}")
+
+    def _architecture(self) -> dict:
+        """
+        The model's own account of its shape, for ``history.json``.
+
+        Falls back to whatever ``model_config`` holds if the variant cannot be
+        resolved (a hand-built model passed straight to the Trainer, which the
+        tests do): an incomplete record beats refusing to start a run over one.
+        """
+        try:
+            from models.variants import resolved_arch
+            return resolved_arch(self.model)
+        except Exception:                      # pragma: no cover - defensive
+            return dict(getattr(self.model, "model_config", {}) or {})
 
     def _extra_trainable(self):
         """Trainable tensors outside ``self.model`` (none here; KDTrainer adds its projectors)."""

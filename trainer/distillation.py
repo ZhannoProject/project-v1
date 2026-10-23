@@ -241,6 +241,28 @@ class FeatureTap:
         self._handles = []
 
 
+def default_feature_layers(model) -> list:
+    """
+    Where to match features when the caller did not say.
+
+    ``decoder`` is the interesting place in the sandwich and parallel
+    variants: it is the attention stack, and the part a bidirectional teacher
+    actually does differently. The TCN families have no decoder -- naming one
+    raises -- so they match at ``backbone``, which is the whole convolutional
+    trunk and the only representation they have.
+
+    Only the default. A layer the caller names is used as given, and still
+    fails loudly if the model has no such module.
+    """
+    for name in ("decoder", "backbone", "tcn_pt1"):
+        if isinstance(getattr(model, name, None), nn.Module):
+            return [name]
+    raise ValueError(
+        f"{type(model).__name__} has no module this knows to match features at; "
+        f"name one with --kd_feature_layers (top-level modules: "
+        f"{[n for n, _ in model.named_children()]})")
+
+
 def parse_feature_layers(layer_names: Sequence[str]) -> list:
     """
     ``["decoder", "decoder.blocks.1:decoder.blocks.9"]`` →

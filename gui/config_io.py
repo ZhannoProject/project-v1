@@ -45,7 +45,7 @@ class Field:
     help: str = ""
     choices: Optional[str] = None      # name of a choice list served by /api/meta
     nullable: bool = False             # empty input → null (else empty is an error)
-    show_if: Optional[str] = None      # attention | mla | sandwich | staged | turboquant | kd
+    show_if: Optional[str] = None      # attention | mla | se | sandwich | staged | turboquant | kd
     min: Optional[float] = None
     max: Optional[float] = None
     step: Optional[float] = None
@@ -70,7 +70,17 @@ SCHEMA: List[Section] = [
         Field("max_seq_len", "int", 512, min=16, show_if="attention",
               help="Causal-mask size; must be ≥ the 512-sample epoch length"),
         Field("kv_lora_rank", "int", 16, min=1, show_if="mla",
-              help="MLA latent KV rank (d_model // 4 = 16 by default)"),
+              help="MLA latent KV rank. Cache per step is 2*d_model/rank smaller than MHA; d_model is 32 after the channel squeeze, so 16 gives 4x"),
+        # Nullable with no default on purpose. A plain 8 here would be merged
+        # into *every* variant's config, and TCNOnly accepts the argument --
+        # that is how tcn_se is built -- so the baseline would quietly grow an
+        # SE gate and report 122k parameters instead of 117k. Empty means
+        # "whatever the variant decides", which for tcn is none and for
+        # tcn_se is 8.
+        Field("se_reduction", "int", None, nullable=True, min=1, show_if="se",
+              help="Squeeze-and-Excitation ratio: C -> C/r -> C channel gate on every residual "
+                   "block, squeezed over a RUNNING mean so it cannot see ahead. "
+                   "Empty = 8; the tcn_se_r{N} variants fix it instead"),
         Field("bottleneck_ratio", "float", 0.5, min=0.05, max=1.0, step=0.05, show_if="sandwich",
               help="Channel squeeze before attention: attn_dim = H × ratio"),
         Field("skip_bottleneck_ratio", "float", None, nullable=True, min=0.05, max=1.0, step=0.05,
@@ -140,9 +150,16 @@ SCHEMA: List[Section] = [
               help="Weight of loss(student, teacher); ground truth gets 1 − α"),
         Field("kd_feature_weight", "float", 0.0, min=0.0, step=0.05, show_if="kd",
               help="Weight of MSE(student features, teacher features); 0 = off"),
-        Field("kd_feature_layers", "list_str", ["decoder"], show_if="kd",
-              help="Submodules to match, comma-separated; student:teacher pairs for different depths "
-                   "(e.g. decoder, decoder.blocks.1:decoder.blocks.9)"),
+        # Empty by default, and nullable, so the form does not write a value
+        # into every config. A hard "decoder" here was sent explicitly on every
+        # GUI run, which meant the trainer never got to resolve it from the
+        # model -- and tcn/tcn_se have no decoder, so switching feature
+        # distillation on failed with "'decoder' is not a submodule".
+        Field("kd_feature_layers", "list_str", None, nullable=True, show_if="kd",
+              help="Submodules to match, comma-separated; empty = pick for this model "
+                   "(decoder for the attention variants, backbone for tcn/tcn_se). "
+                   "student:teacher pairs for different depths, e.g. "
+                   "decoder.blocks.1:decoder.blocks.9"),
         Field("kd_output_loss", "select", None, choices="losses", nullable=True, show_if="kd",
               help="Loss vs teacher output; empty → same as loss_fn"),
         Field("kd_feature_loss", "select", "mse", choices="feature_losses", show_if="kd"),
@@ -574,6 +591,28 @@ def _loss_of(run_dir: Path, history: Optional[dict]) -> tuple[Optional[str], str
     return None, "unknown"
 
 
+def _lookahead_of(variant: Optional[str], model_config: dict) -> Optional[int]:
+    """
+    Samples of future a run was licensed to read, or None if it is not a
+    bounded-lookahead run at all (causal, or an unbounded teacher).
+
+    Taken from the variant the run recorded, with the checkpoint's own
+    ``lookahead`` as the fallback: the registry is authoritative about what a
+    name means, and the recorded value covers a run built before a rung was
+    registered. Reading it from the directory name is deliberately not an
+    option -- a name is a convention, and ``runs/tcn_se_both_s67`` already
+    proved it can be wrong about what is inside.
+    """
+    try:
+        from models.variants import LOOKAHEAD_VARIANTS, pinned_kwargs
+        if variant in LOOKAHEAD_VARIANTS:
+            return pinned_kwargs(variant).get("lookahead")
+    except Exception:                          # torch missing: fall through
+        pass
+    value = (model_config or {}).get("lookahead")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
 def list_runs() -> List[dict]:
     """
     One row per runs/<dir> that holds a best.pt.
@@ -601,9 +640,24 @@ def list_runs() -> List[dict]:
         mc = info.get("model_config") or {}
         artifact = _artifact_from_name(d.name)
         variant = mc.get("variant") or _variant_from_name(d.name, artifact)
+        # Causality has three answers now, not two, and collapsing them loses
+        # the one in the middle: a bounded-lookahead run reads 32 samples
+        # ahead, a *_bi teacher reads the whole epoch, and only the second is
+        # "bidirectional".  ``model_config.causal is False`` is true of both,
+        # so reading the flag alone would badge every rung of the ladder as a
+        # teacher -- a run labelled as something it is not, which is the
+        # failure this project keeps writing guards against.
+        look = _lookahead_of(variant, mc)
+        causal = look is None and not (mc.get("causal") is False or d.name.endswith("_bi")
+                                       or "_bi_" in d.name)
         row = {"name": d.name, "checkpoint": f"./runs/{d.name}/best.pt",
-               "bidirectional": bool(mc.get("causal") is False) or d.name.endswith("_bi")
-                                or "_bi_" in d.name,
+               #: Unbounded only.  A bounded rung is not one of these.
+               "bidirectional": not causal and look is None,
+               #: Samples of future the run may read; None unless bounded.
+               "lookahead": look,
+               #: False for both -- what the ONNX exporter and the streaming
+               #: paths actually key on.
+               "causal": causal,
                "epochs": None, "best_epoch": None, "val_loss": None,
                "rrmse_t": None, "rrmse_s": None, "acc": None, "kd": False,
                "variant": variant, "artifact": artifact,
@@ -635,6 +689,30 @@ def list_runs() -> List[dict]:
                     # without torch; only fall back when it is missing.
                     if (h.get("config") or {}).get("master_seed") is not None:
                         row["master_seed"] = h["config"]["master_seed"]
+                    # The run wrote down what it trained on. Preferred over the
+                    # directory-name parse, which only works for runs named
+                    # <variant>_<artifact> and silently yields nothing for any
+                    # other name.
+                    if (h.get("config") or {}).get("artifact"):
+                        row["artifact"] = h["config"]["artifact"]
+                        row["kind"] = (f"{row['variant']} · {row['artifact']}"
+                                       if row["variant"] else row["kind"])
+                    # The architecture the run recorded for itself. Complete
+                    # (defaults resolved) where the checkpoint's model_config
+                    # holds only what was passed, and readable without torch,
+                    # so it fills the columns in for a run whose best.pt
+                    # cannot be loaded here. Only where the checkpoint is
+                    # silent: the weights are the final authority on shape.
+                    # ``h["config"]`` would raise for a history that has none,
+                    # and the except below would then throw the whole history
+                    # away and report the run as unfinished.
+                    hcfg = h.get("config") or {}
+                    arch = hcfg.get("arch") or {}
+                    for key in ("hidden_channels", "n_attn_layers", "kv_lora_rank"):
+                        if row.get(key) is None and arch.get(key) is not None:
+                            row[key] = arch[key]
+                    if row.get("params") is None and hcfg.get("n_params"):
+                        row["params"] = hcfg["n_params"]
                     # last.pt should sit at the final epoch of that history; if it
                     # does not, the directory was re-used by a later, shorter run.
                     last = row["last_epoch"]

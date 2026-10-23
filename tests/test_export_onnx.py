@@ -221,8 +221,94 @@ class ExportOnnxTests(unittest.TestCase):
                      clean=clean, snr_db=np.tile(np.linspace(-7, 2, 10), 2).astype(np.float32), fs=256)
             with contextlib.redirect_stdout(io.StringIO()):
                 r = raspi_infer.evaluate_testdata(EEGDenoiser(Path(tmp) / "m.onnx", n_threads=1), npz)
-            self.assertEqual(set(r), {"noisy input (no model)", "epoch mode", "stream mode (hop 32)"})
-            self.assertTrue(all(np.isfinite(list(m.values())).all() for m in r.values()))
+            # The scores go into the trace beside the timings, so the return
+            # carries what they were measured on as well as what they were:
+            # a number without its test set and split is not reportable.
+            self.assertEqual(set(r), {"testdata", "n_epochs", "hop", "split", "modes"})
+            self.assertEqual((r["testdata"], r["n_epochs"], r["hop"]), ("t.npz", 20, 32))
+            self.assertEqual(set(r["split"]), {"artifact", "master_seed", "source"})
+            self.assertEqual(set(r["modes"]),
+                             {"noisy input (no model)", "epoch mode", "stream mode (hop 32)"})
+            self.assertTrue(all(np.isfinite(list(m.values())).all()
+                                for m in r["modes"].values()))
+
+
+class ModeLabellingTests(unittest.TestCase):
+    """
+    Each row of the scoring table has to name the computation that produced it.
+
+    The rows are assigned in a branch, and the numbers are plausible either
+    way, so a mislabelled row is not something a reader could catch. Two
+    things are pinned: that a label matches its own independent computation,
+    and that the step graph does not borrow the windowed path's name for a
+    mechanism it does not use.
+    """
+
+    def _fixture(self, tmp):
+        rng = np.random.default_rng(0)
+        clean = 30.0 * rng.standard_normal((20, 512)).astype(np.float32)
+        npz = Path(tmp) / "t.npz"
+        np.savez(npz, noisy=clean + 20.0 * rng.standard_normal(clean.shape).astype(np.float32),
+                 clean=clean, snr_db=np.tile(np.linspace(-7, 2, 10), 2).astype(np.float32),
+                 fs=256, master_seed=42, artifact="EOG", split="test")
+        return npz, clean
+
+    def test_each_windowed_row_is_the_computation_it_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ckpt = _checkpoint(tmp, "tcn")
+            with contextlib.redirect_stdout(io.StringIO()):
+                export_checkpoint(ckpt, out_dir=tmp, name="m")
+            npz, clean = self._fixture(tmp)
+            d = EEGDenoiser(Path(tmp) / "m.onnx", n_threads=1)
+            noisy = np.load(npz)["noisy"]
+            for hop in (8, 32):
+                with self.subTest(hop=hop):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        got = raspi_infer.evaluate_testdata(d, npz, hop,
+                                                            strict_split=False)["modes"]
+                    want_epoch = raspi_infer.metrics(d.denoise_epochs(noisy), clean)
+                    want_stream = raspi_infer.metrics(
+                        d.denoise_stream(noisy.reshape(-1), hop).reshape(noisy.shape), clean)
+                    for key, want in (("epoch mode", want_epoch),
+                                      (f"stream mode (hop {hop})", want_stream)):
+                        self.assertIn(key, got, f"no row called {key!r}")
+                        for metric, v in want.items():
+                            self.assertAlmostEqual(got[key][metric], float(v.mean()), places=9,
+                                                   msg=f"{key}:{metric} is not what it claims")
+                    # the hop in the label is the hop that ran
+                    self.assertNotIn(f"stream mode (hop {64 if hop == 8 else 8})", got)
+
+    def test_the_step_graph_does_not_claim_a_batched_epoch(self):
+        """
+        It steps a sample at a time and resets between epochs. The scoring
+        protocol matches the windowed path's -- which is what keeps the two
+        numbers comparable -- but the mechanism does not, and the label says so.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ckpt = _checkpoint(tmp, "tcn")
+            with contextlib.redirect_stdout(io.StringIO()):
+                export_checkpoint(ckpt, out_dir=tmp, name="m")
+                export_checkpoint(ckpt, out_dir=tmp, name="m", incremental=True)
+            npz, _ = self._fixture(tmp)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                stepped = raspi_infer.evaluate_testdata(
+                    raspi_infer.IncrementalDenoiser(Path(tmp) / "m_step.onnx", n_threads=1),
+                    npz, 32, strict_split=False)["modes"]
+                batched = raspi_infer.evaluate_testdata(
+                    EEGDenoiser(Path(tmp) / "m.onnx", n_threads=1),
+                    npz, 32, strict_split=False)["modes"]
+
+        self.assertIn("epoch mode (stepped)", stepped)
+        self.assertNotIn("epoch mode", stepped,
+                         "the step graph borrowed the batched path's row name")
+        # No stream row either: for a step graph it would be the same numbers.
+        self.assertFalse([k for k in stepped if k.startswith("stream")])
+
+        a, b = stepped["epoch mode (stepped)"], batched["epoch mode"]
+        for metric in a:
+            self.assertAlmostEqual(a[metric], b[metric], places=4,
+                                   msg=f"the two mechanisms disagree on {metric}")
 
 
 if __name__ == "__main__":

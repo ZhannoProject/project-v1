@@ -286,6 +286,12 @@ def _attention_facts(model) -> Optional[dict]:
     sample: MHA caches K and V at full width, MLA caches only the latent.
     Counted in fp32 elements from the architecture alone — TurboQuant
     quantises those tensors further and is not folded in here.
+
+    This arithmetic used to be the only account of the cache anywhere in the
+    project, because no code path held one: the ONNX export recomputes
+    attention every call.  ``_streaming_facts`` now weighs the real buffers
+    from ``models/incremental.py`` and ``report()`` carries both, so the
+    estimate below is checked rather than trusted.
     """
     from models.AttentionBlocks.attention import CausalTransformerDecoder
 
@@ -312,6 +318,56 @@ def _attention_facts(model) -> Optional[dict]:
         "kv_compression": round(2 * d / rank, 2) if rank else 1.0,
         "turboquant_bits": (getattr(attn.turboquant, "bits", None)
                             if getattr(attn, "turboquant", None) is not None else None),
+    }
+
+
+def _streaming_facts(model) -> dict:
+    """
+    The streaming state this model really allocates, weighed rather than derived.
+
+    ``_attention_facts`` computes the KV cache from the architecture.  This
+    builds the streaming wrapper and reads the live buffers, so the page can
+    show the two side by side and say whether they agree.  A disagreement means
+    the analytic formula has drifted from the code — the formula is a dozen
+    lines away from the model it describes, and that is exactly the kind of
+    claim that rots silently.
+
+    Three things only this path can report:
+
+    * ``conv_state_bytes`` — the dilated convolutions' ring buffers, which the
+      KV-cache arithmetic says nothing about.  They are not a rounding error:
+      for the sandwich variants they outweigh an MLA cache, so the end-to-end
+      saving from choosing MLA is smaller than the KV ratio alone suggests.
+      ``total_state_bytes`` is the number an embedded budget actually needs.
+    * ``warmup`` — samples before an output has the full context the batch path
+      would give it.
+    * whether the model can be streamed at all.
+
+    Never raises: the Params tab is the place people inspect the ``*_bi``
+    teachers and the TurboQuant presets, and those cannot stream by design.
+    The refusal is reported as a fact about the model, not as a failure of the
+    page.
+    """
+    from models.incremental import IncrementalModel
+
+    try:
+        stream = IncrementalModel(model)
+    except (ValueError, TypeError) as exc:
+        return {"available": False, "reason": str(exc)}
+
+    report_ = stream.cache_report()
+    window = report_["attention_window"]
+    return {
+        "available": True,
+        "attention": report_["attention"],
+        "attention_window": window,
+        "receptive_field": report_["receptive_field"],
+        "warmup": report_["warmup"],
+        "kv_per_step": report_["attn_floats_per_step"],
+        "kv_bytes_per_step": report_["attn_floats_per_step"] * BYTES_FP32,
+        "attn_cache_bytes": report_["attn_cache_bytes"],
+        "conv_state_bytes": report_["conv_state_bytes"],
+        "total_state_bytes": report_["total_state_bytes"],
     }
 
 
@@ -375,6 +431,9 @@ def report(values: Optional[dict] = None, *, config: Optional[dict] = None,
         "bytes_fp32": trainable * BYTES_FP32,
         "groups": _groups(model),
         "attention": _attention_facts(model),
+        # The same cache, weighed instead of derived. Kept as its own key so a
+        # disagreement between the two is visible rather than reconciled here.
+        "streaming": _streaming_facts(model),
     }
 
 

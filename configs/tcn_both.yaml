@@ -1,0 +1,50 @@
+# ============================================================
+# Plain causal TCN baseline on BOTH artifacts
+#
+# The recipe runs/tcn_both and runs/tcn_both_s42 were actually trained
+# with, read back out of their history.json: mse, lr 5e-4, 200 epochs,
+# batch 32, SNR [-7, 2] dB. It is tcn_se_both.yaml with the gate taken
+# off, which is what makes those two sets of runs comparable at all.
+#
+# Written down because the trainer's own fallbacks are NOT this recipe --
+# they are l1_combined at lr 5e-3 for 150 epochs -- so a run launched
+# with no config differs from every baseline on disk in the loss, the
+# learning rate and the length, and none of that would show up as
+# anything but a worse number.
+#
+# It is the base of the receptive-field ladder: the Receptive field tab
+# trains a rung by overriding --variant tcn_rf{N} and --save_dir on top
+# of this file, so a rung differs from the 125-sample baseline in its
+# reach and nothing else.
+# ============================================================
+
+# --- Model ---
+variant: "tcn"
+hidden_channels: 64
+                           # no se_reduction: the gate is what tcn_se adds,
+                           # and a value here would put it on the baseline
+
+# --- Data ---
+artifact: "BOTH"
+data_dir: "./data/EEGdenoisenet/data/"
+batch_size: 32
+snr_range_db: [-7.0, 2.0]
+master_seed: 42            # the seed picks the split, the SNR pairing, the
+                           # init and the batch order
+
+# --- Training ---
+learning_rate: 5.0e-4
+weight_decay: 0.0
+max_epochs: 200
+log_every: 20
+
+# --- Scheduler (CosineAnnealing + linear warmup) ---
+sched_warmup_epochs: 5
+eta_min: 1.0e-6
+
+# --- Loss function ---
+loss_fn: "mse"              # "l1_combined", "l2_combined", "mse", "l1", or "stft"
+
+# --- Output ---
+save_dir: "./runs/tcn_both"
+tensorboard: false

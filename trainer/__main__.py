@@ -16,6 +16,7 @@ flag overrides the corresponding YAML key.  Priority chain:
 
 import os
 import sys
+from pathlib import Path
 import argparse
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,7 +27,8 @@ from data.Dataloader import build_dataloaders
 from models.variants import (build_model_from_config, VARIANT_REGISTRY, variant_is_causal,
                              pinned_kwargs)
 from configs import load_config, merge_cli_overrides
-from trainer.checkpoint import ensure_writable
+from trainer.checkpoint import ensure_writable, recorded_seed
+from trainer.distillation import default_feature_layers
 from trainer.training import Trainer
 from trainer.distillation import KDTrainer, load_teacher
 from utils.utils import seed_everything, resolve_device, DEVICE_CHOICES
@@ -80,6 +82,9 @@ def main():
     parser.add_argument("--loss_fn", type=str, default=None,
                         choices=["mse", "l1", "stft", "l2_combined", "l1_combined"],
                         help="Loss function: 'l1_combined' (default), 'l2_combined', 'mse', 'l1', or 'stft'")
+    parser.add_argument("--se_reduction", type=int, default=None,
+                        help="Squeeze-and-Excitation ratio for the tcn_se variants: "
+                             "C -> C/r -> C, gated from a running mean so it stays causal")
     parser.add_argument("--kv_lora_rank", type=int, default=None,
                         help="KV low-rank bottleneck dim for MLA variants (default 16). "
                              "Ignored for the tcn_mla_r{N} aliases, which fix the rank themselves.")
@@ -165,7 +170,12 @@ def main():
     cfg.setdefault("teacher_config",    None)
     cfg.setdefault("kd_alpha",          0.5)
     cfg.setdefault("kd_feature_weight", 0.0)
-    cfg.setdefault("kd_feature_layers", ["decoder"])
+    # Left unset here: "decoder" is only the right default for the attention
+    # variants, and tcn/tcn_se have no decoder at all -- asking for one raised
+    # "'decoder' is not a submodule of TCNWithSE". Resolved from the model
+    # below, once the variant is known, so feature distillation can be
+    # switched on for any family without also knowing its module names.
+    cfg.setdefault("kd_feature_layers", None)
     cfg.setdefault("kd_output_loss",    None)
     cfg.setdefault("kd_feature_loss",   "mse")
     cfg.setdefault("init_from_teacher", False)
@@ -190,9 +200,35 @@ def main():
         # folder and the second overwrites the first.  The default seed keeps
         # the bare name, so every directory already in runs/ (and every path in
         # the README and the deploy scripts) still means what it did.
-        suffix = "" if cfg["master_seed"] == DEFAULT_MASTER_SEED else f"_s{cfg['master_seed']}"
-        cfg["save_dir"] = (f"./runs/{cfg['variant']}_{cfg['artifact'].lower()}"
-                           + ("_kd" if distil else "") + suffix)
+        base = (f"./runs/{cfg['variant']}_{cfg['artifact'].lower()}"
+                + ("_kd" if distil else ""))
+        seeded = f"{base}_s{cfg['master_seed']}"
+
+        if cfg["master_seed"] != DEFAULT_MASTER_SEED:
+            cfg["save_dir"] = seeded
+        else:
+            # ...but "the bare name belongs to the default seed" is only true
+            # while nothing else has taken it. runs/tcn_both holds a seed-67
+            # run -- trained before this convention, or with save_dir named
+            # outright -- so the default seed derived a path it was not
+            # allowed to write and the run was refused. Changing the seed and
+            # pressing Train is the whole point of a multi-seed trial, and it
+            # should not depend on which seed happened to get there first.
+            held, files = recorded_seed(Path(base))
+            if files and held is not None and held != cfg["master_seed"]:
+                # Known to be a different seed, so this is certainly a clash
+                # and the seeded folder is certainly free of it. Diverting
+                # beats refusing: nothing is destroyed and the run proceeds.
+                cfg["save_dir"] = seeded
+                print(f"[Config] {base} already holds a run at master_seed={held}; this one "
+                      f"is seed {cfg['master_seed']}, so it goes to {seeded} instead.")
+            else:
+                # Free, ours, or a run whose seed was never recorded. The last
+                # of those is left to ensure_writable: it cannot be shown to
+                # be a different run, and inventing a second folder for what
+                # may be the same one is a guess. Refusing asks the operator,
+                # which is what the guard is for.
+                cfg["save_dir"] = base
     if distil and not variant_is_causal(cfg["variant"]):
         print(f"[Warning] Student '{cfg['variant']}' is bidirectional; distillation is meant "
               f"to teach a causal student. Continuing anyway.")
@@ -254,7 +290,8 @@ def main():
             teacher_ckpt=cfg["teacher_ckpt"],
             kd_alpha=cfg["kd_alpha"],
             kd_feature_weight=cfg["kd_feature_weight"],
-            kd_feature_layers=cfg["kd_feature_layers"],
+            kd_feature_layers=(cfg["kd_feature_layers"]
+                               or default_feature_layers(model)),
             kd_output_loss=cfg["kd_output_loss"],
             kd_feature_loss=cfg["kd_feature_loss"],
             init_from_teacher=cfg["init_from_teacher"],

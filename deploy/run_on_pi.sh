@@ -50,12 +50,29 @@ set -euo pipefail
 
 PI="${1:?usage: $0 user@host [model_name]   e.g. $0 pi@raspberrypi.local tcn_mla_eog}"
 MODEL="${2:-tcn_mla_eog}"
+# INCREMENTAL=1 runs <MODEL>_step.onnx -- the one-sample graph that carries its
+# state in and out -- instead of the windowed one. Same runtime on the board
+# (onnxruntime + numpy); what changes is that the KV cache exists there at all.
+INCREMENTAL="${INCREMENTAL:-}"
+if [[ -n "$INCREMENTAL" ]]; then
+  GRAPH="${MODEL}_step"
+else
+  GRAPH="$MODEL"
+fi
 REMOTE_DIR="${REMOTE_DIR:-eeg}"          # relative to the Pi user's home
 TESTDATA="${TESTDATA:-EOG_test100.npz}"  # file in deploy/testdata/
 HOP="${HOP:-32}"
 THREADS="${THREADS:-2}"                  # 2 measured best on a Pi 5 (4 gives a 2x worse p95)
 LATENCY_EVERY="${LATENCY_EVERY:-400}"    # rolling per-hop latency line every N hops (1600 hops in the bundled set)
-LATENCY_STEM="latency_${MODEL}_hop${HOP}" # per-hop trace written on the Pi, copied back below
+# The trace name has to separate the two paths as well as the model: a step
+# run emits per sample, so it is hop 1 whatever HOP says, and naming it after
+# HOP would have it overwrite the windowed measurement of the same model --
+# two different numbers for two different methods, in one file.
+if [[ -n "$INCREMENTAL" ]]; then
+  LATENCY_STEM="incremental_${MODEL}_hop1"
+else
+  LATENCY_STEM="latency_${MODEL}_hop${HOP}"
+fi
 REALTIME_S="${REALTIME_S:-0}"            # seconds of paced live-loop replay (0 = skip)
 DUTY_HOPS="${DUTY_HOPS:-}"               # e.g. 64,32,16,8,4 -> duty-cycle sweep (empty = skip)
 DUTY_S="${DUTY_S:-20}"                   # paced seconds per hop in the sweep
@@ -75,8 +92,8 @@ FILES=(
   "$DEPLOY/raspi_infer.py"
   "$DEPLOY/preflight.py"
   "$DEPLOY/requirements-raspi.txt"
-  "$DEPLOY/artifacts/$MODEL.onnx"
-  "$DEPLOY/artifacts/$MODEL.json"
+  "$DEPLOY/artifacts/$GRAPH.onnx"
+  "$DEPLOY/artifacts/$GRAPH.json"
   "$DEPLOY/testdata/$TESTDATA"
 )
 for f in "${FILES[@]}"; do
@@ -163,8 +180,9 @@ scp -q "${SSH_OPTS[@]}" "${FILES[@]}" "$SCP_PI:~/$REMOTE_DIR/"
 # killed the run at line 45 -- after the files had been copied and the governor
 # had been changed. %q quoting also survives a value with a space or a quote in
 # it, which the hand-written 'single quotes' did not.
-REMOTE_VARS=(REMOTE_DIR MODEL TESTDATA HOP THREADS LATENCY_EVERY LATENCY_STEM
-             REALTIME_S DUTY_HOPS DUTY_S CPUS GOVERNOR REQUIRE_LOCKED CHECK_ONLY SPIN)
+REMOTE_VARS=(REMOTE_DIR MODEL GRAPH INCREMENTAL TESTDATA HOP THREADS LATENCY_EVERY
+             LATENCY_STEM REALTIME_S DUTY_HOPS DUTY_S CPUS GOVERNOR REQUIRE_LOCKED
+             CHECK_ONLY SPIN)
 REMOTE_ENV=""
 for v in "${REMOTE_VARS[@]}"; do
   printf -v q '%q' "${!v-}"
@@ -174,6 +192,9 @@ done
 echo "==> running on $PI"
 ssh "${SSH_OPTS[@]}" "$PI" "$REMOTE_ENV bash -s" <<'REMOTE'
 set -euo pipefail
+# An array cannot ride through the scalar env above, so it is rebuilt here
+# from the flag that did travel.
+if [[ -n "$INCREMENTAL" ]]; then STEP_ARGS=(--incremental); else STEP_ARGS=(); fi
 cd ~/"$REMOTE_DIR"
 if [[ ! -x env/bin/python ]]; then
   echo "--> creating venv (first run only)"
@@ -255,9 +276,18 @@ SAMPLER=$!
 # thermal zone every two seconds on the board forever, and leave the temp file
 # behind with it. An EXIT trap covers every way out of here but SIGKILL.
 trap 'kill "$SAMPLER" 2>/dev/null || true; rm -f "$PEAK_FILE"' EXIT
+# Clear this stem's traces on the board before measuring. The copy-back at
+# the end is a glob -- ${LATENCY_STEM}*.json -- so anything left here from an
+# earlier run comes home with a fresh timestamp and is read as part of *this*
+# one. That is how a run with the duty sweep switched off still produced a row
+# saying "duty sweep": the file was the previous run's, resurrected by scp.
+# Nothing is lost by deleting them; they were copied back when they were made.
+rm -f "$LATENCY_STEM".json "$LATENCY_STEM".csv "$LATENCY_STEM"_*.json "$LATENCY_STEM"_*.csv
+
 echo "--> before: $(temp)°C  $(clock)  throttled=$(thr)"
 
-env/bin/python raspi_infer.py "$MODEL.onnx" --threads "$THREADS" --hop "$HOP" "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}" \
+env/bin/python raspi_infer.py "$GRAPH.onnx" --threads "$THREADS" --hop "$HOP" \
+    "${STEP_ARGS[@]+"${STEP_ARGS[@]}"}" "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}" \
     --benchmark --testdata "$TESTDATA" \
     --latency --latency_every "$LATENCY_EVERY" --latency_out "$LATENCY_STEM"
 
@@ -272,14 +302,16 @@ np.save("realtime_rec.npy", sig)
 print(f"--> realtime replay: {len(sig)} samples = {len(sig) / fs:.1f} s at {fs} Hz")
 PY
   echo "--> $(temp)°C  $(clock) before paced replay"
-  env/bin/python raspi_infer.py "$MODEL.onnx" --threads "$THREADS" --hop "$HOP" "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}" \
+  env/bin/python raspi_infer.py "$GRAPH.onnx" --threads "$THREADS" --hop "$HOP" \
+    "${STEP_ARGS[@]+"${STEP_ARGS[@]}"}" "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}" \
       --input realtime_rec.npy --stream --realtime \
       --latency --latency_every "$(( LATENCY_EVERY > 0 ? LATENCY_EVERY / 8 : 0 ))" --latency_out "${LATENCY_STEM}_realtime"
 fi
 
 if [[ -n "$DUTY_HOPS" ]]; then
   echo "--> $(temp)°C  $(clock) before duty-cycle sweep"
-  env/bin/python raspi_infer.py "$MODEL.onnx" --threads "$THREADS" "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}" --testdata "$TESTDATA" \
+  env/bin/python raspi_infer.py "$GRAPH.onnx" --threads "$THREADS" \
+    "${STEP_ARGS[@]+"${STEP_ARGS[@]}"}" "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}" --testdata "$TESTDATA" \
       --duty_cycle "$DUTY_HOPS" --duty_seconds "$DUTY_S" --latency_out "$LATENCY_STEM"
 fi
 

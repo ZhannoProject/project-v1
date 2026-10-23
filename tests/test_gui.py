@@ -1,4 +1,5 @@
 """Run: python -m unittest discover -s tests -p 'test_gui.py'."""
+import contextlib
 import json
 import os
 import re
@@ -290,7 +291,14 @@ class RunsListingTests(unittest.TestCase):
             h = {"train_loss": [1.0] * n, "val_loss": [1.0 - i / 100 for i in range(n)],
                  "rrmse_t": [0.7] * n, "rrmse_s": [0.6] * n, "acc": [0.8] * n}
             if loss_fn:
-                h["config"] = {"loss_fn": loss_fn, "artifact": "EOG"}
+                # The artifact a run records has to agree with its own name:
+                # list_runs prefers the recorded value (a run knows what it
+                # trained on; the name only encodes it by convention), so a
+                # fixture that writes EOG into a directory called *_emg is
+                # describing a run that cannot exist.
+                artifact = ("EMG" if name.endswith("_emg")
+                            else "BOTH" if name.endswith("_both") else "EOG")
+                h["config"] = {"loss_fn": loss_fn, "artifact": artifact}
             (d / "history.json").write_text(json.dumps(h))
         if sidecar_loss:
             (d / "loss_fn.json").write_text(json.dumps(
@@ -589,12 +597,24 @@ class ApiTests(unittest.TestCase):
         cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
         cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
         cls.thread.start()
-        server.JOB = TrainingJob()
+        server.TRAIN_JOBS.reset()
 
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown(); cls.srv.server_close()
         cls.tmp.__exit__(None, None, None)
+
+    @contextlib.contextmanager
+    def no_runs(self, *taken):
+        """A runs/ tree holding exactly the directories named, and nothing else."""
+        from gui import lookahead
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for save_dir in taken:
+                (root / save_dir).mkdir(parents=True, exist_ok=True)
+                (root / save_dir / "best.pt").write_bytes(b"")
+            with mock.patch.object(lookahead, "PROJECT_ROOT", root):
+                yield root
 
     def call_raw(self, path):
         """Like call(), but returns the body bytes — the figure route is not JSON."""
@@ -715,12 +735,199 @@ class ApiTests(unittest.TestCase):
 
         slow = [sys.executable, "-c", "import time; print('x', flush=True); time.sleep(30)"]
         with mock.patch.object(server, "build_train_command", return_value=slow):
-            self.assertEqual(self.call("/api/train", {"name": "tcn_eog.yaml"})[0], 200)
-            self.assertEqual(self.call("/api/train", {"name": "tcn_eog.yaml"})[0], 409)
-        status, s = self.call("/api/train/stop", {})
+            # Several at once is the point: a seed repeat is n runs of one
+            # config, and waiting for each before starting the next made that
+            # a sequence of sittings. The cap is the only refusal left.
+            ids = []
+            for _ in range(server.TrainingJobs.MAX_ACTIVE):
+                status, s = self.call("/api/train", {"name": "tcn_eog.yaml"})
+                self.assertEqual(status, 200)
+                ids.append(s["id"])
+            self.assertEqual(len(set(ids)), server.TrainingJobs.MAX_ACTIVE,
+                             "each run needs an id of its own, or they share a log")
+            status, err = self.call("/api/train", {"name": "tcn_eog.yaml"})
+            self.assertEqual(status, 409)
+            self.assertIn(str(server.TrainingJobs.MAX_ACTIVE), err["error"])
+
+        # Every run is listed, and each is addressable by id.
+        status, s = self.call(f"/api/train/status?id={ids[0]}")
+        self.assertEqual(s["id"], ids[0])
+        self.assertEqual(len([j for j in s["jobs"] if j["running"]]),
+                         server.TrainingJobs.MAX_ACTIVE)
+        # The run that finished earlier in this test is still listed: a
+        # finished run is kept so its log and curve can be read back, which is
+        # most of why the switcher is worth having.
+        self.assertTrue(any(not j["running"] for j in s["jobs"]))
+        self.assertEqual(s["jobs"][0]["id"], ids[-1], "newest first")
+
+        # Stopping one leaves the others alone.
+        status, s = self.call("/api/train/stop", {"id": ids[0]})
         self.assertTrue(s["stopped"])
-        time.sleep(0.3)
-        self.assertFalse(self.call("/api/train/status")[1]["running"])
+        time.sleep(0.4)
+        self.assertFalse(self.call(f"/api/train/status?id={ids[0]}")[1]["running"])
+        self.assertTrue(self.call(f"/api/train/status?id={ids[1]}")[1]["running"])
+
+        for job_id in ids[1:]:
+            self.call("/api/train/stop", {"id": job_id})
+        time.sleep(0.4)
+        self.assertFalse(any(j["running"] for j in
+                             self.call("/api/train/status")[1]["jobs"]))
+
+    def test_a_status_without_an_id_means_the_newest_running_run(self):
+        """What a page that has only ever shown one run asks for."""
+        server.TRAIN_JOBS.reset()
+        slow = [sys.executable, "-c", "import time; print('x', flush=True); time.sleep(30)"]
+        try:
+            with mock.patch.object(server, "build_train_command", return_value=slow):
+                first = self.call("/api/train", {"name": "tcn_eog.yaml"})[1]["id"]
+                second = self.call("/api/train", {"name": "tcn_eog.yaml"})[1]["id"]
+            self.assertNotEqual(first, second)
+            self.assertEqual(self.call("/api/train/status")[1]["id"], second)
+        finally:
+            server.TRAIN_JOBS.stop_all()
+
+    def test_a_rung_trains_at_every_seed_asked_for(self):
+        """
+        One run is a point with no spread, so the tab offers the seeds
+        together. They start as ordinary training runs, which is what lets the
+        Train tab hold them side by side.
+        """
+        server.TRAIN_JOBS.reset()
+        slow = [sys.executable, "-c", "import time; print('x', flush=True); time.sleep(30)"]
+        try:
+            # An empty runs tree: whether a rung is trained is whatever the
+            # person has been doing this week, and a test that reads the real
+            # one passes until they train that rung.
+            with self.no_runs(), \
+                 mock.patch.object(server, "build_train_command", return_value=slow):
+                code, body = self.call("/api/lookahead/train",
+                                       {"lookahead": 124, "master_seeds": [42, 54, 67]})
+            self.assertEqual(code, 200, body)
+            self.assertEqual(len(body["started"]), 3)
+            self.assertEqual(len(set(body["started"])), 3, "three runs, three jobs")
+            self.assertEqual(body["id"], body["started"][0],
+                             "the page opens on the first of them")
+            self.assertEqual([r["master_seed"] for r in body["planned"]["runs"]], [42, 54, 67])
+        finally:
+            server.TRAIN_JOBS.stop_all()
+
+    def test_a_seed_that_already_has_a_run_is_named_not_just_refused(self):
+        """And nothing starts, so the request is all or none."""
+        server.TRAIN_JOBS.reset()
+        with self.no_runs("runs/tcn_se_both"):
+            code, body = self.call("/api/lookahead/train",
+                                   {"lookahead": 0, "master_seeds": [42, 54, 67]})
+        self.assertEqual(code, 409)
+        self.assertIn("runs/tcn_se_both", body["error"])
+        self.assertIn("overwrite", body["error"])
+        self.assertEqual(server.TRAIN_JOBS.summaries(), [])
+
+    def test_more_seeds_than_room_refuses_before_starting_any(self):
+        """
+        Starting two of three and refusing the third leaves a half-done
+        request that reads like a failure of the runs that did start.
+        """
+        server.TRAIN_JOBS.reset()
+        slow = [sys.executable, "-c", "import time; print('x', flush=True); time.sleep(30)"]
+        try:
+            with self.no_runs(), \
+                 mock.patch.object(server.TRAIN_JOBS, "MAX_ACTIVE", 2), \
+                 mock.patch.object(server, "build_train_command", return_value=slow):
+                code, body = self.call("/api/lookahead/train",
+                                       {"lookahead": 124, "master_seeds": [42, 54, 67]})
+            self.assertEqual(code, 409)
+            self.assertIn("more than there is room for", body["error"])
+            self.assertEqual(server.TRAIN_JOBS.summaries(), [],
+                             "a refused batch must not leave runs going")
+        finally:
+            server.TRAIN_JOBS.stop_all()
+
+    def test_overwrite_lets_a_taken_seed_be_retrained(self):
+        """Otherwise the 409 telling the reader to tick overwrite names a box
+        that does not exist."""
+        server.TRAIN_JOBS.reset()
+        slow = [sys.executable, "-c", "import time; print('x', flush=True); time.sleep(30)"]
+        try:
+            with self.no_runs("runs/tcn_se_both"), \
+                 mock.patch.object(server, "build_train_command", return_value=slow):
+                code, body = self.call("/api/lookahead/train",
+                                       {"lookahead": 0, "master_seeds": [42],
+                                        "overwrite": True})
+            self.assertEqual(code, 200, body)
+            self.assertIn("--overwrite", body["planned"]["runs"][0]["extra"])
+        finally:
+            server.TRAIN_JOBS.stop_all()
+
+    def test_a_finished_run_is_kept_but_the_oldest_are_dropped(self):
+        """Its log and curve stay readable; the list does not grow forever."""
+        jobs = server.TrainingJobs()
+        jobs.MAX_KEPT = 2
+        quick = [sys.executable, "-c", "pass"]
+        for _ in range(4):
+            job = jobs.start(quick, config_io.PROJECT_ROOT, Path(tempfile.gettempdir()))
+            for _ in range(200):
+                if not job.running:
+                    break
+                time.sleep(0.01)
+        self.assertLessEqual(len(jobs.summaries()), 2)
+
+    def test_a_running_job_is_never_dropped(self):
+        jobs = server.TrainingJobs()
+        jobs.MAX_KEPT = 1
+        slow = [sys.executable, "-c", "import time; time.sleep(30)"]
+        quick = [sys.executable, "-c", "pass"]
+        try:
+            held = jobs.start(slow, config_io.PROJECT_ROOT, Path(tempfile.gettempdir()))
+            for _ in range(3):
+                done = jobs.start(quick, config_io.PROJECT_ROOT, Path(tempfile.gettempdir()))
+                for _ in range(200):
+                    if not done.running:
+                        break
+                    time.sleep(0.01)
+            self.assertIn(held.id, [j["id"] for j in jobs.summaries()])
+        finally:
+            jobs.stop_all()
+
+    def test_a_run_is_named_after_the_directory_it_writes(self):
+        """Four runs of one preset differ only in save_dir, so that is the
+        label that tells them apart on the switcher."""
+        self.assertEqual(server._train_title("tcn_se_both.yaml",
+                                             ["python", "--save_dir", "runs/tcn_se_la1_both_s54"]),
+                         "tcn_se_la1_both_s54")
+        # A preset that names its own save_dir: that is the path, so that is
+        # the label.
+        self.assertEqual(server._train_title("tcn_se_both.yaml", ["python"]), "tcn_se_both")
+
+    def test_a_run_with_no_save_dir_is_named_after_the_one_it_derives(self):
+        """Naming it after the preset gave every run from one file the same
+        pill -- and hid that they derive one directory and overwrite each
+        other. The label repeats the trainer's own derivation instead."""
+        cmd = ["python", "-m", "trainer", "--variant", "tcn_se_la8",
+               "--artifact", "BOTH", "--master_seed", "54"]
+        # No preset to read: derived from the flags alone.
+        self.assertEqual(server._train_title("not_a_preset.yaml", cmd), "tcn_se_la8_both_s54")
+        # Seed 42 keeps the bare name, the rule the trainer follows.
+        self.assertEqual(
+            server._train_title("not_a_preset.yaml", cmd[:-2] + ["--master_seed", "42"]),
+            "tcn_se_la8_both")
+        # A preset that pins save_dir wins over the derivation, because that
+        # is what the trainer does: overriding --variant on such a preset
+        # sends the run to the preset's directory, not a derived one, and the
+        # label has to say where it will really land.
+        self.assertEqual(server._train_title("tcn_eog.yaml", cmd), "tcn_eog")
+
+    def test_two_live_runs_deriving_one_directory_get_different_pills(self):
+        """They will overwrite each other, which the switcher cannot fix --
+        but it must not show two identical labels while it happens."""
+        jobs = server.TrainingJobs()
+        slow = [sys.executable, "-c", "import time; time.sleep(30)"]
+        try:
+            a = jobs.start(slow, config_io.PROJECT_ROOT, Path(tempfile.gettempdir()), title="same")
+            b = jobs.start(slow, config_io.PROJECT_ROOT, Path(tempfile.gettempdir()), title="same")
+            self.assertEqual(a.title, "same")
+            self.assertEqual(b.title, "same #2")
+        finally:
+            jobs.stop_all()
 
 
     def test_eval_endpoints_with_stubbed_command(self):
@@ -766,7 +973,7 @@ class ApiTests(unittest.TestCase):
     def test_an_evaluation_does_not_block_training(self):
         """The two jobs are independent; neither 409s the other."""
         server.EVAL_JOB = server.EvalJob()
-        server.JOB = TrainingJob()
+        server.TRAIN_JOBS.reset()
         slow = [sys.executable, "-c", "import time; print('x', flush=True); time.sleep(30)"]
         try:
             with mock.patch.object(server, "build_eval_command", return_value=(slow, "figures/o")):
@@ -824,6 +1031,90 @@ class ParamReportTests(unittest.TestCase):
         r = params.report({"variant": "tcn_mla_r8", "hidden_channels": 64, "kv_lora_rank": 32})
         self.assertEqual(r["attention"]["kv_lora_rank"], 8)
         self.assertIn("fixes kv_lora_rank = 8", " ".join(r["notes"]))
+
+    def test_the_measured_cache_confirms_the_analytic_one(self):
+        """
+        The Params tab reports the KV cache twice: derived from the
+        architecture, and weighed off the streaming model's live buffers.  The
+        whole point is that the two agree, so a drift between the formula in
+        params.py and the code in models/incremental.py shows up here rather
+        than in the Letter.
+        """
+        for variant in ("tcn_mha", "tcn_mla", "tcn_mla_par", "tcn_mla_r8"):
+            with self.subTest(variant=variant):
+                r = params.report({"variant": variant, "hidden_channels": 64,
+                                   "n_attn_layers": 2, "kv_lora_rank": 16})
+                self.assertTrue(r["streaming"]["available"])
+                self.assertEqual(r["streaming"]["kv_per_step"],
+                                 r["attention"]["kv_per_step"],
+                                 "measured cache disagrees with the analytic formula")
+                self.assertEqual(r["streaming"]["kv_bytes_per_step"],
+                                 r["attention"]["kv_bytes_per_step"])
+
+    def test_mla_measures_a_smaller_cache_than_mha(self):
+        base = {"hidden_channels": 64, "n_attn_layers": 2, "n_heads": 4, "kv_lora_rank": 16}
+        mha = params.report({**base, "variant": "tcn_mha"})["streaming"]
+        mla = params.report({**base, "variant": "tcn_mla"})["streaming"]
+        self.assertEqual(mha["kv_per_step"] / mla["kv_per_step"], 4.0)
+        # The end-to-end number an embedded budget needs is smaller than 4x,
+        # because the convolution ring buffers are the same in both and the
+        # KV arithmetic does not count them.
+        self.assertLess(mla["total_state_bytes"], mha["total_state_bytes"])
+        self.assertLess(mha["total_state_bytes"] / mla["total_state_bytes"], 4.0)
+        self.assertEqual(mha["conv_state_bytes"], mla["conv_state_bytes"])
+
+    def test_the_baseline_reports_conv_state_and_no_cache(self):
+        r = params.report({"variant": "tcn", "hidden_channels": 64})
+        self.assertIsNone(r["attention"])
+        self.assertTrue(r["streaming"]["available"])
+        self.assertEqual(r["streaming"]["attn_cache_bytes"], 0)
+        self.assertGreater(r["streaming"]["conv_state_bytes"], 0)
+
+    def test_unstreamable_models_report_a_reason_not_an_error(self):
+        """
+        The Params tab is where the bidirectional teachers and the TurboQuant
+        presets get inspected, and neither can stream.  That has to come back
+        as a fact about the model, or the tab breaks on exactly the variants it
+        exists to explain.
+        """
+        for variant in ("tcn_mla_bi", "tcn_bi", "tcn_mha_full_bi"):
+            with self.subTest(variant=variant):
+                r = params.report({"variant": variant, "hidden_channels": 64})
+                self.assertFalse(r["streaming"]["available"])
+                self.assertTrue(r["streaming"]["reason"])
+        r = params.report({"variant": "tcn_mla", "hidden_channels": 64,
+                           "turboquant": True})
+        self.assertFalse(r["streaming"]["available"])
+        self.assertIn("TurboQuant", r["streaming"]["reason"])
+
+    def test_the_form_does_not_pin_a_feature_layer_the_model_lacks(self):
+        """
+        ``kd_feature_layers`` must default to empty, not to "decoder".
+
+        A hard default is written into every config the GUI saves, so the
+        trainer never sees it unset and never gets to resolve it from the
+        model. ``decoder`` is attention-only, so a GUI run of tcn/tcn_se with
+        feature distillation switched on died with "'decoder' is not a
+        submodule of TCNWithSE" -- the one knob that makes KD do more than
+        chase the teacher's output was unusable from the interface.
+        """
+        field = next(f for s in config_io.SCHEMA for f in s.fields
+                     if f.key == "kd_feature_layers")
+        self.assertIsNone(field.default,
+                          "a pinned default is sent on every run and blocks the model's own choice")
+        self.assertTrue(field.nullable, "it has to be clearable")
+        self.assertIn("empty", field.help.lower(),
+                      "the help has to say what empty does")
+
+    def test_a_saved_config_leaves_the_layer_for_the_model_to_pick(self):
+        from trainer.distillation import default_feature_layers
+        from models.variants import build_model
+        text = config_io.update_yaml_text(
+            'variant: "tcn"\nkd_feature_weight: 0.0\nkd_feature_layers: ["decoder"]\n',
+            {"variant": "tcn_se", "kd_feature_weight": 0.5, "kd_feature_layers": None})
+        self.assertIn("kd_feature_layers: null", text)
+        # ...and what the trainer then picks is a module the model has.
+        self.assertEqual(default_feature_layers(build_model("tcn_se")), ["backbone"])
 
     def test_an_impossible_shape_is_a_message_not_a_traceback(self):
         with self.assertRaisesRegex(ValueError, "divisible"):
@@ -886,12 +1177,89 @@ class RunsTablePageTests(unittest.TestCase):
     PAGE = (ROOT / "gui" / "static" / "index.html").read_text()
 
     def test_header_row_and_group_spans_agree_on_the_column_count(self):
-        head = re.search(r"const HEAD = `(.*?)`;", self.PAGE, re.S)
-        self.assertIsNotNone(head, "HEAD row not found")
-        columns = len(re.findall(r"<th", head.group(1)))
-        spans = set(re.findall(r'colspan="(\d+)"', self.PAGE))
-        self.assertEqual(spans, {str(columns)},
-                         f"header has {columns} columns; colspans say {sorted(spans)}")
+        """
+        Three tables live in this page now — the training runs, the Deploy
+        runs view, which has its own columns because a measurement has a
+        machine and a deadline and no epochs, and the receptive-field ladder,
+        whose untrained rungs span the columns they have no numbers for. Each
+        one's colspans are checked against its own header rather than all
+        three against one number, so a column added to any of them still shows
+        up here.
+        """
+        def columns(name):
+            head = re.search(rf"const {name} = `(.*?)`;", self.PAGE, re.S)
+            self.assertIsNotNone(head, f"{name} row not found")
+            return len(re.findall(r"<th", head.group(1)))
+
+        def carve(opening, closing):
+            """Take a block out of the page so what is left is judged alone."""
+            start = self.PAGE.index(opening)
+            end = self.PAGE.index(closing, start + len(opening))
+            return self.PAGE[start:end], (start, end)
+
+        # The deploy branch of runsMarkup and the ladder's renderer, split out
+        # so each table's spans are judged against the header it uses.
+        deploy_block, deploy_at = carve('} else if (view === "deploy") {', "} else {")
+        rf_block, rf_at = carve("function renderRfTable() {", "\n  }")
+        rest = self.PAGE
+        for start, end in sorted((deploy_at, rf_at), reverse=True):
+            rest = rest[:start] + rest[end:]
+
+        self.assertEqual(set(re.findall(r'colspan="(\d+)"', deploy_block)),
+                         {str(columns("DEPLOY_HEAD"))},
+                         "the Deploy runs view's colspans do not match DEPLOY_HEAD")
+        # The ladder's untrained rungs still print the three columns that are
+        # known without training — reach, schedule, parameter cost — and span
+        # only the rest, so each row is measured by its total width.
+        wide = columns("RF_HEAD")
+        for row in rf_block.split("<tr")[1:]:
+            spans = [int(n) for n in re.findall(r'colspan="(\d+)"', row)]
+            width = len(re.findall(r"<td", row)) - len(spans) + sum(spans)
+            self.assertEqual(width, wide,
+                             f"a receptive-field row is {width} columns wide, "
+                             f"RF_HEAD has {wide}")
+        self.assertEqual(set(re.findall(r'colspan="(\d+)"', rest)),
+                         {str(columns("HEAD"))},
+                         "the runs table's colspans do not match HEAD")
+
+    def test_the_receptive_field_table_costs_a_rung_one_way(self):
+        """
+        A run's ``params`` counts every tensor in its state_dict, including
+        BatchNorm's running statistics; the ladder counts trainable
+        parameters. They differ by 258 per block at width 64, so a column
+        that took whichever was available would show a rung getting more
+        expensive the moment it was trained.
+        """
+        block = re.search(r"function renderRfTable\(\) \{(.*?)\n  \}", self.PAGE, re.S)
+        self.assertIsNotNone(block, "renderRfTable not found")
+        cells = re.findall(r'<td class="num"[^>]*>\$\{fmtN\((.*?)\)\}', block.group(1))
+        self.assertTrue(cells, "no parameter cell found")
+        self.assertNotIn("r.params", cells, "the cost column reads a checkpoint's state size")
+
+    def test_opening_a_deploy_row_loads_every_trace_of_that_measurement(self):
+        """
+        The Deploy tab draws two panels from two slots keyed by trace kind
+        (``latency`` and ``duty``), so opening only the per-hop trace left the
+        duty-cycle chart showing the previous measurement's sweep, or nothing.
+
+        A row therefore carries all of its traces and the handler loads the
+        set, clearing both slots first — a row with no duty sweep must not
+        keep another model's, which would attribute one model's duty cycle to
+        another.
+        """
+        row = re.search(r"function deployRow\(r\) \{(.*?)\n  \}", self.PAGE, re.S)
+        self.assertIsNotNone(row, "deployRow not found")
+        self.assertIn("data-traces=", row.group(1),
+                      "the row does not carry the measurement's other traces")
+
+        handler = re.search(r'querySelectorAll\("button\[data-trace\]"\)(.*?)\}\)\);',
+                            self.PAGE, re.S)
+        self.assertIsNotNone(handler, "the data-trace click handler was not found")
+        body = handler.group(1)
+        self.assertIn("dataset.traces", body, "the handler ignores the row's other traces")
+        self.assertIn("{ latency: null, duty: null }", body,
+                      "the handler does not clear the panels, so a stale duty sweep survives")
+        self.assertIn("loadPiTrace", body)
 
     def test_a_run_row_fills_every_column(self):
         row = re.search(r"return `<tr\$\{rowAttrs\}>(.*?)</tr>`;", self.PAGE, re.S)
@@ -915,6 +1283,93 @@ class RunsTablePageTests(unittest.TestCase):
                              f"an action branch does not emit exactly one cell: {branch.strip()}")
 
 
+class LookaheadPageTests(unittest.TestCase):
+    """The ladder's training controls, which are built in the page."""
+
+    PAGE = (ROOT / "gui" / "static" / "index.html").read_text()
+
+    def test_seeds_are_ticked_together_not_chosen_one_at_a_time(self):
+        """
+        A rung trained at one seed is a point the chart draws hollow, because
+        the spread there is unknown. Offering one seed at a time made the
+        ordinary unit of work three sittings.
+        """
+        self.assertNotIn('id="laSeed"', self.PAGE, "the one-of-three select is back")
+        self.assertIn('id="laSeeds"', self.PAGE)
+        self.assertRegex(self.PAGE, r'master_seeds: picked\.map')
+
+    def test_the_tab_has_the_overwrite_the_refusal_names(self):
+        """The server's 409 says to tick overwrite, so there has to be one."""
+        self.assertIn('id="laOverwrite"', self.PAGE)
+        self.assertRegex(self.PAGE, r'overwrite: \$\("#laOverwrite"\)\.checked')
+
+    def test_the_anchor_is_not_counted_as_a_rung(self):
+        """
+        "10 / 9 rungs priced" — the 0 ms baseline and the unbounded ceiling
+        are the two ends the ladder is measured between, not steps on it.
+        It only showed once every rung had been trained.
+        """
+        self.assertIn("const rungs = rows.filter(r => !r.unbounded && r.lookahead !== 0)",
+                      self.PAGE)
+        self.assertIn("${priced.length} / ${rungs.length}", self.PAGE)
+        self.assertNotIn("rows.length - 2", self.PAGE)
+
+    def test_a_rung_with_no_past_is_off_the_price_curve(self):
+        """
+        The line is read as "pay this latency, get this error". A rung whose
+        window has left the past entirely is not one more step along it — it
+        is the baseline's mirror — so joining it to the rest would draw a
+        purchase nobody can make.
+        """
+        fn = re.search(r"function renderLookaheadChart\(.*?\n  \}", self.PAGE, re.S)
+        self.assertIsNotNone(fn, "renderLookaheadChart not found")
+        body = fn.group(0)
+        self.assertIn("const curve = pts.filter(r => !r.one_sided)", body)
+        self.assertRegex(body, r"const line = curve\.map")
+        self.assertIn("no past", body, "the chart does not say why the point is off the curve")
+
+    def test_the_table_shows_the_whole_window_not_just_what_was_bought(self):
+        """
+        Only what the budget bought was ever shown. The two numbers come out
+        of one fixed window, and showing both is also what answers "186 of
+        what?" — the window is 124 taps, the rung number is the licence.
+        """
+        self.assertIn(">window</th>", self.PAGE)
+        self.assertIn("${r.past} / ${r.ahead}", self.PAGE)
+
+    def test_the_share_rides_with_the_name_in_both_places(self):
+        """
+        `la186` on a 124-tap window invites an arithmetic that does not work
+        out. The picker is where a rung is chosen and the table is where the
+        rungs are compared, so both carry the share — one is not enough, and
+        two spellings of it would be worse than none.
+        """
+        self.assertIn("state.la.meta.shares", self.PAGE)
+        self.assertIn("${n} — tcn_se_la${n}${tail}", self.PAGE)
+        label = re.search(r"const label = r\.unbounded(.*?);\n", self.PAGE, re.S)
+        self.assertIsNotNone(label, "the rung label was not found")
+        self.assertIn("share", label.group(0), "the rung column drops the share")
+
+    def test_the_preview_asks_about_every_seed_not_the_ticked_ones(self):
+        """Which directories are taken is what decides the ticks."""
+        fn = re.search(r"async function previewLookahead\(.*?\n  \}", self.PAGE, re.S)
+        self.assertIsNotNone(fn, "previewLookahead not found")
+        self.assertIn("state.la.meta.seeds", fn.group(0))
+
+    def test_a_trained_seed_is_unticked_rather_than_hidden(self):
+        """With overwrite it is a legitimate thing to ask for, and hiding it
+        would hide that the rung has been trained before."""
+        fn = re.search(r"function renderLaTrain\(.*?\n  \}", self.PAGE, re.S)
+        self.assertIsNotNone(fn, "renderLaTrain not found")
+        self.assertIn("cb.checked = !r.exists", fn.group(0))
+        self.assertNotIn("cb.disabled", fn.group(0))
+
+    def test_several_commands_are_shown_as_several_lines(self):
+        """`.cmd` wraps on word boundaries, so three commands joined by
+        newlines would print as one unreadable paragraph."""
+        self.assertIn("#laCommand { white-space: pre-wrap; }", self.PAGE)
+
+
 class RunPickerPageTests(unittest.TestCase):
     """The Evaluate tab picks its run from the Runs table rather than a bare
     dropdown, which is only true for as long as the two share a renderer."""
@@ -929,12 +1384,25 @@ class RunPickerPageTests(unittest.TestCase):
         self.assertIn('runsMarkup(state.runsView, "tab")', self.PAGE)
         self.assertIn('runsMarkup(state.pickView, "pick")', self.PAGE)
 
-    def test_the_picker_offers_the_same_views_as_the_runs_tab(self):
+    def test_the_picker_offers_the_runs_tab_views_minus_the_unpickable(self):
+        """
+        The picker and the tab share ``runsMarkup``, so every view the picker
+        offers must be one the tab has.
+
+        They are no longer identical: the tab also lists Deploy runs, and a
+        measurement is not something the picker can return — it picks a
+        checkpoint to evaluate or deploy, and a latency trace is neither.
+        """
         def views(container):
             block = re.search(rf'id="{container}">(.*?)</span>', self.PAGE, re.S)
             self.assertIsNotNone(block, f"{container} not found")
             return set(re.findall(r'data-view="([^"]+)"', block.group(1)))
-        self.assertEqual(views("pickView"), views("runsView"))
+
+        pick, tab = views("pickView"), views("runsView")
+        self.assertTrue(pick <= tab,
+                        f"the picker offers views the tab does not: {sorted(pick - tab)}")
+        self.assertEqual(tab - pick, {"deploy"},
+                         "the tab gained a view the picker skips without a reason recorded here")
 
     def test_the_picker_drops_the_actions_that_would_navigate_away(self):
         """curve and "Use as teacher" leave the tab; mid-choice that loses the
@@ -1188,8 +1656,11 @@ class EvalJobTests(unittest.TestCase):
 
     def test_training_and_evaluation_are_separate_jobs(self):
         """One must not lock out or overwrite the other."""
-        self.assertIsNot(server.JOB, server.EVAL_JOB)
-        self.assertEqual(server.JOB.KIND, "train")
+        # Training is a registry now (several runs at once) and evaluation is
+        # still one job; what must hold either way is that neither can end up
+        # writing into the other's buffer or log.
+        self.assertIsNot(server.TRAIN_JOBS, server.EVAL_JOB)
+        self.assertEqual(server.TRAIN_JOBS._factory().KIND, "train")
         self.assertEqual(server.EVAL_JOB.KIND, "eval")
         train, ev = server.TrainingJob(), server.EvalJob()
         train._scan("[fit | Epoch 1/3]")

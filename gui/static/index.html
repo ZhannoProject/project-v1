@@ -78,10 +78,14 @@
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
   .row .grow { flex: 1; }
   .cmd { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); word-break: break-all; margin-bottom: 8px; }
+  /* One line per seed, so three commands read as three commands and not as
+     one long one with the newlines collapsed away. */
+  #laCommand { white-space: pre-wrap; }
   .banner { display: none; padding: 8px 12px; border-radius: 8px; margin: 0 16px; font-size: 13px; }
   .banner.show { display: block; }
   .banner.err { background: color-mix(in srgb, var(--err) 12%, transparent); color: var(--err); }
   .banner.info { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
+  .banner.warn { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
   th { color: var(--muted); font-weight: 500; }
@@ -89,6 +93,10 @@
   th.num { text-align: right; }
   .badge { font-size: 10px; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); margin-left: 4px; }
   .badge.bi { color: var(--warn); border-color: var(--warn); }
+  /* Both read ahead, so both are warn-coloured; dashed means the reach is
+     bounded and stated, solid means it is the whole epoch. Same solid/dashed
+     distinction the loss badges draw between recorded and recovered. */
+  .badge.la { color: var(--warn); border-color: var(--warn); border-style: dashed; }
   .badge.kd { color: var(--accent); border-color: var(--accent); }
   .muted { color: var(--muted); }
   .badge.stale { color: var(--err); border-color: var(--err); }
@@ -100,12 +108,31 @@
   .seg button { border: 0; border-radius: 0; padding: 4px 10px; color: var(--muted); background: transparent; }
   .seg button + button { border-left: 1px solid var(--border); }
   .seg button.active { background: var(--accent); color: var(--accent-text); }
+  /* The run switcher: a dot carries the state so the label can stay the run's
+     own name, which is the thing that tells four runs of one preset apart. */
+  #jobTabs button { display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+  #jobTabs .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+  #jobTabs .dot.running { background: var(--accent); animation: jobpulse 1.4s ease-in-out infinite; }
+  #jobTabs .dot.ok { background: var(--ok); }
+  #jobTabs .dot.err { background: var(--err); }
+  #jobTabs button.active .dot { background: var(--accent-text); animation: none; }
+  @keyframes jobpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
   /* Display only: the variant label reads as a model name (TCN_MHA · EOG) while
      the DOM text and /api/runs keep the registry spelling ("tcn_mha"), which is
      what the YAML and build_model() use. The run rows below are directory names
      in runs/, so they stay as they are on disk. */
   tr.group td { background: var(--code); font-weight: 600; color: var(--text); text-transform: uppercase; }
   tr.group .sub { font-weight: 400; color: var(--muted); margin-left: 8px; font-size: 11.5px; text-transform: none; }
+  /* A second line inside an ordinary cell: what a measurement was of, under
+     its name. tr.group's .sub is a trailing caption on one line and stays so. */
+  #runs td .sub { display: block; font-weight: 400; color: var(--muted); font-size: 11px; }
+  /* A number recovered from a job log rather than saved as data: the same
+     solid/dashed distinction the loss badges draw. */
+  #runs td .fromlog { border-bottom: 1px dashed var(--border); cursor: help; }
+  /* The method, under the machine. Incremental is the odd one out — PyTorch,
+     host only — so it is marked rather than left to read as a Pi number. */
+  #runs td .modeinc { color: var(--accent); }
+  #runs td.num .sub { font-size: 10.5px; }
   tr.group.warn td { color: var(--warn); }
   .badge.loss { color: var(--muted); }
   .badge.optim { color: var(--muted); }
@@ -142,7 +169,8 @@
   .facts b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
   /* Evaluate tab: a compact control grid, then whatever figures the run wrote. */
   #tab-eval .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 12px; margin-bottom: 10px; }
-  #tab-eval .efield { display: grid; gap: 3px; }
+  #tab-eval .efield { display: grid; gap: 3px; min-width: 0; }
+  #tab-eval .efield > * { min-width: 0; max-width: 100%; }
   #tab-eval .efield label { font-size: 11.5px; color: var(--muted); }
   #tab-eval .efield .hint { font-size: 11px; color: var(--muted); }
   #evalRuns { border: 1px solid var(--border); border-radius: 8px; max-height: 190px; overflow: auto; background: var(--panel); }
@@ -159,9 +187,27 @@
   #evalFigs figcaption .grow { flex: 1; }
   /* Deploy tab: the same control grid as Evaluate, then whatever the run measured. */
   #tab-deploy .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 12px; margin-bottom: 10px; }
-  #tab-deploy .efield { display: grid; gap: 3px; }
+  #tab-deploy .efield { display: grid; gap: 3px; min-width: 0; }
+  #tab-deploy .efield > * { min-width: 0; max-width: 100%; }
   #tab-deploy .efield label { font-size: 11.5px; color: var(--muted); }
-  #tab-deploy .efield .hint { font-size: 11px; color: var(--muted); }
+  #tab-deploy .efield .hint { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+  /* A hint worth keeping but not worth three lines of column on every render:
+     collapsed into a marker, shown on hover or keyboard focus. Nothing in the
+     grid clips, so the tip can be positioned absolutely against the field. */
+  .infodot { display: inline-flex; align-items: center; justify-content: center;
+    width: 13px; height: 13px; margin-left: 4px; border: 1px solid var(--border);
+    border-radius: 50%; color: var(--muted); font: 700 9.5px/1 inherit;
+    font-style: normal; cursor: help; position: relative; vertical-align: middle; }
+  .infodot:hover, .infodot:focus { border-color: var(--accent); color: var(--accent); outline: none; }
+  .infodot > .tip { position: absolute; left: 0; top: calc(100% + 6px); z-index: 60;
+    width: max-content; max-width: min(320px, 70vw); padding: 7px 9px;
+    border: 1px solid var(--border); border-radius: 7px; background: var(--panel);
+    color: var(--text); box-shadow: 0 6px 18px rgba(0, 0, 0, .18);
+    font: 400 11.5px/1.45 inherit; text-align: left; white-space: normal;
+    opacity: 0; visibility: hidden; transition: opacity .12s ease; pointer-events: none; }
+  /* For a field near the right edge, so the tip opens inwards. */
+  .infodot.right > .tip { left: auto; right: 0; }
+  .infodot:hover > .tip, .infodot:focus > .tip { opacity: 1; visibility: visible; }
   #tab-deploy .steps { align-items: center; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; }
   label.chk { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
   label.chk.off { color: var(--muted); }
@@ -175,6 +221,45 @@
   #piModelBtn .none { color: var(--muted); }
   #piModelBtn .meta { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted); }
   #piModelBtn .caret { flex: 0 0 auto; color: var(--muted); }
+  /* The test set gets the model button's shape: both are "pick the thing this
+     run is about", and a bare <select> could not show whether a set matches
+     the model's split, which is the only thing that makes one of them right. */
+  #piTestdataBtn { width: 100%; text-align: left; display: flex; align-items: center; gap: 8px; }
+  #piTestdataBtn .grow { flex: 1 1 auto; min-width: 5em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #piTestdataBtn .none { color: var(--muted); }
+  /* Same overflow handling as the model button's meta. Without it the span
+     is nowrap with nothing allowed to clip it, so the button cannot shrink
+     below its content: the grid column sizes to that, the field overflows
+     its cell and lands on top of the one beside it. */
+  #piTestdataBtn .meta { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted); }
+  #piTestdataBtn .caret { flex: 0 0 auto; color: var(--muted); }
+  #piTestdataWrap { position: relative; }
+  /* Wider than its field: a set's name, its match tag and its provenance have
+     to be readable together, and the grid column is ~190px. It therefore
+     overhangs, and which way it overhangs is measured when it opens (see
+     togglePiTestdataMenu) so the panel edge cannot clip it. */
+  #piTestdataMenu { position: absolute; left: 0; top: calc(100% + 4px); z-index: 70;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, .22); padding: 4px; display: none;
+    max-height: 320px; overflow-y: auto; width: max-content;
+    min-width: 100%; max-width: min(420px, 80vw); }
+  #piTestdataMenu.right { left: auto; right: 0; }
+  #piTestdataMenu.show { display: block; }
+  #piTestdataMenu .opt { display: flex; align-items: baseline; gap: 8px; width: 100%;
+    padding: 6px 8px; border: 0; border-radius: 6px; background: none; text-align: left;
+    cursor: pointer; font: inherit; color: var(--text); }
+  #piTestdataMenu .opt:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  #piTestdataMenu .opt.current { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+  #piTestdataMenu .opt .nm { flex: 1 1 auto; min-width: 11em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #piTestdataMenu .opt .tag { flex: 0 0 auto; font-size: 10.5px; padding: 1px 5px; border-radius: 4px; }
+  #piTestdataMenu .opt .tag.match { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  #piTestdataMenu .opt .tag.leak { background: color-mix(in srgb, var(--err) 16%, transparent); color: var(--err); }
+  #piTestdataMenu .opt .tag.unk { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  #piTestdataMenu .opt .meta { flex: 0 0 auto; font-size: 11px; color: var(--muted); }
+  #piTestdataMenu .sep { height: 1px; background: var(--border); margin: 4px 2px; }
+  #piTestdataMenu .cut { color: var(--accent); font-weight: 600; }
+  #piTestdataMenu .cut:disabled { color: var(--muted); font-weight: 400; cursor: default; background: none; }
+  #piTestdataMenu .empty { padding: 8px; font-size: 11.5px; color: var(--muted); }
   .badge.ok { color: var(--ok); border-color: var(--ok); }
   .badge.marginal { color: var(--warn); border-color: var(--warn); }
   .badge.fail { color: var(--err); border-color: var(--err); }
@@ -267,6 +352,8 @@
       <button data-tab="train">Train</button>
       <button data-tab="eval" title="Run eval.py on a finished run: per-SNR metrics, curves, waveforms, attention heatmaps, and the artifact-switch probe">Evaluate</button>
       <button data-tab="deploy" title="Export a checkpoint to ONNX and measure what it costs to run: per-hop latency, deadline misses and the duty-cycle sweep — on this machine, or on a Raspberry Pi 5 over SSH">Deploy</button>
+      <button data-tab="lookahead" title="What a millisecond of future context is worth: the ladder between the causal SE baseline and its unbounded twin, priced in output latency">Lookahead</button>
+      <button data-tab="rf" title="How far back the TCN needs to look: one run per rung of the dilation ladder, from 5 samples to 509 — the span attention gets, without the attention">Receptive field</button>
       <button data-tab="params" title="Parameter count of the model the form describes, broken down by stage">Params</button>
       <button data-tab="runs">Runs</button>
     </div>
@@ -287,6 +374,12 @@
         <input type="text" id="extraArgs" class="grow" placeholder="extra CLI flags, e.g. --max_epochs 2 --staged" title="Appended to the command; CLI flags override the YAML">
       </div>
       <div class="cmd" id="cmd"></div>
+      <div class="row" id="jobBar" style="display:none">
+        <span class="muted">runs</span>
+        <span class="seg" id="jobTabs"></span>
+        <span class="grow"></span>
+        <span class="muted" id="jobNote"></span>
+      </div>
       <div class="chartbox">
         <div class="head">
           <span class="muted" id="chartTitle">validation metrics</span>
@@ -414,14 +507,14 @@
           <span class="hint" id="piModelHint"></span>
         </div>
         <div class="efield" id="piSshWrap">
-          <label for="piSsh">Pi address</label>
+          <label for="piSsh">Pi address<span class="infodot" tabindex="0" role="note" aria-label="Six files are copied there; the venv is made once. A Pi on a direct cable often has no IPv4 — use its link-local address with the interface, for example user@fe80::…%en5">i<span class="tip">Six files are copied there; the venv is made once.<br><br>A Pi on a direct cable often has no IPv4 — use its link-local address with the interface, e.g. <code>user@fe80::…%en5</code></span></span></label>
           <input type="text" id="piSsh" placeholder="pi@raspberrypi.local">
-          <span class="hint">six files are copied there; the venv is made once. A Pi on a direct cable often has no IPv4 — use its link-local address with the interface, e.g. <code>user@fe80::…%en5</code></span>
         </div>
-        <div class="efield">
-          <label for="piTestdata">test set</label>
-          <select id="piTestdata"></select>
-          <span class="hint">scored, and replayed as the signal</span>
+        <div class="efield" id="piTestdataWrap">
+          <label for="piTestdataBtn">test set<span class="infodot" tabindex="0" role="note" aria-label="Scored, and replayed as the signal. A test set belongs to the split it was cut from: it is only a test set for a model trained at the same master_seed.">i<span class="tip">Scored, and replayed as the signal.<br><br>A set belongs to the split it was cut from — it is only a <em>test</em> set for a model trained at the same <code>master_seed</code>.</span></span></label>
+          <button id="piTestdataBtn" type="button"></button>
+          <div id="piTestdataMenu"></div>
+          <span class="hint" id="piTestdataHint">scored, and replayed as the signal</span>
         </div>
         <div class="efield">
           <label for="piThreads">threads</label>
@@ -450,12 +543,18 @@
         </div>
       </div>
 
+      <!-- A test set is only a test set for a model trained at the same seed.
+           Shown here before a run, refused by the API, and refused again by
+           raspi_infer on the board. -->
+      <div id="piSplitBanner" class="banner" style="margin:0 0 10px"></div>
+
       <div class="row steps">
         <label class="chk" id="piExportWrap" title="Write deploy/artifacts/<model>.onnx from that run's best.pt first — verified against PyTorch and refused if it is not causal. Ticked for you when the model has no export yet."><input type="checkbox" id="piExport"> export first</label>
         <span style="width:8px"></span>
         <label class="chk" title="One invocation: a tight benchmark loop, the test set scored in epoch and streaming mode, and the per-hop latency monitor"><input type="checkbox" id="piMeasure" checked> benchmark + test set + latency</label>
         <span style="width:8px"></span>
         <label class="chk" title="Paced replay at each hop size: compute per hop ÷ hop period, end-to-end latency and its drift, with an OK / MARGINAL / FAIL verdict"><input type="checkbox" id="piDutyOn"> duty-cycle sweep</label>
+        <label class="chk" id="piIncrementalWrap"><input type="checkbox" id="piIncremental"> incremental inference</label>
         <input type="text" id="piDutyHops" style="width:132px" title="hop sizes, largest first">
         <span class="muted">for</span>
         <input type="number" id="piDutySeconds" min="1" max="600" step="1" style="width:66px">
@@ -514,6 +613,86 @@
       <div class="muted" style="margin-top:6px" id="piLogNote"></div>
     </div>
 
+    <div class="tab" id="tab-lookahead">
+      <div class="row">
+        <label class="muted" for="laArtifact">artifact</label>
+        <select id="laArtifact" title="Which trained runs to read off the ladder"></select>
+        <label class="muted" for="laWidth">hidden channels</label>
+        <input id="laWidth" type="number" min="1" max="1024" step="1" style="width:5.5em"
+               title="The width every rung is measured at. A trained run only joins a rung's average if its width matches: runs/tcn_se_both_s67 is 48 channels where its companions are 64, and averaging it in made a three-seed spread out of two seeds and a width experiment. A distilled run and a run on another loss are left out for the same reason.">
+        <span class="grow"></span>
+        <span class="muted" id="laCapacity"></span>
+        <button id="btnLaRefresh">Measure</button>
+      </div>
+
+      <div id="laChartBox">
+        <div class="row"><span class="muted" id="laChartTitle">…</span></div>
+        <div id="laChart"></div>
+        <div class="legend" id="laLegend"></div>
+        <div class="row"><span class="muted" id="laChartNote"></span></div>
+      </div>
+
+      <div id="laBody"></div>
+
+      <div class="row" style="margin-top:10px">
+        <label class="muted" for="laRung">train rung</label>
+        <select id="laRung" title="Which rung to train. Every rung runs the same recipe as the causal baseline — only the variant and the output directory change."></select>
+        <span class="muted">seeds</span>
+        <span id="laSeeds" class="row" style="gap:8px;flex-wrap:wrap"
+              title="A rung trained once is a point with no spread. Tick the seeds to train; ones that already have a run start unticked."></span>
+        <label class="chk" id="laOverwriteBox"
+               title="Retrain a seed that already has a run. The directory is cleared by the trainer's own --overwrite, so a half-written run cannot be left behind.">
+          <input type="checkbox" id="laOverwrite"> overwrite</label>
+        <button id="btnLaTrain" class="primary">Train this rung</button>
+        <span class="grow"></span>
+        <span class="muted" id="laTrainNote"></span>
+      </div>
+      <div class="row"><code class="cmd" id="laCommand"></code></div>
+    </div>
+
+    <div class="tab" id="tab-rf">
+      <div class="row">
+        <button id="btnRfRun" class="primary">▶ Train sweep</button>
+        <button id="btnRfStop">■ Stop</button>
+        <span style="width:10px"></span>
+        <label class="muted" for="rfVariant">family</label>
+        <select id="rfVariant" title="The plain baseline isolates reach from the channel gate, which is what the sweep is for; tcn_se sweeps the same ladder with SE on."></select>
+        <label class="muted" for="rfArtifact">artifact</label>
+        <select id="rfArtifact"></select>
+        <label class="muted" for="rfSeed">seed</label>
+        <input id="rfSeed" type="number" min="0" step="1" style="width:5em">
+        <label class="muted" for="rfEpochs">epochs</label>
+        <input id="rfEpochs" type="number" min="1" max="2000" step="1" style="width:5.5em">
+        <span class="grow"></span>
+        <span id="rfPill" class="pill"><span class="dot"></span><span>idle</span></span>
+      </div>
+
+      <div class="row" style="margin-top:4px">
+        <span class="muted">rungs</span>
+        <span id="rfRungs" class="row" style="gap:10px;flex-wrap:wrap"></span>
+        <span class="grow"></span>
+        <button id="btnRfAll" title="Every rung">all</button>
+        <button id="btnRfNone">none</button>
+      </div>
+
+      <div class="banner info show" id="rfIntro" style="margin:8px 0">
+        The attention variants are justified by long-range context. A dilated stack reaches as
+        far for a few thousand parameters and no attention at all — so if the error keeps
+        falling as the field grows, the benefit was reach and this is the cheap way to buy it;
+        if it flattens at 125, the model already had all the context it could use.
+      </div>
+
+      <div id="rfChartBox" class="chartbox">
+        <div class="row"><span class="muted" id="rfChartTitle">error against how far back the model can see</span></div>
+        <div id="rfChart"></div>
+        <div class="row"><span class="muted" id="rfChartNote"></span></div>
+      </div>
+
+      <div style="overflow:auto"><table id="rfTable"></table></div>
+      <div class="muted" id="rfNote" style="margin-top:6px"></div>
+      <pre id="rfLog"></pre>
+    </div>
+
     <div class="tab" id="tab-params">
       <div class="row">
         <span class="muted" id="paramTitle">…</span>
@@ -533,6 +712,7 @@
           <button data-view="optim" title="Grouped by the optimizer recipe recorded in each checkpoint — family, configured LR, decoder/TCN LR ratio and schedule">Complete by optimizer</button>
           <button data-view="time" title="Every run, newest first, grouped by the day it last wrote — including the ones that died">By time</button>
           <button data-view="all">All runs</button>
+          <button data-view="deploy" title="Every Pi and host measurement: model, hop, median latency against its deadline, and whether the machine was held still while measuring">Deploy runs</button>
         </span>
         <span class="grow"></span>
         <button id="btnRunsRefresh">Refresh</button>
@@ -581,7 +761,13 @@
 <script>
 (() => {
   const $ = (s, r = document) => r.querySelector(s);
-  const state = { meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {}, job: { running: false, next: 0, metrics: [], maxEpochs: null }, runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0, params: { a: null, b: null, error: null }, paramCmp: "", evalRows: [], evalRun: null, pickView: null, pickFor: "eval", evalJob: { running: false, next: 0, artifacts: [] },
+  const state = { rf: { variant: null, artifact: null, rungs: null, rows: [], job: null }, meta: null, name: null, present: new Set(), original: "", text: "", dirty: false, values: {},
+    // job: the run on screen. jobs: every run this page has seen, by id, each
+    // with its own log, curve and read offset. jobList: the server's summary
+    // of them all, which drives the switcher.
+    job: { running: false, next: 0, metrics: [], maxEpochs: null, log: "" },
+    jobs: {}, jobId: null, jobList: [], runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0, params: { a: null, b: null, error: null }, paramCmp: "", evalRows: [], evalRun: null, pickView: null, pickFor: "eval", evalJob: { running: false, next: 0, artifacts: [] },
+    la: { meta: null, data: null, error: null, artifact: "BOTH" },
     pi: { target: "host", model: null, testdata: null, running: false, next: 0,
           returncode: null, parsed: {}, steps: [], step: 0, formTouched: false, seenTraces: [],
           loaded: { latency: null, duty: null } } };
@@ -729,6 +915,10 @@
     const ctx = {
       attention,
       mla: attention && variant.includes("mla"),
+      // The SE families, including the pinned tcn_se_r{N} sweep. The field is
+      // shown for those too: it says what the run is, and build_model reports
+      // when a name overrides it rather than letting the two disagree.
+      se: /(^|_)se(_|$)|^tcn_se_r\d+$/.test(variant),
       sandwich: attention && !variant.includes("_par"),
       staged: !!v("staged"),
       turboquant: attention && !!v("turboquant"),
@@ -853,26 +1043,102 @@
     }
     try {
       const s = await api("/api/train", { name: state.name, extra_args: $("#extraArgs").value });
-      $("#log").textContent = ""; state.job.next = 0; state.job.metrics = []; state.job.maxEpochs = null;
-      applyStatus(s); showTab("train"); startPolling();
+      // No clearing here: the new run gets its own buffer, and the one that
+      // was on screen keeps its log for when you switch back to it.
+      applyStatus(s); selectJob(s.id, { force: true }); showTab("train"); startPolling();
     } catch (e) { banner(e.message); }
   }
 
   async function stop() {
-    try { applyStatus(await api("/api/train/stop", {})); } catch (e) { banner(e.message); }
+    // The selected run, not "the training job": with several going, Stop has
+    // to mean the one whose log you are reading.
+    try { applyStatus(await api("/api/train/stop", { id: state.jobId })); }
+    catch (e) { banner(e.message); }
   }
 
   function startPolling() { clearInterval(pollTimer); pollTimer = setInterval(poll, 1000); poll(); }
 
+  // ---------- several runs at once ----------
+  // The tab shows one run and knows about all of them. Each has its own log
+  // buffer, curve and read offset on this side, so switching is instant and
+  // does not re-read a log from the start; the server is asked only for the
+  // selected run's new lines, plus a one-line summary of each other run to
+  // keep its pill current.
+  function jobState(id) {
+    if (!state.jobs[id]) {
+      state.jobs[id] = { next: 0, metrics: [], maxEpochs: null, running: false,
+                         returncode: null, log: "", title: id };
+    }
+    return state.jobs[id];
+  }
+
+  function selectJob(id, { force = false } = {}) {
+    if (!id || (id === state.jobId && !force)) return;
+    if (state.jobId && state.jobs[state.jobId]) state.jobs[state.jobId].log = $("#log").textContent;
+    state.jobId = id;
+    state.job = jobState(id);
+    $("#log").textContent = state.job.log || "";
+    $("#log").scrollTop = $("#log").scrollHeight;
+    state.chartRun = null;
+    renderChart();
+    renderJobTabs();
+    poll();
+  }
+
+  function renderJobTabs() {
+    const bar = $("#jobBar"), tabs = $("#jobTabs"), all = state.jobList || [];
+    // The switcher is a queue of what is *going*, not a history. A finished
+    // run leaves it — its log is still on disk and its curve is still in the
+    // Runs tab, so nothing is lost, and the pills stay about the thing the
+    // tab is for. The one exception is the run being read right now: it would
+    // be worse for the selected pill to vanish under the cursor the moment
+    // its run ends.
+    const list = all.filter(j => j.running || j.id === state.jobId);
+    // One run is the ordinary case and needs no switcher: the bar appears
+    // only once there is a choice to make.
+    bar.style.display = list.length > 1 ? "" : "none";
+    if (list.length <= 1) return;
+    tabs.innerHTML = list.map(j => {
+      const cls = j.running ? "running" : j.returncode === 0 ? "ok" : j.returncode == null ? "" : "err";
+      const where = j.epoch ? `epoch ${j.epoch}${j.max_epochs ? "/" + j.max_epochs : ""}`
+        : j.running ? "starting" : j.returncode === 0 ? "finished" : j.returncode == null ? "—" : `exit ${j.returncode}`;
+      const best = j.best_val_loss == null ? "" : ` · best ${j.best_val_loss.toFixed(4)}`;
+      return `<button data-job="${j.id}" class="${j.id === state.jobId ? "active" : ""} job-${cls}"`
+        + ` title="${j.title} — ${where}${best}${j.started ? " · started " + j.started.slice(11, 16) : ""}">`
+        + `<i class="dot ${cls}"></i>${j.title}</button>`;
+    }).join("");
+    tabs.querySelectorAll("button").forEach(b =>
+      b.addEventListener("click", () => selectJob(b.dataset.job)));
+    const n = list.filter(j => j.running).length;
+    $("#jobNote").textContent = n > 1
+      ? `${n} runs at once — they share this machine, so the per-epoch times in each log are not comparable with a run that had it to itself`
+      : "";
+  }
+
   async function poll() {
     try {
-      const s = await api(`/api/train/status?since=${state.job.next}`);
+      const id = state.jobId ? `&id=${encodeURIComponent(state.jobId)}` : "";
+      const s = await api(`/api/train/status?since=${state.job.next}${id}`);
       applyStatus(s);
-      if (!s.running) { clearInterval(pollTimer); pollTimer = null; refreshRuns(); }
+      // Keep polling while *any* run is going: the selected one may have
+      // finished while another is still filling its own log, and the pills
+      // have to stay current or the switcher lies about what is alive.
+      const anyRunning = (s.jobs || []).some(j => j.running);
+      if (!anyRunning) { clearInterval(pollTimer); pollTimer = null; refreshRuns(); }
     } catch (e) { clearInterval(pollTimer); }
   }
 
   function applyStatus(s) {
+    if (s.jobs) state.jobList = s.jobs;
+    // A status for a run other than the selected one must not scroll into
+    // this log: adopt the id the server answered for.
+    if (s.id && s.id !== state.jobId) {
+      if (state.jobId && state.jobs[state.jobId]) state.jobs[state.jobId].log = $("#log").textContent;
+      state.jobId = s.id;
+      state.job = jobState(s.id);
+      $("#log").textContent = state.job.log || "";
+    }
+    if (s.title) state.job.title = s.title;
     const log = $("#log");
     if (s.lines && s.lines.length) {
       const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
@@ -887,7 +1153,12 @@
     }
     if (s.command) $("#cmd").textContent = s.command;
     $("#logNote").textContent = s.log_path ? `Mirrored to ${s.log_path}` : "";
-    $("#btnTrain").disabled = s.running; $("#btnStop").disabled = !s.running;
+    // Train stays available while another run is going — that is the point of
+    // allowing several — and is refused by the server at the cap.
+    const active = (state.jobList || []).filter(j => j.running).length;
+    $("#btnTrain").disabled = active >= (s.max_active || 4);
+    $("#btnStop").disabled = !s.running;
+    renderJobTabs();
     updatePills(s);
   }
 
@@ -897,7 +1168,11 @@
     const j = $("#jobPill");
     if (s === undefined) s = { running: state.job.running, returncode: state.job.returncode };
     state.job.returncode = s.returncode;
-    if (s.running) { j.className = "pill running"; j.lastElementChild.textContent = "training…"; }
+    // The pill speaks for the whole tab, not the selected run: with three
+    // going it should say so rather than report whichever one is on screen.
+    const active = (state.jobList || []).filter(x => x.running).length;
+    if (active > 1) { j.className = "pill running"; j.lastElementChild.textContent = `${active} training…`; }
+    else if (s.running) { j.className = "pill running"; j.lastElementChild.textContent = "training…"; }
     else if (s.returncode == null) { j.className = "pill"; j.lastElementChild.textContent = "idle"; }
     else if (s.returncode === 0) { j.className = "pill ok"; j.lastElementChild.textContent = "finished"; }
     else { j.className = "pill err"; j.lastElementChild.textContent = `exit ${s.returncode}`; }
@@ -1241,9 +1516,11 @@
     if (!state.pi.model || !(m.models || []).some(x => x.name === state.pi.model)) {
       state.pi.model = (m.defaults || {}).model || null;
     }
-    keep($("#piTestdata"), state.pi.testdata || (m.defaults || {}).testdata,
-         m.testdata.map(t => ({ value: t.name, label: `${t.name} · ${t.size_kb} kB` })));
-    state.pi.testdata = $("#piTestdata").value || null;
+    const sets = m.testdata || [];
+    const want = state.pi.testdata || (m.defaults || {}).testdata;
+    state.pi.testdata = sets.some(t => t.name === want) ? want
+                      : (sets[0] ? sets[0].name : null);
+    renderPiTestdataButton();
 
     const sel = $("#piTrace");
     const chosen = sel.value;
@@ -1252,6 +1529,7 @@
     for (const t of m.traces) sel.appendChild(new Option(piTraceLabel(t), t.name));
     sel.value = m.traces.some(t => t.name === chosen) ? chosen : "";
     renderPiModelButton();
+    renderPiSplitBanner();
   }
 
   function setPiModel(name) {
@@ -1265,6 +1543,7 @@
     const m = piModel();
     if (m) $("#piExport").checked = !m.exported || m.stale;
     renderPiModelButton();
+    renderPiSplitBanner();
     syncPiTarget();
   }
 
@@ -1305,7 +1584,15 @@
     const hint = $("#piModelHint"), m = piModel(), e = piExport();
     const models = piMeta().models || [];
     if (!models.length) { hint.textContent = "no runs and no exports yet"; return; }
-    if (!m) { hint.innerHTML = `one of <b>${models.length}</b> trained runs`; return; }
+    if (!m) {
+      // Two very different situations, and reporting both as "pick one" is
+      // what made a stale list look like a broken tab.
+      hint.innerHTML = name
+        ? `<b>${escHtml(name)} is not in this tab's list</b> — it was probably trained after `
+          + `the page loaded. Press Refresh.`
+        : `one of <b>${models.length}</b> trained runs`;
+      return;
+    }
     if (m.bidirectional) {
       hint.innerHTML = "<b>non-causal</b> — it needs the future, so the exporter "
         + "refuses it and it could not run online";
@@ -1325,6 +1612,442 @@
       + bits.filter(Boolean).join(" · ");
   }
 
+  // A test set belongs to the split it was cut from. EEGDenoiseDataset permutes
+  // the epoch pool by master_seed before slicing it, so the seed-42 test epochs
+  // are 69% of them inside the seed-67 training split: scoring across that line
+  // returns a better number than the model earns, with nothing visibly wrong.
+  // The server refuses it too, and so does raspi_infer on the board — this is
+  // only the half that says so before you wait for a Pi run.
+  function piSplitProblem() {
+    const t = (piMeta().testdata || []).find(x => x.name === state.pi.testdata);
+    const m = piModel();
+    if (!t) return null;
+    if (!m) {
+      // Nothing can be checked against a model this tab does not know about,
+      // and saying nothing reads as "the pair is fine".
+      return state.pi.model
+        ? { level: "warn", text: `<b>${escHtml(state.pi.model)}</b> is not in this tab's list, so `
+            + `the test set cannot be checked against it. Press Refresh.` }
+        : null;
+    }
+    if (t.split && t.split !== "test")
+      return { level: "err", text: `<b>${t.name}</b> is the '${t.split}' split, not the test split` };
+    if (m.master_seed == null || t.master_seed == null) {
+      const why = m.master_seed == null
+        ? `<b>${m.name}</b> predates the seed being recorded`
+        : `<b>${t.name}</b> carries no recorded provenance`;
+      return { level: "warn", text: `Cannot verify the split — ${why}. If the two seeds differ, `
+        + `these epochs are that model's training data and the score means nothing.` };
+    }
+    if (Number(m.master_seed) !== Number(t.master_seed))
+      return { level: "err", text: `<b>Split mismatch.</b> <b>${m.name}</b> was trained at `
+        + `master_seed ${m.master_seed}, but <b>${t.name}</b> was cut from the master_seed `
+        + `${t.master_seed} split — most of these epochs are in that model's training set, so the `
+        + `score would be inflated. Cut a matching set: `
+        + `<code>python -m deploy.make_testdata --artifact ${t.artifact || m.artifact || "EOG"} `
+        + `--master_seed ${m.master_seed}</code>` };
+    if (t.artifact && m.artifact && t.artifact !== m.artifact)
+      return { level: "warn", text: `<b>${m.name}</b> was trained on ${m.artifact} but `
+        + `<b>${t.name}</b> is ${t.artifact} — a cross-artifact probe, not a like-for-like score` };
+    if (t.source === "filename")
+      return { level: "warn", text: `<b>${t.name}</b> has no recorded provenance; its split was read `
+        + `off the filename. Re-cut it to stamp the provenance in.` };
+    return null;
+  }
+
+  // How a given set stands against the model currently picked. The same three
+  // outcomes the server and the board use, so the menu cannot say "match" for
+  // a pair the API would refuse.
+  function piTestdataStatus(t) {
+    const m = piModel();
+    if (!t || !m) return null;
+    if (m.master_seed == null || t.master_seed == null) return "unknown";
+    return Number(m.master_seed) === Number(t.master_seed) ? "match" : "leak";
+  }
+
+  function piTestdataSet(name) {
+    return (piMeta().testdata || []).find(t => t.name === name) || null;
+  }
+
+  function renderPiTestdataButton() {
+    const btn = $("#piTestdataBtn"), name = state.pi.testdata, t = piTestdataSet(name);
+    btn.innerHTML = "";
+    const main = document.createElement("span");
+    main.className = "grow";
+    main.textContent = name || "Choose a test set…";
+    if (!name) main.classList.add("none");
+    btn.append(main);
+    if (t) {
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent = t.master_seed != null
+        ? `${t.artifact || "?"} · seed ${t.master_seed}` : `${t.size_kb} kB`;
+      btn.append(meta);
+    }
+    const caret = document.createElement("span");
+    caret.className = "caret"; caret.textContent = "⌄";
+    btn.append(caret);
+    btn.title = name ? `${name}\nClick to choose another, or cut one for this model`
+                     : "Pick a test set, or cut one for this model";
+    renderPiSplitBanner();
+  }
+
+  const TD_TAG = { match: ["matches", "match"], leak: ["wrong split", "leak"],
+                   unknown: ["unverified", "unk"] };
+
+  function renderPiTestdataMenu() {
+    const menu = $("#piTestdataMenu");
+    menu.innerHTML = "";
+    const sets = piMeta().testdata || [];
+    const m = piModel();
+
+    if (!sets.length) {
+      const e = document.createElement("div");
+      e.className = "empty";
+      e.textContent = "No test sets in deploy/testdata/ yet.";
+      menu.append(e);
+    }
+    // Matching sets first: with several seeds in play the right one should not
+    // have to be hunted for in a list sorted by filename.
+    const order = { match: 0, unknown: 1, leak: 2, null: 1 };
+    for (const t of [...sets].sort((a, b) =>
+        (order[piTestdataStatus(a)] ?? 1) - (order[piTestdataStatus(b)] ?? 1)
+        || a.name.localeCompare(b.name))) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "opt" + (t.name === state.pi.testdata ? " current" : "");
+      const nm = document.createElement("span");
+      nm.className = "nm"; nm.textContent = t.name;
+      b.append(nm);
+      const st = piTestdataStatus(t);
+      if (st) {
+        const [text, cls] = TD_TAG[st];
+        const tag = document.createElement("span");
+        tag.className = "tag " + cls; tag.textContent = text;
+        b.append(tag);
+      }
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent = t.master_seed != null
+        ? `${t.artifact || "?"} · seed ${t.master_seed} · ${t.size_kb} kB`
+        : `${t.size_kb} kB`;
+      b.append(meta);
+      b.addEventListener("click", ev => {
+        ev.stopPropagation();
+        state.pi.testdata = t.name;
+        state.pi.formTouched = true;
+        closePiTestdataMenu();
+        renderPiTestdataButton();
+        syncPiTarget();
+      });
+      menu.append(b);
+    }
+
+    menu.append(Object.assign(document.createElement("div"), { className: "sep" }));
+
+    // The generator. Everything it needs is already recorded on the model, so
+    // the operator should not have to translate a mismatch into a command.
+    const cut = document.createElement("button");
+    cut.type = "button"; cut.className = "opt cut";
+    const label = document.createElement("span");
+    label.className = "nm";
+    if (!m) {
+      label.textContent = "Cut a set for this model — pick a model first";
+      cut.disabled = true;
+    } else if (m.master_seed == null) {
+      label.textContent = `Cannot cut for ${m.name} — it never recorded its seed`;
+      cut.disabled = true;
+      cut.title = "This run predates master_seed being saved, so the matching split "
+                + "cannot be worked out. Cutting at a guessed seed would produce a file "
+                + "that looks matched and is not.";
+    } else {
+      label.textContent = `Cut ${m.artifact || "?"} test set for ${m.name} (seed ${m.master_seed})`;
+      cut.title = "Runs deploy.make_testdata with this model's artifact and seed. "
+                + "An existing matching file is reused, not rewritten.";
+    }
+    cut.append(label);
+    cut.addEventListener("click", async ev => {
+      ev.stopPropagation();
+      if (cut.disabled) return;
+      label.textContent = "Cutting…";
+      try {
+        const r = await api("/api/pi/testdata", { model: m.name, n: 100 });
+        if (state.meta && state.meta.pi) state.meta.pi.testdata = r.testdata;
+        state.pi.testdata = r.name;
+        state.pi.formTouched = true;
+        closePiTestdataMenu();
+        renderPiTestdataButton();
+        syncPiTarget();
+        banner(r.created ? `Cut deploy/testdata/${r.name} — ${r.n} epochs, ${r.artifact} `
+                         + `test split at master_seed ${r.master_seed}`
+                         : `${r.name} already matches this model — selected it`, "info");
+      } catch (err) {
+        closePiTestdataMenu();
+        banner(String((err && err.message) || err));
+      }
+    });
+    menu.append(cut);
+  }
+
+  function togglePiTestdataMenu() {
+    const menu = $("#piTestdataMenu");
+    if (menu.classList.contains("show")) return closePiTestdataMenu();
+    renderPiTestdataMenu();
+    menu.classList.remove("right");
+    menu.classList.add("show");
+    // The menu is wider than its column, so it overhangs one way or the other.
+    // Measure rather than assume: the control grid is auto-fit, so this field
+    // is a middle column at one window width and the last one at another.
+    const edge = ($("#tab-deploy") || document.body).getBoundingClientRect().right;
+    if (menu.getBoundingClientRect().right > edge - 4) menu.classList.add("right");
+  }
+
+  function closePiTestdataMenu() { $("#piTestdataMenu").classList.remove("show"); }
+
+  function renderPiSplitBanner() {
+    const el = $("#piSplitBanner"), p = piSplitProblem();
+    el.className = "banner" + (p ? ` ${p.level === "err" ? "err" : "warn"} show` : "");
+    el.innerHTML = p ? p.text : "";
+    // Running a pair the server will refuse wastes a trip to the Pi — but
+    // only the steps that score the test set care which split it came from.
+    // Incremental inference times the checkpoint and reads no test data at
+    // all, so blocking it on a split mismatch would be stricter than the
+    // server, which never asks for a test set in that case.
+    const usesTestdata = $("#piMeasure").checked || $("#piDutyOn").checked
+                      || state.pi.target === "pi";
+    const run = $("#btnPi");
+    if (run) run.disabled = !!(p && p.level === "err" && usesTestdata);
+    // The banner still shows, because the pair is still wrong — it just is
+    // not blocking this particular run.
+    if (p && p.level === "err" && !usesTestdata) {
+      el.className = "banner warn show";
+      el.innerHTML = p.text + " <b>Not blocking this run</b>: nothing ticked reads the test set.";
+    }
+
+    const hint = $("#piTestdataHint");
+    const t = (piMeta().testdata || []).find(x => x.name === state.pi.testdata);
+    if (hint) hint.textContent = t && t.master_seed != null
+      ? `${t.artifact || "?"} test split, seed ${t.master_seed}`
+      : "scored, and replayed as the signal";
+  }
+
+  // Which way a tip opens depends on the width the panel happens to have: the
+  // control grid is auto-fit, so the same field is a middle column at one size
+  // and the last one at another. Measured when it is about to open rather than
+  // fixed in the markup, so it cannot be clipped by the panel edge.
+  function flipTip(dot) {
+    dot.classList.remove("right");
+    const tip = dot.querySelector(".tip");
+    if (!tip) return;
+    const edge = (dot.closest(".tab") || document.body).getBoundingClientRect().right;
+    if (dot.getBoundingClientRect().left + tip.offsetWidth > edge - 8) dot.classList.add("right");
+  }
+  for (const ev of ["mouseenter", "focus"]) {
+    document.addEventListener(ev, e => {
+      const dot = e.target instanceof Element && e.target.closest(".infodot");
+      if (dot) flipTip(dot);
+    }, true);
+  }
+
+  // ---------- receptive field sweep ----------
+  const rfMeta = () => (state.meta && state.meta.rf) || { ladder: {}, artifacts: [], defaults: {} };
+  const rfLadder = () => (rfMeta().ladder || {})[$("#rfVariant").value] || [];
+
+  async function loadRfMeta() {
+    try {
+      state.meta.rf = await api("/api/rf/meta");
+      const d = rfMeta().defaults || {};
+      fillSelect($("#rfVariant"), ["tcn", "tcn_se"], state.rf.variant || d.variant);
+      fillSelect($("#rfArtifact"), rfMeta().artifacts, state.rf.artifact || d.artifact);
+      if (!$("#rfSeed").value && d.master_seed != null) $("#rfSeed").value = d.master_seed;
+      if (!$("#rfEpochs").value) $("#rfEpochs").value = d.max_epochs ?? 200;
+      renderRfRungs();
+      await refreshRfResults();
+    } catch (e) { banner(e.message); }
+  }
+
+  function fillSelect(sel, values, keep) {
+    sel.innerHTML = "";
+    for (const v of values) sel.appendChild(new Option(v, v));
+    if (keep && values.includes(keep)) sel.value = keep;
+  }
+
+  // One checkbox per rung, labelled with what the rung *is* -- the reach in
+  // samples and in milliseconds -- rather than its index, because the reach is
+  // the axis the experiment is about.
+  function renderRfRungs() {
+    const box = $("#rfRungs");
+    box.innerHTML = "";
+    for (const r of rfLadder()) {
+      const picked = state.rf.rungs ? state.rf.rungs.includes(r.receptive_field) : true;
+      const lab = document.createElement("label");
+      lab.className = "chk";
+      lab.title = `dilations ${r.dilations.join(", ")} · ${r.params.toLocaleString()} params`
+        + (r.is_default ? " · the project's existing default" : "");
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.checked = picked; cb.dataset.rf = r.receptive_field;
+      cb.addEventListener("change", () => {
+        state.rf.rungs = [...box.querySelectorAll("input:checked")].map(x => Number(x.dataset.rf));
+        updateRfNote();
+      });
+      lab.append(cb, document.createTextNode(
+        ` ${r.receptive_field}${r.is_default ? "*" : ""} (${Math.round(r.ms)} ms)`));
+      box.appendChild(lab);
+    }
+    state.rf.rungs = [...box.querySelectorAll("input:checked")].map(x => Number(x.dataset.rf));
+    updateRfNote();
+  }
+
+  function updateRfNote() {
+    const all = rfLadder(), picked = state.rf.rungs || [];
+    const params = all.filter(r => picked.includes(r.receptive_field))
+                      .reduce((n, r) => n + r.params, 0);
+    $("#rfNote").innerHTML = `${picked.length} of ${all.length} rungs`
+      + (picked.length ? ` · ${params.toLocaleString()} parameters trained in total`
+                       + ` · <b>* is the default the rest of the study used</b>` : "")
+      + ` · each rung is an ordinary training run, shortest reach first`;
+  }
+
+  async function refreshRfResults() {
+    try {
+      const q = new URLSearchParams({ variant: $("#rfVariant").value,
+                                      artifact: $("#rfArtifact").value });
+      const r = await api(`/api/rf/results?${q}`);
+      state.rf.rows = r.rows || [];
+      renderRfTable();
+    } catch (e) { /* the ladder is still worth showing */ }
+  }
+
+  const RF_HEAD = `<tr><th>receptive field</th><th>dilations</th><th class="num">params</th>`
+      + `<th class="num">seeds</th><th class="num">val loss</th><th class="num">RRMSE_t</th>`
+      + `<th class="num">RRMSE_f</th><th class="num">CC</th><th>runs</th></tr>`;
+
+  function renderRfTable() {
+    const rows = state.rf.rows || [], ladder = rfLadder();
+    const done = new Map(rows.map(r => [r.receptive_field, r]));
+    const body = ladder.map(L => {
+      const r = done.get(L.receptive_field);
+      const star = L.is_default ? ' <span class="badge">default</span>' : "";
+      if (!r) {
+        return `<tr class="muted"><td>${L.receptive_field} <span class="sub">${Math.round(L.ms)} ms</span>${star}</td>`
+          + `<td>${L.dilations.join(", ")}</td><td class="num">${fmtN(L.params)}</td>`
+          + `<td colspan="6" class="muted">not trained yet</td></tr>`;
+      }
+      // The runs behind the rung, and the ones held out of it: a rung with
+      // five runs on it is the normal case at 125, where every tcn and
+      // tcn_se run the project has done already sits.
+      const excluded = (r.mismatched || []).length
+        ? ` <span class="warn" title="${escHtml(r.mismatched.map(m => m.name + ": " + m.why).join("; "))
+            }">· ${r.mismatched.length} excluded</span>` : "";
+      // The ladder's own count, trained or not: it is the rung's cost, and a
+      // run reports the size of its whole state_dict instead -- 258 more per
+      // block at width 64, which is BatchNorm's running statistics. Two
+      // conventions in one column would read as a rung costing more once it
+      // had been trained.
+      const recorded = r.params && r.params !== L.params
+        ? ` title="the checkpoints hold ${fmtN(r.params)} tensor entries — ${fmtN(r.params - L.params)}`
+          + ` more than the trainable count, which is BatchNorm's running statistics"` : "";
+      return `<tr><td><b>${r.receptive_field}</b> <span class="sub">${Math.round(r.ms)} ms</span>${star}</td>`
+        + `<td>${L.dilations.join(", ")}</td><td class="num"${recorded}>${fmtN(L.params)}</td>`
+        + `<td class="num">${r.n_runs}</td><td class="num">${metricCell(r.val_loss)}</td>`
+        + `<td class="num">${metricCell(r.rrmse_t)}</td><td class="num">${metricCell(r.rrmse_s)}</td>`
+        + `<td class="num">${metricCell(r.acc)}</td>`
+        + `<td><span title="${escHtml(r.runs.join("\n"))}">${r.seeds.length ? "seed " + r.seeds.join(", ") : r.runs.length + " runs"}</span>${excluded}</td></tr>`;
+    }).join("");
+    $("#rfTable").innerHTML = RF_HEAD + body;
+    drawRfChart();
+  }
+
+  // RRMSE against reach, with the x-axis in log2 because the ladder doubles.
+  // A flat curve past some rung is the finding, so the grid is drawn at the
+  // rungs themselves rather than at round numbers.
+  function drawRfChart() {
+    const rows = (state.rf.rows || []).filter(r => r.rrmse_t && r.rrmse_t.n);
+    const box = $("#rfChart");
+    if (rows.length < 2) {
+      box.innerHTML = `<svg viewBox="0 0 720 150"><text x="360" y="75" text-anchor="middle" `
+        + `font-size="13" fill="#6b7280">train two or more rungs to see the curve</text></svg>`;
+      $("#rfChartNote").textContent = "";
+      return;
+    }
+    const W = 720, H = 240, L = 54, R = 16, T = 16, B = 34;
+    const xs = rows.map(r => Math.log2(r.receptive_field));
+    const ys = rows.map(r => r.rrmse_t.mean);
+    const sd = r => r.rrmse_t.sd || 0;
+    const x0 = Math.min(...xs), x1 = Math.max(...xs);
+    const lo = Math.min(...rows.map(r => r.rrmse_t.mean - sd(r)));
+    const hi = Math.max(...rows.map(r => r.rrmse_t.mean + sd(r)));
+    const pad = (hi - lo) * 0.2 || 0.01;
+    const X = v => L + (W - L - R) * ((v - x0) / ((x1 - x0) || 1));
+    const Y = v => T + (H - T - B) * (1 - (v - (lo - pad)) / ((hi + pad) - (lo - pad)));
+    const pts = rows.map((r, i) => `${X(xs[i])},${Y(ys[i])}`).join(" ");
+    // A whisker where a rung has more than one seed, so a difference between
+    // rungs can be read against the spread inside them rather than taken flat.
+    const bars = rows.map((r, i) => sd(r)
+      ? `<line x1="${X(xs[i])}" y1="${Y(ys[i] - sd(r))}" x2="${X(xs[i])}" y2="${Y(ys[i] + sd(r))}" `
+        + `stroke="${cssVar("--accent")}" stroke-width="1" opacity="0.5"/>` : "").join("");
+    const dots = rows.map((r, i) =>
+      `<circle cx="${X(xs[i])}" cy="${Y(ys[i])}" r="4" fill="${cssVar("--accent")}">`
+      + `<title>reach ${r.receptive_field} samples (${Math.round(r.ms)} ms)\n`
+      + `RRMSE_t ${metricText(r.rrmse_t)}  CC ${metricText(r.acc)}\n`
+      + `${r.n_runs} run${r.n_runs === 1 ? "" : "s"}: ${r.runs.join(", ")}</title></circle>`).join("");
+    const ticks = rows.map((r, i) =>
+      `<text x="${X(xs[i])}" y="${H - 12}" text-anchor="middle" font-size="10" `
+      + `fill="#6b7280">${r.receptive_field}</text>`).join("");
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}">`
+      + `<text x="14" y="${T + 10}" font-size="10" fill="#6b7280">RRMSE_t</text>`
+      + `<text x="${L}" y="${H - 1}" font-size="10" fill="#6b7280">receptive field (samples, log scale)</text>`
+      + `<text x="14" y="${Y(hi)}" font-size="10" fill="#6b7280">${fmt(hi)}</text>`
+      + `<text x="14" y="${Y(lo)}" font-size="10" fill="#6b7280">${fmt(lo)}</text>`
+      + `<polyline points="${pts}" fill="none" stroke="${cssVar("--accent")}" stroke-width="2"/>`
+      + bars + dots + ticks + `</svg>`;
+    const first = rows[0], last = rows[rows.length - 1];
+    const drop = first.rrmse_t.mean - last.rrmse_t.mean;
+    const ns = rows.map(r => r.n_runs);
+    const seeds = Math.min(...ns) === Math.max(...ns)
+      ? `${ns[0]} seed${ns[0] === 1 ? "" : "s"} per rung`
+      : `${Math.min(...ns)}–${Math.max(...ns)} seeds per rung`;
+    $("#rfChartNote").innerHTML =
+      `${fmt(first.rrmse_t.mean)} at ${first.receptive_field} samples → ${fmt(last.rrmse_t.mean)} at `
+      + `${last.receptive_field} (${drop >= 0 ? "−" : "+"}${fmt(Math.abs(drop))}) · ${seeds}`
+      + (rows.some(r => r.rrmse_t.sd) ? " · whiskers ± 1 sd over seeds" : "");
+  }
+
+  async function runRfSweep() {
+    const spec = {
+      variant: $("#rfVariant").value, artifact: $("#rfArtifact").value,
+      master_seed: Number($("#rfSeed").value), max_epochs: Number($("#rfEpochs").value),
+      rungs: state.rf.rungs,
+    };
+    try {
+      const s = await api("/api/rf/run", spec);
+      state.rf.job = s; startRfPolling();
+    } catch (e) { banner(e.message); }
+  }
+
+  let rfTimer = null;
+  function startRfPolling() {
+    if (rfTimer) return;
+    rfTimer = setInterval(async () => {
+      try {
+        const s = await api(`/api/rf/status?since=${(state.rf.job || {}).next || 0}`);
+        state.rf.job = s;
+        const pill = $("#rfPill");
+        pill.className = "pill" + (s.running ? " running" : s.returncode === 0 ? " ok"
+                                   : s.returncode == null ? "" : " err");
+        pill.lastElementChild.textContent = s.running
+          ? `step ${(s.step || 0) + 1}/${(s.steps || []).length || "?"}`
+          : s.returncode == null ? "idle" : s.returncode === 0 ? "finished" : `exit ${s.returncode}`;
+        if (s.lines && s.lines.length) {
+          const log = $("#rfLog");
+          log.textContent += s.lines.join("\n") + "\n";
+          log.scrollTop = log.scrollHeight;
+        }
+        if (!s.running) { clearInterval(rfTimer); rfTimer = null; await refreshRfResults(); }
+      } catch (e) { clearInterval(rfTimer); rfTimer = null; }
+    }, 1500);
+  }
+
   function syncPiTarget() {
     const onPi = state.pi.target === "pi";
     $("#piTarget").querySelectorAll("button").forEach(b =>
@@ -1341,6 +2064,50 @@
     m.parentElement.title = onPi
       ? "run_on_pi.sh always benchmarks and scores the test set — the sweep and the paced replay are what it switches on"
       : "One invocation: a tight benchmark loop, the test set scored in epoch and streaming mode, and the per-hop latency monitor";
+    // Available on both targets. They take different routes to the same
+    // function: this machine runs the checkpoint through models/incremental.py
+    // in torch, the Pi runs <model>_step.onnx, because the board has no torch.
+    // What the Pi needs is that graph, so the hint tracks whether it exists
+    // rather than the option disappearing.
+    const inc = $("#piIncremental");
+    const stepModel = piModel();
+    const needsStepExport = onPi && stepModel && !stepModel.step_exported;
+    inc.disabled = false;
+    inc.parentElement.classList.remove("off");
+    inc.parentElement.title = onPi
+      ? "One sample at a time on the board, state carried in and out of the graph — "
+        + "no hop buffering, and a real KV cache. Runs <model>_step.onnx"
+        + (needsStepExport
+            ? ", which this model does not have yet: tick 'export first' and it will be written."
+            : ", which this model has.")
+      : "Run the trained checkpoint one sample at a time in PyTorch, carrying a real KV cache, "
+        + "and compare its per-sample cost with the windowed path at this hop. Writes a trace "
+        + "that appears in the Runs tab beside the windowed measurement of the same model.";
+    // Exporting the step graph is the one thing that makes it possible, so
+    // ask for it rather than letting the run fail on a missing file.
+    if (needsStepExport && inc.checked) $("#piExport").checked = true;
+
+    // The sweep asks which hop size keeps up; a step graph has no hop, it
+    // emits on every sample. Ticking both used to produce a clean-looking
+    // OK/FAIL table measured by re-stepping a whole window per hop — the one
+    // thing carrying state exists to avoid. Each disables the other, so the
+    // contradiction is not expressible rather than merely refused later.
+    const dutyBox = $("#piDutyOn");
+    dutyBox.disabled = inc.checked;
+    dutyBox.parentElement.classList.toggle("off", inc.checked);
+    if (inc.checked) dutyBox.checked = false;
+    dutyBox.parentElement.title = inc.checked
+      ? "Not with incremental inference: the sweep compares hop sizes and a step graph has "
+        + "no hop — it emits on every sample, so its duty cycle is the single number the "
+        + "latency run reports."
+      : "Paced replay at each hop size: compute per hop ÷ hop period, end-to-end latency "
+        + "and its drift, with an OK / MARGINAL / FAIL verdict";
+    if (dutyBox.checked) {
+      inc.disabled = true;
+      inc.parentElement.classList.add("off");
+      inc.parentElement.title = "Not with the duty-cycle sweep: that sweeps hop sizes, and "
+        + "incremental inference has no hop to sweep.";
+    }
     $("#piGovernorWrap").style.display = onPi ? "" : "none";
     const hop = Number($("#piHop").value);
     const fs = (piExport() || {}).sample_rate_hz || 256;
@@ -1360,6 +2127,10 @@
         + `interrupts and the timer tick, so the measurement is kept off it`
       : `${(piMeta().host_environment || {}).platform?.system || "this host"} has no CPU `
         + "affinity API — only the Pi can be pinned";
+    // Whether a split mismatch blocks the run depends on which steps are
+    // ticked, so the banner has to be re-judged when they change — not only
+    // when the model or the test set does.
+    renderPiSplitBanner();
     paintPiCmd();
   }
 
@@ -1369,12 +2140,13 @@
     return {
       target: state.pi.target,
       model: state.pi.model || "",
-      testdata: $("#piTestdata").value,
+      testdata: state.pi.testdata || "",
       threads: num("#piThreads"),
       hop: num("#piHop"),
       latency_every: num("#piLatencyEvery"),
       measure: $("#piMeasure").checked || onPi,
       duty: $("#piDutyOn").checked,
+      incremental: $("#piIncremental").checked,
       duty_hops: $("#piDutyHops").value,
       duty_seconds: num("#piDutySeconds"),
       realtime: onPi && $("#piRealtime").checked,
@@ -1508,6 +2280,15 @@
   async function refreshPiMeta() {
     try {
       state.meta.pi = await api("/api/pi/meta");
+      // The measurement that just finished is also a row in the Runs tab's
+      // Deploy view, which reads state.meta.deploys and would otherwise go on
+      // showing the measurements that existed when the page loaded.
+      try {
+        const d = await api("/api/runs/deploys");
+        state.meta.deploys = d.deploys || [];
+        state.meta.deploy_logs = d.deploy_logs || [];
+        if (state.runsView === "deploy") renderRuns();
+      } catch (e) { /* the Pi meta is the important half; keep it */ }
       // A run that exported leaves the form pointing at the old model, which
       // would then describe something the run never touched.
       const made = state.pi.ranExport;
@@ -2023,23 +2804,119 @@
   const fmt = (x, d = 3) => x == null ? "—" : Number(x).toFixed(d);
   async function refreshRuns() {
     try {
-      // /api/runs returns every grouping; take them all. Picking out only two
-      // left the loss and optimizer views showing whatever the page loaded with,
-      // so a run that finished while the page was open never appeared in them.
+      // /api/runs returns every grouping; take them all. Copied by iterating
+      // the payload rather than a list written out here, because that list is
+      // the thing that goes stale: it already cost the loss and optimizer
+      // views once, and again when the deploy rows were added to the endpoint
+      // and not to the list. A view then shows whatever the page loaded with,
+      // which looks like the data is missing rather than old.
       const payload = await api("/api/runs");
       const runs = payload.runs;
-      for (const key of ["runs", "kinds", "times", "losses", "optimizers"]) {
-        state.meta[key] = payload[key] || [];
-      }
+      for (const [key, value] of Object.entries(payload)) state.meta[key] = value;
       state.meta.datalists.checkpoints = runs.map(r => r.checkpoint);
       const dl = $("#dl_teacher_ckpt"); if (dl) { dl.innerHTML = ""; for (const r of runs) dl.appendChild(new Option(r.checkpoint)); }
       fillParamCmp();
       fillEvalRuns();
+      // The Deploy tab keeps its own list, and a run that just finished is a
+      // model it can deploy. Without this the tab goes on showing the models
+      // that existed when the page loaded: the new run is selectable from the
+      // Runs table but unknown here, so it has no metadata, no split check
+      // and no test-set generator -- all of which fail quietly.
+      await refreshPiMeta();
       renderPiModelButton();
       renderRuns();
     } catch (e) { banner(e.message); }
   }
   const HEAD = `<tr><th>run</th><th class="num">params</th><th class="num" title="master_seed: the one seed this project has. It drives the data splits, the SNR pairing, weight init, dropout and batch order together, so runs that differ only in it are independent repeats of the same experiment.">seed</th><th class="num">epochs</th><th class="num">best</th><th class="num">val loss</th><th class="num">RRMSE_t</th><th class="num">RRMSE_f</th><th class="num">CC</th><th></th></tr>`;
+
+  const DEPLOY_HEAD = `<tr><th>measurement</th><th>where</th><th class="num">hop</th>`
+    + `<th class="num" title="Median wall-clock time for one hop: buffer roll, normalise, run, rescale, slice">median</th>`
+    + `<th class="num" title="Median hop time over the hop's deadline (hop / 256 Hz). Under 1 keeps up.">duty</th>`
+    + `<th class="num" title="Hops that missed their deadline">misses</th>`
+    + `<th class="num" title="RRMSE in the time domain on the test set, epoch mode — lower is better. Hover a value for the streaming figure and where it came from.">RRMSE_t</th>`
+    + `<th class="num" title="RRMSE on the amplitude spectrum, epoch mode — lower is better">RRMSE_f</th>`
+    + `<th class="num" title="Correlation with the clean signal, epoch mode — higher is better">CC</th>`
+    + `<th title="Whether the machine was held still while measuring: governor, CPU affinity, throttling and load. Traces from before this was recorded say unknown, which is not the same as unlocked.">state</th><th></th></tr>`;
+
+  const VERDICT_TITLE = {
+    locked: "every control held — governor, affinity, thread count, no throttling, machine idle",
+    partial: "usable, but something was not held, so the tail is not reproducible",
+    unlocked: "the machine was not held still; indicative only",
+  };
+
+  function deployRow(r) {
+    const name = `<b>${escHtml(r.model)}</b>`
+      + (r.variant || r.artifact
+          ? `<span class="sub">${escHtml([r.variant, r.artifact].filter(Boolean).join(" · "))}`
+            + `${r.params != null ? " · " + (r.params / 1000).toFixed(0) + "k params" : ""}`
+            + `${r.master_seed != null ? " · seed " + r.master_seed : ""}</span>`
+          : `<span class="sub">no run by this name any more</span>`);
+    // The host is this laptop, which has neither a governor nor an affinity
+    // API, so it can never be the reportable number. Labelled, not hidden.
+    const inf = r.inference || {};
+    const machine = r.where === "pi"
+      ? `Raspberry Pi`
+      : `<span class="muted" title="macOS exposes no CPU governor and no affinity control, so a host run is a convenience, not the measurement">this machine</span>`;
+    // The machine and the method are two different questions and a row has to
+    // answer both: "15 ms a hop" means nothing without knowing whether the
+    // hop recomputed a whole window or advanced one cached step.
+    const modeTitle = inf.note
+      ? `${inf.mode} · ${inf.runtime || ""} · ${inf.note}`
+      : "windowed hop-and-recompute (assumed: this trace predates the method being recorded)";
+    const mode = `<span class="sub ${r.mode === "incremental" ? "modeinc" : ""}"`
+      + ` title="${escHtml(modeTitle)}">${r.mode}`
+      + `${inf.kv_cache ? " · KV cache" : ""}`
+      + `${inf.recompute_factor > 1 ? ` · ${inf.recompute_factor}x recompute` : ""}</span>`;
+    const where = machine + mode;
+    const duty = r.duty_cycle == null ? "—"
+      : `<span class="${r.realtime_ok === false ? "d up" : ""}">${(r.duty_cycle * 100).toFixed(1)}%</span>`;
+    const v = r.verdict || "unknown";
+    const vcls = v === "locked" ? "ok" : v === "unknown" ? "muted" : "warn";
+    const extras = [r.duty ? `duty sweep${r.duty.best_hop != null ? ` · safe from hop ${r.duty.best_hop}` : ""}` : null,
+                    r.realtime ? "real-time replay" : null,
+                    r.csv ? "csv" : null].filter(Boolean).join(" · ");
+    // Accuracy from the same run as the timing. "epoch mode" is the batched
+    // score and the one to compare across rows; the streaming figure is a
+    // pessimistic bound (it concatenates independent epochs, so every window
+    // straddles two unrelated signals) and rides along in the tooltip.
+    const sc = r.scores || {}, modes = sc.modes || {};
+    // Matched by prefix: the windowed path reports "epoch mode" and the step
+    // graph "epoch mode (stepped)". Both are the same scoring protocol --
+    // independent epochs -- which is what makes the column comparable down
+    // the table; they differ in how the samples were produced, which the
+    // label says and the mode column says again.
+    const epochKey = Object.keys(modes).find(k => k.startsWith("epoch mode"));
+    const epoch = (epochKey && modes[epochKey]) || {};
+    const stream = modes[`stream mode (hop ${r.hop})`]
+                || Object.entries(modes).find(([k]) => k.startsWith("stream mode"))?.[1] || {};
+    const metricCell = key => {
+      const v = epoch[key];
+      if (v == null) return `<td class="num">—</td>`;
+      const bits = [stream[key] != null ? `streaming ${stream[key].toFixed(4)}` : null,
+                    sc.testdata ? `on ${sc.testdata}` : null,
+                    sc.source === "log"
+                      ? `read from ${sc.from_log} — this trace predates scores being saved`
+                      : "recorded in the trace"].filter(Boolean).join(" · ");
+      // Dashed underline for a number scraped out of a log rather than saved
+      // as data, the same distinction the loss badges draw.
+      return `<td class="num"><span class="${sc.source === "log" ? "fromlog" : ""}"`
+           + ` title="${escHtml(bits)}">${v.toFixed(key === "acc" ? 3 : 3)}</span></td>`;
+    };
+
+    return `<tr><td>${name}</td><td>${where}</td><td class="num">${r.hop}</td>`
+      + `<td class="num">${r.median_ms == null ? "—" : r.median_ms.toFixed(2) + " ms"}`
+      + `<span class="sub">of ${r.budget_ms} ms</span></td>`
+      + `<td class="num">${duty}</td>`
+      + `<td class="num">${r.deadline_misses == null ? "—" : r.deadline_misses}`
+      + `${r.n_hops ? `<span class="sub">of ${r.n_hops}</span>` : ""}</td>`
+      + metricCell("rrmse_t") + metricCell("rrmse_s") + metricCell("acc")
+      + `<td><span class="${vcls}" title="${escHtml(VERDICT_TITLE[v] || "this trace predates the environment being recorded")}">${v}</span>`
+      + `${extras ? `<span class="sub">${extras}</span>` : ""}</td>`
+      + `<td><button data-trace="${escHtml(r.primary || r.traces[0])}"`
+      + ` data-traces="${escHtml(r.traces.join(" "))}"`
+      + ` title="Show this measurement in the Deploy tab — its per-hop latency and,`
+      + ` where the run wrote one, its duty-cycle sweep">Open</button></td></tr>`;
+  }
 
   // The same figure the Params tab calls the checkpoint count: every tensor in
   // model_state except the causal masks.  Rounded here because the column is
@@ -2083,7 +2960,11 @@
   }
 
   function runRow(r, when = "", mode = "tab") {
-    const badges = (r.bidirectional ? '<span class="badge bi">bi</span>' : "")
+    const badges = (r.bidirectional ? '<span class="badge bi" title="non-causal with no bounded horizon: its attention or its pooling reads the whole 512-sample epoch. A teacher, not a deployable model">bi</span>' : "")
+      + (r.lookahead
+          ? `<span class="badge la" title="bounded lookahead: this run may read ${r.lookahead} sample${r.lookahead === 1 ? "" : "s"} past the one it emits, which is ${(1000 * r.lookahead / 256).toFixed(1)} ms of output delay. Not causal, so the ONNX exporter refuses it — but the horizon is finite and stated, unlike a bi teacher">la${r.lookahead}</span>`
+          + `<span class="badge la" title="the output delay this rung's lookahead costs at 256 Hz">+${(1000 * r.lookahead / 256).toFixed(1)} ms</span>`
+          : "")
       + (r.kd ? '<span class="badge kd">kd</span>' : "")
       + (r.status === "stale" ? '<span class="badge stale" title="history.json and the weights beside it come from different runs — this directory was re-used">stale</span>' : "")
       + (r.status === "interrupted" ? '<span class="badge partial" title="no history.json: the run did not finish">partial</span>' : "")
@@ -2099,8 +2980,10 @@
     // which of them can already be run and which would be exported first —
     // the distinction the Deploy tab's model field is about.
     const deployBadge = (state.pickFor === "deploy" && mode === "pick")
-      ? (r.bidirectional
-          ? '<span class="badge fail" title="non-causal: it needs the future, so the ONNX exporter refuses it">no export</span>'
+      ? (r.bidirectional || r.lookahead
+          ? `<span class="badge fail" title="${r.lookahead
+              ? `bounded lookahead: it reads ${r.lookahead} samples ahead, so the exporter refuses it. Deploying one means delaying the output ${(1000 * r.lookahead / 256).toFixed(1)} ms, which no path here implements yet`
+              : "non-causal: it needs the future, so the ONNX exporter refuses it"}">no export</span>`
           : (piMeta().models || []).some(m => m.name === r.name && m.exported)
             ? '<span class="badge ok" title="an ONNX export already exists for this run">onnx</span>'
             : '<span class="badge" title="no ONNX export yet — picking this one exports it first">export first</span>')
@@ -2195,6 +3078,19 @@
           + g.runs.map(r => runRow(r, "", mode)).join("");
       }).join("");
       html = HEAD + (body || '<tr><td colspan="10" class="muted">no complete runs yet</td></tr>');
+    } else if (view === "deploy") {
+      // A different kind of run and so a different table: a measurement has a
+      // machine, a hop and a deadline, none of which a training run has, and
+      // none of the training columns (epochs, val loss) mean anything here.
+      const rows = state.meta.deploys || [], logs = state.meta.deploy_logs || [];
+      const onPi = rows.filter(r => r.where === "pi").length;
+      note = { html: `${rows.length} measurement${rows.length === 1 ? "" : "s"}`
+        + ` · ${onPi} on the Pi, ${rows.length - onPi} on this machine`
+        + (logs.length ? ` · ${logs.length} deploy job log${logs.length === 1 ? "" : "s"} in runs/` : "")
+        + ` · <b>a latency figure describes a model and the machine it ran on</b> —`
+        + ` the state column is which of the two was actually held still` };
+      html = DEPLOY_HEAD + (rows.map(deployRow).join("")
+        || '<tr><td colspan="11" class="muted">no measurements yet — run one from the Deploy tab</td></tr>');
     } else {
       note = { text: `${all.length} checkpoint director${all.length === 1 ? "y" : "ies"} in runs/ · best epoch by val loss · “Use as teacher” fills teacher_ckpt` };
       html = HEAD + (all.map(r => runRow(r, "", mode)).join("") || '<tr><td colspan="10" class="muted">no runs/*/best.pt yet</td></tr>');
@@ -2216,6 +3112,23 @@
       $("#f_teacher_ckpt").scrollIntoView({ block: "center" });
     }));
     t.querySelectorAll("button[data-hist]").forEach(b => b.addEventListener("click", () => plotRun(b.dataset.hist)));
+    t.querySelectorAll("button[data-trace]").forEach(b => b.addEventListener("click", async () => {
+      showTab("deploy");
+      // A measurement writes up to three traces and the Deploy tab draws them
+      // in two panels, fed from two slots keyed by kind. Opening only the
+      // per-hop trace therefore left the duty-cycle panel showing whatever ran
+      // before — or nothing at all. Load the row's whole set.
+      const names = (b.dataset.traces || b.dataset.trace || "").split(" ").filter(Boolean);
+      // Clear first: a row with no duty sweep must not keep another run's.
+      state.pi.loaded = { latency: null, duty: null };
+      const sel = $("#piTrace");
+      if ([...sel.options].some(o => o.value === b.dataset.trace)) sel.value = b.dataset.trace;
+      // The per-hop trace goes last so it, not the real-time replay beside it,
+      // is what ends up in the shared "latency" slot.
+      const ordered = [...names.filter(n => n !== b.dataset.trace), b.dataset.trace];
+      for (const n of ordered) await loadPiTrace(n, true);
+      renderPi();
+    }));
   }
 
   async function plotRun(name) {
@@ -2354,6 +3267,7 @@
       <div class="stat"><b>${fmtBytes(a.bytes_fp32)}</b><span class="k">weights, fp32</span></div>
       ${a.attention ? `<div class="stat"><b>${a.attention.d_model}</b><span class="k">attention width (d_model)</span></div>
       <div class="stat"><b>${a.attention.n_layers} × ${a.attention.attention_type.toUpperCase()}</b><span class="k">${a.attention.n_heads} heads · head_dim ${a.attention.head_dim}</span></div>` : ""}
+      ${(a.streaming && a.streaming.available) ? `<div class="stat"><b>${fmtBytes(a.streaming.total_state_bytes)}</b><span class="k">streaming state — measured, one stream</span></div>` : ""}
     </div>`;
 
     const f = a.attention;
@@ -2377,6 +3291,30 @@
         + (f.turboquant_bits ? `; TurboQuant would quantise these to ${f.turboquant_bits} bits and is not folded in` : ""));
       facts.push(`the causal masks add <b>${fmtBytes(a.mask_elements * 4)}</b> of constant ones to every saved checkpoint; they are buffers, not weights, and the counts above exclude them`);
     }
+
+    // The same cache, weighed rather than derived. The line above is arithmetic
+    // from the architecture; this one builds the streaming model and reads its
+    // live buffers, so the claim is confirmed instead of asserted. If the two
+    // ever disagree the formula has drifted from the code, and that says so.
+    const s = a.streaming;
+    if (s && s.available) {
+      if (f) {
+        const agrees = s.kv_per_step === f.kv_per_step;
+        facts.push(agrees
+          ? `<b>measured</b>: streaming the model really allocates <b>${fmtN(s.kv_per_step)}</b> fp32 values per new sample, which is what the line above predicts — the cache is weighed, not just derived (<code>models/incremental.py</code>)`
+          : `<b>the measured cache disagrees with the arithmetic above</b>: streaming allocates <b>${fmtN(s.kv_per_step)}</b> fp32 values per sample, not ${fmtN(f.kv_per_step)}. The analytic formula in <code>gui/params.py</code> has drifted from <code>models/incremental.py</code>; trust the measured number`);
+      }
+      // Only this path can see the convolution buffers, and for the sandwich
+      // variants they outweigh an MLA cache — so the end-to-end saving from
+      // choosing MLA is smaller than the KV ratio on its own suggests.
+      facts.push(`the full streaming state is <b>${fmtBytes(s.total_state_bytes)}</b> per stream: <b>${fmtBytes(s.attn_cache_bytes)}</b> of attention cache over a ${fmtN(s.attention_window)}-sample window plus <b>${fmtBytes(s.conv_state_bytes)}</b> of convolution ring buffers`
+        + (s.attn_cache_bytes && s.conv_state_bytes > s.attn_cache_bytes
+            ? ` — the convolution buffers are the larger half, which the KV-cache arithmetic above says nothing about, so an embedded budget should be read off this number rather than that one`
+            : ""));
+      facts.push(`a fresh stream needs <b>${fmtN(s.warmup)}</b> samples before an output has the full context the batch path would give it (convolution receptive field ${fmtN(s.receptive_field)}, attention window ${fmtN(s.attention_window)})`);
+    } else if (s) {
+      facts.push(`<b>cannot be streamed</b>: ${escHtml(s.reason)}`);
+    }
     if (a.buffers) facts.push(`checkpoint − trainable = <b>${fmtN(a.buffers)}</b> BatchNorm running statistics (saved, never optimised)`);
 
     const notes = (a.notes || []).map(n => `<div class="banner info show" style="margin:0 0 8px">${escHtml(n)}</div>`).join("");
@@ -2388,6 +3326,353 @@
       + `<div class="facts">${facts.map(x => `<div>${x}</div>`).join("")}</div>`;
   }
 
+  // ---------- lookahead ----------
+  // The ladder between tcn_se (reads nothing ahead) and tcn_se_bi (reads the
+  // whole epoch). A rung's budget in samples is its output latency: L/fs, so
+  // 3.9 ms a sample at 256 Hz, which is why the x axis is milliseconds and
+  // not rung number -- the chart is a price list, and the quantity being
+  // priced is delay.
+  async function refreshLookahead(force) {
+    if (!force && !$("#tab-lookahead").classList.contains("active")) return;
+    if (!state.la.meta) {
+      try { state.la.meta = await api("/api/lookahead/meta"); } catch (e) { return banner(e.message); }
+      const art = $("#laArtifact");
+      if (!art.options.length) {
+        for (const a of state.la.meta.artifacts) art.appendChild(new Option(a, a));
+        art.value = state.la.artifact;
+      }
+      if (!$("#laWidth").value) $("#laWidth").value = state.la.meta.hidden_channels;
+      const rung = $("#laRung"), seeds = $("#laSeeds");
+      if (!rung.options.length) {
+        rung.appendChild(new Option("0 — tcn_se (causal)", "0"));
+        // The share is in the label because "la186" invites "186 of what?",
+        // and the window it is read against is 124 taps. The denominator is
+        // the licence: 124 the convolutions can move plus 62 the SE gates can
+        // peek. As a share the top three rungs are the thirds.
+        const shares = state.la.meta.shares || {};
+        for (const n of state.la.meta.ladder) {
+          const tail = shares[String(n)] ? ` · ${shares[String(n)]} ahead` : "";
+          rung.appendChild(new Option(`${n} — tcn_se_la${n}${tail}`, String(n)));
+        }
+        rung.value = "32";
+      }
+      if (!seeds.querySelector("input")) {
+        for (const n of state.la.meta.seeds) {
+          const lab = document.createElement("label");
+          lab.className = "chk";
+          const cb = document.createElement("input");
+          cb.type = "checkbox"; cb.value = String(n); cb.checked = true;
+          cb.addEventListener("change", () => renderLaTrain(false));
+          lab.append(cb, document.createTextNode(` ${n}`),
+                     Object.assign(document.createElement("span"), { className: "mark" }));
+          seeds.appendChild(lab);
+        }
+      }
+      const cap = state.la.meta.capacity;
+      $("#laCapacity").textContent = `capacity ${cap.conv_and_se} samples `
+        + `(${cap.conv} in the convolutions, ${cap.conv_and_se - cap.conv} in the SE gates) `
+        + `— a budget can exceed the ${cap.conv}-tap window because the gates reach `
+        + `forward too`;
+    }
+    $("#laChartTitle").textContent = "measuring…";
+    try {
+      state.la.data = await api("/api/lookahead/measure",
+        { artifact: $("#laArtifact").value, hidden_channels: +$("#laWidth").value || 64 });
+      state.la.error = null;
+    } catch (e) { state.la.error = e.message; }
+    renderLookahead();
+    previewLookahead();
+  }
+
+  function renderLookahead() {
+    const box = $("#laBody"), d = state.la.data;
+    if (state.la.error) { box.innerHTML = `<div class="banner show err">${state.la.error}</div>`; return; }
+    if (!d) { box.innerHTML = ""; return; }
+
+    const rows = d.rows;
+    const ceiling = rows.find(r => r.unbounded);
+    const floor0 = rows.find(r => r.lookahead === 0);
+    // The rungs are the ladder itself: the 0 ms anchor and the unbounded
+    // ceiling are the two ends it is measured between, not steps on it.
+    // Counting the anchor as a rung read "10 / 9 priced" once every rung had
+    // been trained.
+    const rungs = rows.filter(r => !r.unbounded && r.lookahead !== 0);
+    const priced = rungs.filter(r => r.rrmse_t.n);
+
+    renderLookaheadChart(rows);
+
+    // --- the gap this ladder exists to fill ---
+    const gap = (floor0 && floor0.rrmse_t.mean != null && ceiling && ceiling.rrmse_t.mean != null)
+      ? floor0.rrmse_t.mean - ceiling.rrmse_t.mean : null;
+    const stats = `<div class="row" style="gap:8px;margin:10px 0">`
+      + `<div class="stat"><b>${fmt(floor0 && floor0.rrmse_t.mean, 4)}</b><span class="k">causal, 0 ms</span>`
+        + `<div class="d">${seedNote(floor0)}</div></div>`
+      + `<div class="stat"><b>${fmt(ceiling && ceiling.rrmse_t.mean, 4)}</b><span class="k">unbounded ceiling</span>`
+        + `<div class="d">${seedNote(ceiling)}</div></div>`
+      + `<div class="stat"><b>${gap == null ? "—" : gap.toFixed(4)}</b><span class="k">RRMSE_t on the table</span>`
+        + `<div class="d">what lookahead can buy</div></div>`
+      + `<div class="stat"><b>${priced.length} / ${rungs.length}</b><span class="k">rungs priced</span>`
+        + `<div class="d">${priced.length ? "" : "train one to start the curve"}</div></div>`
+      + `</div>`;
+
+    const head = `<tr><th>rung</th><th class="num" title="What the graph is licensed to read past the sample it emits. This is the figure that sets the output delay, whether or not the weights use all of it.">licensed</th>`
+      + `<th class="num" title="licensed / 256 Hz — the output delay a deployment must carry">latency</th>`
+      + `<th class="num" title="How far the weights actually reach, by perturbing one input sample and finding how far back the output moves. Can fall short of licensed: a dead ReLU in an SE gate drops a licensed dependence to exactly zero.">measured</th>`
+      + `<th class="num">used</th>`
+      + `<th class="num" title="The convolution window: taps behind t / taps ahead of it. A kernel has a fixed number of taps to place and puts each one on one side or the other, so the two always sum to 124 — lookahead does not add context, it slides the same window forward. The rung number can exceed 124 because the SE gates peek forward as well, and it is the licence that sets the latency. A rung with 0 behind has no past at all: the anti-causal mirror of the baseline, not a better-informed version of it.">window</th>`
+      + `<th class="num">params</th><th class="num">seeds</th>`
+      + `<th class="num">RRMSE_t</th><th class="num">RRMSE_f</th><th class="num">CC</th><th></th></tr>`;
+
+    const body = rows.map(r => {
+      // The share rides along with the name here too: the column is where the
+      // numbers are compared, so it is where "186 of what?" gets asked.
+      const share = r.share
+        ? ` <span class="muted" title="${r.lookahead} of the ${r.window + 62}-sample licence `
+          + `— ${r.window} convolution taps plus 62 of SE peek — may sit ahead of t, so about `
+          + `${r.share} of the window is in the future">${r.share}</span>` : "";
+      const label = r.unbounded
+        ? `${r.variant} <span class="muted" title="Its convolutions are centred: 62 taps either `
+          + `side, the same 125-sample window as every rung. Unbounded refers to the SE gate, `
+          + `which pools globally.">unbounded</span> <span class="muted">centred</span>`
+        : r.variant ? r.variant + share + (r.one_sided ? ` <span class="warn">mirror</span>` : "")
+        : `<span class="muted">la${r.lookahead} (unregistered)</span>`;
+      const lat = r.unbounded ? `<span class="muted">—</span>`
+        : `${r.latency_ms.toFixed(1)} ms`;
+      const used = r.exercised == null ? `<span class="muted">—</span>`
+        : `${r.exercised.toFixed(0)}%`;
+      const warn = (r.mismatched || []).length
+        ? ` <span class="muted" title="${r.mismatched.map(m => m.name + ": " + m.why).join("; ")
+            }">· ${r.mismatched.length} excluded</span>` : "";
+      return `<tr${r.unbounded ? ' class="grp"' : ""}>`
+        + `<td class="name">${label}${warn}</td>`
+        + `<td class="num">${r.licensed == null ? "∞" : r.licensed}</td>`
+        + `<td class="num">${lat}</td>`
+        + `<td class="num">${r.measured == null ? "∞" : r.measured}</td>`
+        + `<td class="num">${used}</td>`
+        + `<td class="num${r.one_sided ? " warn" : ""}"`
+          + ` title="${r.one_sided ? "no past: every convolution is padded entirely on the right, "
+            + "so this rung sees nothing before the sample it emits"
+            : `${r.past} of the ${r.window}-tap window behind t, ${r.ahead} ahead`
+              + (r.share ? ` · licence ${r.share}` : "")}">`
+          + `${r.past == null ? "—" : `${r.past} / ${r.ahead}`}</td>`
+        + `<td class="num">${fmtK(r.params)}</td>`
+        + `<td class="num">${r.seeds.length ? r.seeds.join(" ") : "<span class='muted'>—</span>"}</td>`
+        + `<td class="num">${metricCell(r.rrmse_t)}</td>`
+        + `<td class="num">${metricCell(r.rrmse_s)}</td>`
+        + `<td class="num">${metricCell(r.acc)}</td>`
+        + `<td class="num">${r.trainable ? "" : `<span class="muted" title="${r.note || ""}">no name</span>`}</td>`
+        + `</tr>`;
+    }).join("");
+
+    box.innerHTML = stats
+      + `<div style="overflow:auto"><table id="params">${head}${body}</table></div>`
+      + `<div class="row"><span class="muted">Measured at ${d.hidden_channels} channels on `
+      + `${d.artifact} runs, from <code>configs/${d.config}</code>. A run joins a rung's average `
+      + `only if it is the same model trained the same way — same width, no distillation, same `
+      + `loss; excluded ones are counted in the rung's row and named on hover. `
+      + `<b>measured</b> is taken on a freshly initialised model at a fixed weight seed — it `
+      + `shows that a licence can go unused, not what any trained rung does with it. Trained `
+      + `checkpoints reach further: tcn_se_la16 uses 15–16 of its 16 samples where a fresh `
+      + `init uses 14.</span></div>`;
+  }
+
+  const seedNote = r => !r || !r.rrmse_t.n ? "no run yet"
+    : r.rrmse_t.n === 1 ? "1 seed" : `${r.rrmse_t.n} seeds ± ${fmt(r.rrmse_t.sd, 4)}`;
+
+  const metricText = s => !s || !s.n ? "—"
+    : s.sd == null ? s.mean.toFixed(4) : `${s.mean.toFixed(4)} ± ${s.sd.toFixed(4)}`;
+
+  function metricCell(s) {
+    if (!s || !s.n) return `<span class="muted">—</span>`;
+    const sd = s.sd == null ? "" : ` <span class="muted">± ${s.sd.toFixed(4)}</span>`;
+    return `${s.mean.toFixed(4)}${sd}`;
+  }
+
+  function renderLookaheadChart(rows) {
+    const box = $("#laChart"), legend = $("#laLegend"), note = $("#laChartNote");
+    const ceiling = rows.find(r => r.unbounded);
+    const pts = rows.filter(r => !r.unbounded && r.rrmse_t.n);
+    const W = 720, H = 230, L = 52, R = 18, T = 14, B = 34;
+
+    if (!pts.length) {
+      $("#laChartTitle").textContent = "accuracy against latency — nothing priced yet";
+      box.innerHTML = `<svg viewBox="0 0 ${W} ${H}"><text x="${W / 2}" y="${H / 2}" text-anchor="middle" `
+        + `font-size="13" fill="${cssVar("--muted")}">train a rung to put a point on the curve</text></svg>`;
+      legend.innerHTML = ""; note.textContent = ""; return;
+    }
+    const n = pts.filter(r => r.lookahead !== 0).length;      // the anchor is not a rung
+    $("#laChartTitle").textContent = `RRMSE_t against output latency — ${n} rung`
+      + `${n === 1 ? "" : "s"} priced`;
+
+    // x: a dedicated anchor for 0 ms (which no log axis can hold), then log10
+    // over the rest. Linear would crowd six of ten rungs into the first sixth
+    // of the axis; rung number would hide the diminishing returns, which is
+    // the shape the chart is read for.
+    const lats = rows.filter(r => !r.unbounded && r.latency_ms > 0).map(r => r.latency_ms);
+    const loMs = Math.min(...lats), hiMs = Math.max(...lats);
+    const x0 = L + 26, xs = L + 58;
+    const X = v => v <= 0 ? x0
+      : xs + (Math.log10(v) - Math.log10(loMs)) / (Math.log10(hiMs) - Math.log10(loMs)) * (W - R - xs);
+
+    const vals = pts.flatMap(r => [r.rrmse_t.mean - (r.rrmse_t.sd || 0),
+                                   r.rrmse_t.mean + (r.rrmse_t.sd || 0)]);
+    if (ceiling && ceiling.rrmse_t.mean != null) vals.push(ceiling.rrmse_t.mean);
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    const pad = (hi - lo) * 0.18 || 0.01; lo -= pad; hi += pad;
+    const Y = v => T + (hi - v) / (hi - lo) * (H - T - B);
+
+    let g = "";
+    for (const t of niceTicks(lo, hi)) {
+      const y = Y(t).toFixed(1);
+      g += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="${cssVar("--border")}"/>`
+         + `<text x="${L - 6}" y="${y}" text-anchor="end" dominant-baseline="central" font-size="10.5" `
+         + `fill="${cssVar("--muted")}">${(+t).toFixed(3)}</text>`;
+    }
+    for (const r of rows.filter(q => !q.unbounded)) {
+      const x = X(r.latency_ms).toFixed(1);
+      g += `<text x="${x}" y="${H - B + 13}" text-anchor="middle" font-size="10" `
+         + `fill="${cssVar("--muted")}">${r.latency_ms === 0 ? "0" : r.latency_ms < 100
+             ? r.latency_ms.toFixed(0) : Math.round(r.latency_ms)}</text>`;
+    }
+    g += `<text x="${(L + W - R) / 2}" y="${H - 3}" text-anchor="middle" font-size="10.5" `
+       + `fill="${cssVar("--muted")}">output latency (ms, log scale past 0)</text>`;
+
+    // The ceiling has no finite latency, so it is a line rather than a point:
+    // what the model reaches when future context stops being rationed.
+    let over = "";
+    if (ceiling && ceiling.rrmse_t.mean != null) {
+      const y = Y(ceiling.rrmse_t.mean).toFixed(1);
+      over += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="${cssVar("--accent")}" `
+            + `stroke-width="1.4" stroke-dasharray="5 4" opacity="0.85"/>`
+            + `<text x="${W - R - 4}" y="${+y - 5}" text-anchor="end" font-size="10" `
+            + `fill="${cssVar("--accent")}">${ceiling.variant} (unbounded) ${ceiling.rrmse_t.mean.toFixed(4)}</text>`;
+    }
+
+    // The line joins the rungs that are actually a price curve. A rung with no
+    // past left is not one more step along it: the budget slides a fixed
+    // window forward rather than widening it, so at the top the window has
+    // left the past entirely and the point is the baseline's mirror. Joining
+    // it to the rest would draw a purchase that cannot be made.
+    const curve = pts.filter(r => !r.one_sided), mirror = pts.filter(r => r.one_sided);
+    const line = curve.map(r => `${X(r.latency_ms).toFixed(1)},${Y(r.rrmse_t.mean).toFixed(1)}`);
+    if (line.length > 1) {
+      over += `<polyline points="${line.join(" ")}" fill="none" stroke="${cssVar("--accent")}" `
+            + `stroke-width="1.8" stroke-linejoin="round"/>`;
+    }
+    for (const r of mirror) {
+      const x = +X(r.latency_ms).toFixed(1), y = +Y(r.rrmse_t.mean).toFixed(1), k = 4;
+      over += `<line x1="${x - k}" y1="${y - k}" x2="${x + k}" y2="${y + k}" `
+            + `stroke="${cssVar("--warn")}" stroke-width="1.8"/>`
+            + `<line x1="${x - k}" y1="${y + k}" x2="${x + k}" y2="${y - k}" `
+            + `stroke="${cssVar("--warn")}" stroke-width="1.8"/>`
+            + `<title>${r.variant}: no past left — every convolution padded on the right</title>`;
+    }
+    for (const r of curve) {
+      const x = X(r.latency_ms).toFixed(1), y = Y(r.rrmse_t.mean).toFixed(1);
+      if (r.rrmse_t.sd) {
+        const a = Y(r.rrmse_t.mean - r.rrmse_t.sd).toFixed(1), b = Y(r.rrmse_t.mean + r.rrmse_t.sd).toFixed(1);
+        over += `<line x1="${x}" y1="${a}" x2="${x}" y2="${b}" stroke="${cssVar("--accent")}" stroke-width="1.2"/>`
+              + `<line x1="${+x - 3}" y1="${a}" x2="${+x + 3}" y2="${a}" stroke="${cssVar("--accent")}" stroke-width="1.2"/>`
+              + `<line x1="${+x - 3}" y1="${b}" x2="${+x + 3}" y2="${b}" stroke="${cssVar("--accent")}" stroke-width="1.2"/>`;
+      }
+      over += `<circle cx="${x}" cy="${y}" r="${r.rrmse_t.n > 1 ? 3.2 : 2.4}" `
+            + `fill="${r.rrmse_t.n > 1 ? cssVar("--accent") : cssVar("--bg")}" `
+            + `stroke="${cssVar("--accent")}" stroke-width="1.4"/>`;
+    }
+
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" `
+      + `aria-label="RRMSE_t against output latency">${g}${over}</svg>`;
+    legend.innerHTML = `<span class="item"><i style="background:${cssVar("--accent")}"></i>mean over seeds`
+      + `</span><span class="item muted">whiskers ± 1 sd</span>`
+      + `<span class="item muted">hollow point = one seed only</span>`
+      + (mirror.length ? `<span class="item muted">✕ = no past left, off the curve</span>` : "");
+    const single = curve.filter(r => r.rrmse_t.n === 1).length;
+    const parts = [];
+    if (mirror.length) {
+      parts.push(`${mirror.map(r => r.variant).join(", ")} is off the curve: at the full budget `
+        + `every convolution is padded on the right, so it has no past at all. Lookahead slides `
+        + `the window forward, it does not widen it — every tap given to the future comes out of `
+        + `the past, and that rung is the causal baseline's mirror.`);
+    }
+    if (single) {
+      parts.push(`${single} rung${single === 1 ? " has" : "s have"} a single seed: the spread `
+        + `there is unknown, not zero.`);
+    }
+    note.textContent = parts.join(" ");
+  }
+
+  // The preview asks about every seed, not the ticked ones: which directories
+  // are already taken is what decides the ticks in the first place, so a rung
+  // that has been trained at 42 opens with 54 and 67 selected and 42 marked.
+  async function previewLookahead(reset) {
+    try {
+      const plan = await api("/api/lookahead/preview",
+        { lookahead: +$("#laRung").value, artifact: $("#laArtifact").value,
+          master_seeds: (state.la.meta.seeds || []).slice(),
+          overwrite: $("#laOverwrite").checked });
+      state.la.plan = plan;
+      renderLaTrain(reset !== false);
+    } catch (e) {
+      state.la.plan = null;
+      $("#laCommand").textContent = e.message;
+      $("#btnLaTrain").disabled = true;
+    }
+  }
+
+  function laPicked() {
+    const plan = state.la.plan;
+    if (!plan) return [];
+    const on = new Set([...$("#laSeeds").querySelectorAll("input:checked")].map(c => +c.value));
+    return plan.runs.filter(r => on.has(r.master_seed));
+  }
+
+  function renderLaTrain(reset) {
+    const plan = state.la.plan;
+    if (!plan) return;
+    for (const r of plan.runs) {
+      const cb = $("#laSeeds").querySelector(`input[value="${r.master_seed}"]`);
+      if (!cb) continue;
+      // A seed with a run starts unticked rather than disabled: with overwrite
+      // it is a legitimate thing to ask for, and hiding it would hide that the
+      // rung has been done before.
+      if (reset) cb.checked = !r.exists;
+      cb.parentElement.title = r.exists ? `${r.save_dir} already holds a run` : `→ ${r.save_dir}`;
+      cb.parentElement.querySelector(".mark").textContent = r.exists ? " ✓" : "";
+    }
+    const over = $("#laOverwrite").checked;
+    const picked = laPicked(), clash = over ? [] : picked.filter(r => r.exists);
+    const redo = over ? picked.filter(r => r.exists) : [];
+    $("#laCommand").textContent = picked.length
+      ? picked.map(r => `python -m trainer --config configs/${plan.config} ${r.extra}`).join("\n")
+      : "tick a seed to train";
+    $("#btnLaTrain").textContent = picked.length > 1
+      ? `Train ${picked.length} seeds` : "Train this rung";
+    $("#btnLaTrain").disabled = !picked.length || clash.length > 0;
+    $("#laTrainNote").textContent = clash.length
+      ? `${clash.map(r => r.save_dir).join(", ")} already `
+        + `${clash.length === 1 ? "holds" : "hold"} a run`
+      : redo.length
+        ? `${redo.map(r => r.save_dir).join(", ")} will be overwritten`
+      : !picked.length && plan.runs.every(r => r.exists)
+        ? `every seed on this rung has a run — tick one with overwrite to redo it`
+      : picked.length > 1
+        ? `${picked.length} runs at once — they share one machine, so the epoch times `
+          + `in each log are not comparable with a run that had it to itself`
+        : "";
+  }
+
+  async function trainLookahead() {
+    const picked = laPicked();
+    if (!picked.length) return;
+    try {
+      const s = await api("/api/lookahead/train",
+        { lookahead: +$("#laRung").value, artifact: $("#laArtifact").value,
+          master_seeds: picked.map(r => r.master_seed),
+          overwrite: $("#laOverwrite").checked });
+      applyStatus(s); selectJob(s.id, { force: true }); showTab("train"); startPolling();
+    } catch (e) { banner(e.message); }
+  }
+
   // ---------- tabs / wiring ----------
   function showTab(id) {
     document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === id));
@@ -2396,7 +3681,16 @@
   document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click", () => {
     showTab(b.dataset.tab);
     if (b.dataset.tab === "params") refreshParams(true);
+    if (b.dataset.tab === "lookahead" && !state.la.data) refreshLookahead(true);
   }));
+  $("#btnLaRefresh").addEventListener("click", () => refreshLookahead(true));
+  $("#laArtifact").addEventListener("change", () => refreshLookahead(true));
+  $("#laWidth").addEventListener("change", () => refreshLookahead(true));
+  $("#laRung").addEventListener("change", () => previewLookahead(true));
+  // Re-asked rather than patched in the page: --overwrite lands on the runs
+  // that need it, and which those are is the server's answer.
+  $("#laOverwrite").addEventListener("change", () => previewLookahead(false));
+  $("#btnLaTrain").addEventListener("click", trainLookahead);
   $("#paramCmp").addEventListener("change", e => {
     state.paramCmp = e.target.value;
     try { localStorage.setItem("trainGui.paramCmp", state.paramCmp); } catch (err) {}
@@ -2450,6 +3744,24 @@
   $("#btnPiCheck").addEventListener("click", () => runPi(true));
   $("#btnPiStop").addEventListener("click", stopPi);
   $("#btnPiRefresh").addEventListener("click", refreshPiMeta);
+  $("#btnRfRun").addEventListener("click", runRfSweep);
+  $("#btnRfStop").addEventListener("click", async () => {
+    try { state.rf.job = await api("/api/rf/stop", {}); } catch (e) { banner(e.message); }
+  });
+  $("#btnRfAll").addEventListener("click", () => {
+    $("#rfRungs").querySelectorAll("input").forEach(c => c.checked = true);
+    state.rf.rungs = rfLadder().map(r => r.receptive_field); updateRfNote();
+  });
+  $("#btnRfNone").addEventListener("click", () => {
+    $("#rfRungs").querySelectorAll("input").forEach(c => c.checked = false);
+    state.rf.rungs = []; updateRfNote();
+  });
+  $("#rfVariant").addEventListener("change", () => {
+    state.rf.variant = $("#rfVariant").value; renderRfRungs(); refreshRfResults();
+  });
+  $("#rfArtifact").addEventListener("change", () => {
+    state.rf.artifact = $("#rfArtifact").value; refreshRfResults();
+  });
   $("#piTarget").querySelectorAll("button").forEach(b => b.addEventListener("click", () => {
     state.pi.target = b.dataset.target;
     try { localStorage.setItem("trainGui.piTarget", state.pi.target); } catch (e) {}
@@ -2459,14 +3771,25 @@
   }));
   $("#piRequireLocked").addEventListener("change", rememberRequireLocked);
   $("#piTrace").addEventListener("change", e => loadPiTrace(e.target.value));
-  $("#piTestdata").addEventListener("change", e => { state.pi.testdata = e.target.value; });
+  $("#piTestdataBtn").addEventListener("click", e => {
+    e.stopPropagation(); togglePiTestdataMenu();
+  });
+  // Click-away and Escape close it, like any menu.
+  document.addEventListener("click", e => {
+    const menu = $("#piTestdataMenu");
+    if (menu.classList.contains("show") && !e.target.closest("#piTestdataWrap")) closePiTestdataMenu();
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && $("#piTestdataMenu").classList.contains("show")) closePiTestdataMenu();
+  });
   $("#piSsh").addEventListener("change", e => {
     try { localStorage.setItem("trainGui.piSsh", e.target.value.trim()); } catch (err) {}
   });
   // Every control the command is built from: the preview is refetched from the
   // server on each keystroke, so it cannot drift from what would run.
-  for (const id of ["#piTestdata", "#piThreads", "#piHop", "#piLatencyEvery",
-                    "#piExport", "#piMeasure", "#piDutyOn", "#piDutyHops", "#piDutySeconds",
+  for (const id of ["#piThreads", "#piHop", "#piLatencyEvery",
+                    "#piExport", "#piMeasure", "#piDutyOn", "#piIncremental",
+                    "#piDutyHops", "#piDutySeconds",
                     "#piRealtime", "#piRealtimeS", "#piSsh", "#piExtra",
                     "#piCpus", "#piGovernor", "#piRequireLocked", "#piSpin"]) {
     for (const ev of ["input", "change"]) {
@@ -2485,6 +3808,7 @@
       $("#runsView").querySelectorAll("button").forEach(x => x.classList.toggle("active", x.dataset.view === state.runsView));
       try { const c = localStorage.getItem("trainGui.paramCmp"); if (c) state.paramCmp = c; } catch (e) {}
       fillParamCmp();
+      loadRfMeta();
       initEvalControls();
       initPiControls();
       renderRuns();

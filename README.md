@@ -21,6 +21,8 @@ The study also introduces **Multi-head Latent Attention (MLA)**, adapted from De
 | `tcn_mla` | Sandwich: TCN → MLA → TCN | Multi-head Latent Attention | 165k |
 | `tcn_mha_par` | Parallel: TCN + MHA branches | Multi-Head Attention | 238k |
 | `tcn_mla_par` | Parallel: TCN + MLA branches | Multi-head Latent Attention | 228k |
+| `tcn_se` | Baseline + a causal Squeeze-and-Excitation gate on every block | Channel gate only, no temporal mixing | 123k |
+| `tcn_se_la{N}` | `tcn_se` licensed to read N samples past the one it emits | Channel gate only | 123k |
 | `tcn_mla_r{N}` | MLA with fixed kv_lora_rank=N | MLA (rank sweep) | varies |
 | `tcn_mha_bi`, `tcn_mla_bi`, `tcn_mha_par_bi`, `tcn_mla_par_bi` | Same as above, **bidirectional** attention (non-causal) | KD teachers only | same as causal twin |
 | `tcn_bi` | Baseline with **non-causal convolutions** (centred padding) | None | 117k |
@@ -78,7 +80,15 @@ Not to be confused with `bottleneck_ratio`, which is the channel squeeze between
 │   ├── TCN_backbone.py         # CausalConv1d → ResidualBlock → CausalTCNBackbone
 │   ├── AttentionBlocks/
 │   │   └── attention.py        # CausalMHA, CausalMLA, TransformerBlock/Decoder
-│   └── variants.py             # 5 model variants + registry + build_model()
+│   ├── variants.py             # 5 model variants + registry + build_model()
+│   ├── lookahead.py           # causality as a dial: budget allocation across the stack,
+│   │                           #   and the probe that measures what a model really reaches
+│   ├── receptive_field.py      # the mirror question: how far *back* the stack reaches,
+│   │                           #   the dilation ladder, and the same probe pointed backwards
+│   ├── incremental.py          # streaming inference: one sample at a time, with a real
+│   │                           #   KV / latent cache (see Incremental inference below)
+│   └── step_graph.py           # the same step as an exportable graph: state in, state out,
+│                               #   so it runs on the Pi with onnxruntime and no torch
 ├── trainer/
 │   ├── __main__.py             # CLI entry point: python -m trainer
 │   ├── training.py             # Trainer class (fit / staged_fit)
@@ -92,9 +102,12 @@ Not to be confused with `bottleneck_ratio`, which is the channel squeeze between
 │   ├── config_io.py            # field schema + comment-preserving YAML writer
 │   ├── server.py               # stdlib HTTP/JSON API, training / evaluation / deploy job runners
 │   ├── pi.py                   # Deploy tab: step builder, log reader, latency + duty traces
+│   ├── lookahead.py            # Lookahead tab: the ladder, measured per rung, joined to runs
+│   ├── rfsweep.py              # Receptive field tab: one training run per rung of the ladder
 │   └── static/index.html       # the page
 ├── deploy/
 │   ├── preflight.py            # the state of the machine a timing run is taken on, judged
+│   ├── bench_incremental.py    # per-sample cost and cache size: incremental vs windowed
 │   ├── export_onnx.py          # checkpoint → verified ONNX (+ sidecar JSON) for Raspberry Pi 5
 │   ├── run_on_pi.sh            # one command: copy to the Pi over SSH, set up, benchmark, score
 │   ├── raspi_infer.py          # numpy + onnxruntime inference (epoch + causal streaming), --testdata scoring, per-hop latency monitor
@@ -240,9 +253,10 @@ Failures show an alert pointing at `~/Library/Logs/eeg-training-gui.log`.
 The bundle is git-ignored. Closing the window stops the server (and asks
 first if a training run is still going).
 
-The page has six tabs: **YAML** (the text a save would write), **Train**,
-**Evaluate**, **Deploy**, **Params** and **Runs**. The Evaluate and Deploy tabs
-borrow the Runs table as a run picker, so all three share one renderer.
+The page has eight tabs: **YAML** (the text a save would write), **Train**,
+**Evaluate**, **Deploy**, **Lookahead**, **Receptive field**, **Params** and
+**Runs**. The Evaluate and Deploy tabs borrow the Runs table as a run picker,
+so all three share one renderer.
 
 - **Form ↔ YAML.** Every key of `trainer/__main__.py` is a field, grouped as in
   the preset files (Model, Data, Training, Scheduler, Staged, Loss, Output,
@@ -266,7 +280,7 @@ borrow the Runs table as a run picker, so all three share one renderer.
   the bulk of the run — epoch 1 is often several times worse than the rest and
   would otherwise flatten everything; the caption says when early epochs run
   off the top.
-- **Runs** has five views. *Complete by kind* groups finished runs by
+- **Runs** has six views. *Complete by kind* groups finished runs by
   `variant × artifact` (the thing an ablation row compares), best RRMSE_t first,
   with the depth, KV rank and parameter count read from the checkpoint itself.
   *Complete by loss* groups them by `loss_fn × artifact` instead, ranked by
@@ -317,10 +331,57 @@ borrow the Runs table as a run picker, so all three share one renderer.
     metrics in that row describe weights that no longer exist, so the row is
     not comparable with anything.
 
+  **How far ahead a run reads** is a badge on every row, because it decides
+  what the run can be used for and nothing else on the row says it:
+  - no badge — causal. The deployable case.
+  - `bi` (solid) — non-causal with no bounded horizon: its attention or its
+    pooling reads the whole 512-sample epoch. A teacher.
+  - `la{N}` `+{t} ms` (dashed) — a bounded-lookahead rung: it may read N
+    samples past the one it emits, which is N/256 s of output delay. Not
+    causal either, but the horizon is finite and stated, and the badge gives
+    the latency it costs.
+
+  The dashed/solid pair is the same distinction the loss badges draw: dashed
+  is the qualified answer. Keeping the two apart is not cosmetic. A rung and a
+  teacher both record `causal: false`, so reading that flag alone — which this
+  tab did until the ladder existed — badges every rung as a non-deployable
+  teacher, and `runs/tcn_se_la32_both` would claim to be something it is not.
+  The Deploy tab refuses both, and now says which refusal it is: a teacher
+  needs the whole epoch, a rung needs an output delay that no path here
+  implements yet.
+
   **curve** on any finished run plots its saved history in the same chart, and
   “Use as teacher” fills `teacher_ckpt` for a distillation run.
 
-The server binds to 127.0.0.1 only and runs one training job at a time.
+#### Several runs at once
+
+The Train tab holds more than one run. Each gets its own log, its own live
+curve and its own read offset, and a row of pills above the chart switches
+between them — a dot per run, green when it finished, red on a non-zero exit,
+pulsing while it is going. One run shows no pills: there is nothing to choose.
+
+This is not a convenience feature bolted on. The ordinary task in this project
+is *n* runs that differ in one flag — three seeds of one config, or one run per
+rung of the lookahead ladder — and the server used to refuse the second with a
+409, which made that a sequence of sittings with a person waiting between them.
+
+What it does not do is make them free. They share one machine, and on MPS one
+accelerator, so concurrent runs contend: **the per-epoch wall times in each log
+stop being comparable** with a run that had the box to itself, and three at
+once on a laptop finish later than three in a row. The metrics are unaffected —
+each run has its own seed, data, weights and output directory — which is why
+this is allowed at all, and the tab says so in a line above the chart whenever
+more than one is going rather than leaving it to be discovered. For anything
+where the *timing* is the measurement, use the Deploy tab, which holds the
+machine still on purpose.
+
+Four at once is the cap, so a mistake cannot spawn fifty; the fifth is refused
+with a 409 that names the limit. **Stop** means the run whose log you are
+reading, not "the training job". A finished run stays in the list so its log
+and curve can still be read, and the oldest are dropped once sixteen have
+accumulated. Runs still going are never dropped.
+
+The server binds to 127.0.0.1 only.
 Validation: `python -m unittest discover -s tests -p 'test_gui.py'`.
 
 #### Evaluate tab
@@ -331,10 +392,50 @@ curves, waveforms, attention heatmaps, the artifact-switch probe, and the
 multi-model comparisons — and the mode decides which controls are shown, so the
 switch options appear for a switch run and nothing else.
 
+
+  *Deploy runs* is the other half of what this project did. The five views
+  above list what was trained; this one lists what was **measured** — one row
+  per `(machine, model, hop)`, newest first, with the median hop time against
+  its deadline (`hop / 256 Hz`), the duty cycle, the deadline misses, and the
+  environment verdict the trace recorded. A single deploy run can write three
+  traces — the per-hop latency, the duty-cycle sweep beside it and the
+  real-time replay — and they are gathered into one row, because they are one
+  run's output rather than three runs.
+
+  The **state** column is the point: a latency figure is a statement about a
+  model *and* about the machine it ran on, so a row says which of the two was
+  held still. `locked` means every control held; a trace from before the
+  environment was recorded reads `unknown`, which is deliberately not the same
+  as `unlocked`. Runs on this machine are labelled *this machine* rather than
+  hidden — macOS exposes neither a governor nor an affinity API, so a host run
+  is a convenience and the board's run is the measurement. **Open** sends the
+  row's primary trace to the Deploy tab's viewer.
+
+  The row also carries what the model **scored** on its test set —
+  **RRMSE_t**, **RRMSE_f** and **CC**, epoch mode — because a latency without
+  an accuracy beside it says nothing about whether the speed was worth having.
+  Hovering a value gives the streaming figure (a pessimistic bound: the probe
+  concatenates independent epochs, so every window straddles two unrelated
+  signals), the test set it was scored on, and where the number came from.
+
+  Those scores used to be printed and dropped: `evaluate_testdata` computed
+  them, returned them, and `main` ignored the return, so the trace saved the
+  milliseconds and lost the thing they were spent on. The trace now records
+  them beside the timings. Measurements taken before that are **recovered
+  from the job log that produced them**, which also names the traces it wrote
+  — that is the join — and are shown with a dashed underline, the same
+  solid/dashed distinction the loss badges draw. A row whose numbers are in
+  neither place shows `—` rather than a guess.
+
+  On the Pi at hop 32 the table reads both costs straight off: the TCN
+  baseline at 3.2 ms against a 125 ms deadline for RRMSE_t 0.713, the MLA
+  sandwich at 15.0 ms for 0.705 — roughly 5x the compute for a 1% difference,
+  on one seed.
 - **The run is picked from the Runs table, not a dropdown.** Clicking the
   *run* field opens the Runs tab's own table in a dialog — the same groupings
   (by kind, loss, optimizer, time, or all), the same params, seed, epochs, val
-  loss, RRMSE_t / RRMSE_f / CC and the same `bi` / `stale` / `partial` badges —
+  loss, RRMSE_t / RRMSE_f / CC and the same `bi` / `la{N}` / `stale` /
+  `partial` badges —
   and clicking a row picks it. Both are rendered by one function, so the picker
   cannot drift from the tab. The two actions that would navigate away mid-choice
   (`curve`, "Use as teacher") are dropped in the picker.
@@ -345,8 +446,11 @@ switch options appear for a switch run and nothing else.
   nothing said so. The field now reads "Choose a run…" and the command preview
   says `mode 'X' needs a run` until one is picked. The choice is remembered
   between sessions.
-- **Two jobs, not one.** Training and evaluation are separate; starting an
-  evaluation neither blocks a running training job nor clobbers its log.
+- **Separate jobs, not one.** Training, evaluation and deployment are
+  independent; starting an evaluation neither blocks a training run nor
+  clobbers its log. Training is the one that can have several going at once
+  (see [Several runs at once](#several-runs-at-once)); evaluation and
+  deployment stay one at a time.
 - **The command is the preview.** The grey line under the form is not built in
   the page — it is the exact argv the server would run, fetched on every
   keystroke. So is every refusal: pick one run for a comparison mode, or a run
@@ -467,6 +571,403 @@ real run (and against what `LatencyMonitor.print_summary` prints, so the parser
 cannot drift from the printer), the trace files and their sandbox, the
 step sequence (order, a failing step, a stop between steps), the routes and the
 page's own tables.
+
+#### Lookahead tab
+
+The causality cost, priced by the millisecond instead of quoted as a single
+number.
+
+This project has measured that cost exactly twice: `tcn_se` at RRMSE_t
+0.7104 ± 0.0020 (3 seeds) and its unbounded twin `tcn_se_bi` at
+0.5950 ± 0.0020. The 0.1154 between them is real, and as a design input it is
+useless — it prices *all* the future against *none* of it, and no online
+system is offered that choice. It is offered a latency budget. So the tab
+turns the two points into a curve, on the axis the budget is denominated in:
+
+```
+L samples of lookahead  =  L / fs of output latency  =  3.9 ms per sample at 256 Hz
+```
+
+A rung is `tcn_se_la{N}` — the same model, licensed to read N samples past the
+one it emits. The ladder is 1, 2, 4, 8, 16, 32, 62, 124, 186 samples (3.9 ms
+to 727 ms), anchored by `tcn_se` at 0 and `tcn_se_bi` at unbounded. 62 is
+worth naming: it is the forward reach of `tcn_bi`, so a model at 62 sees
+exactly as far ahead as this project's existing non-causal baseline while
+keeping a horizon that can be stated.
+
+**The x axis is available before any rung is trained.** The reach is a
+property of the graph, so the tab measures the whole ladder in under a second
+on freshly built models and says which rungs have a run behind them. The
+accuracy half is a 200-epoch run per rung; the tab builds and launches it
+through the ordinary training runner, from `configs/tcn_se_both.yaml` — the SE
+recipe the three seed repeats used — overriding only the variant, the seed and
+the output directory.
+
+**A rung is trained at every seed at once.** The seeds are tick boxes, not a
+one-of-three menu, because a rung trained once is a point whose spread is
+unknown — the chart draws it hollow to say so — and the useful unit of work on
+this ladder is therefore a rung at three seeds, not a rung. Asking for them
+one at a time made that three sittings with someone waiting between each,
+which is exactly what the Train tab stopped requiring when it learned to hold
+several runs. A seed that already has a run opens unticked and marked ✓, with
+the directory on hover, so adding the two that are missing is one click; it is
+unticked rather than disabled, because with **overwrite** — a box in the same
+row — redoing it is a legitimate thing to ask for. That flag is put only on
+the directories that have something in them: a blanket `--overwrite` would
+also switch off the trainer's guard for the seeds that did not need it, which
+is where a mistyped seed quietly lands on top of a finished run. The request
+is all-or-none: if a ticked seed is taken and overwrite is off, or there is
+not room under the four-run cap, nothing starts and the refusal names what is
+in the way — starting two of three and refusing the third would read as a
+failure of the two that ran.
+
+**Two numbers per rung, and they are not the same number.**
+
+| Column | What it is |
+|---|---|
+| `licensed` | What the graph may read. This is what sets the latency, whether or not the weights use it. Exact, and a property of the architecture |
+| `measured` | How far the weights actually reach, by perturbing one input sample and finding how far back the output moves — the probe that measures 62 on `tcn_bi`, the number the switch probe independently recovers as 242 ms |
+
+For the convolution stack they agree exactly: nothing on that path can zero a
+dependence, since PReLU has a slope either side and BatchNorm is affine in
+eval mode. For the SE gates they do not. The gate is
+`sigmoid(W2 @ relu(W1 @ s))`, and **ReLU can be exactly dead** — where
+`W1 @ s` is negative the gate stops depending on `s` at all, so a gate
+licensed to peek L ahead contributes nothing there. A fresh 186-sample model
+measures about 150. Neither number is the honest one on its own: you pay for
+`licensed` in latency, and `measured` tells you how much of that licence the
+weights bother to use, which is a result in itself.
+
+A budget is spent across the stack proportionally to what each site can take
+(two convolutions and one SE gate per block), so the sites' reaches add up to
+the budget exactly. Capacity is 186 samples — 124 in the convolutions, 62 in
+the gates — and a request above it is clamped, and says so.
+
+**Capacity is not a target.** Spending all 124 convolution taps forward means
+spending none backward: `pad_left + pad_right` is fixed per layer, so the
+budget slides the window rather than widening it, and the full budget leaves
+the model with no past at all. The `past` column in the tab is that number —
+the taps still behind *t* — and a rung that reaches 0 is marked ✕ and left
+off the price curve. See *What a millisecond is worth* below for what it does
+to the measured curve.
+
+**What the rung number is a number of.** `tcn_se_la186` reads as 186 of
+something, and the obvious something — the convolution window — is 124 taps,
+so the name invites an arithmetic that does not work out. The denominator is
+the *licence*: 124 taps the convolutions can move plus 62 the SE gates can
+peek, which the gates have and the window does not. Against that the ladder's
+top three rungs are exactly the thirds — 62, 124 and 186 are 1/3, 2/3 and all
+of it — which is why they are the rungs. The tab prints the share beside the
+name in both places it is read: the rung picker
+(`124 — tcn_se_la124 · 2/3 ahead`) and the rung column
+(`tcn_se_la124  2/3`), with the window itself in its own column (`41 / 83`,
+behind and ahead, always summing to 124). The top rung is written `1/1`
+rather than "all" so that it reads as the last of the thirds. `tcn_se_bi` is
+marked **centred** beside "unbounded" for the same reason: unbounded is its
+SE gate, while its convolutions see 62 either side — the same 125-sample
+window as every rung, in the middle.
+
+The names themselves are left alone, for two reasons: the number *is* the
+output latency in samples, which is the contract a deployment carries and the
+axis the ladder is priced on; and 27 run directories and the architecture
+recorded inside each of them already name the variant. A share would read
+better and say less.
+
+**A rung's name states its budget**, the way `tcn_mla_r{N}` states its rank:
+there is no `--lookahead` flag, because a run called anything else could hold
+any budget at all. An off-ladder budget is measurable in the tab (nothing is
+saved, so no name can misdescribe it) and refused for training until it is
+added to `LOOKAHEAD_LADDER` in `models/lookahead.py`.
+
+#### What a millisecond is worth
+
+Three seeds (42, 54, 67) per rung, 200 epochs, `configs/tcn_se_both.yaml`,
+everything but `master_seed` identical. Δ is paired within each seed — the
+seed fixes the split, so pairing removes split variance and leaves the thing
+being measured:
+
+The `window` column is the convolution stack's taps behind and ahead of the
+sample it emits. It is in the table because the two numbers always sum to 124
+— and that is the whole story of the top rung:
+
+| rung | latency | window (back/ahead) | seeds | RRMSE_t | CC | Δ from causal, paired | of the gap |
+|---|---|---|---|---|---|---|---|
+| `tcn_se` | 0 ms | 124 / 0 | 3 | 0.7104 ± 0.0020 | 0.7074 ± 0.0029 | — | — |
+| `tcn_se_la1` | 3.9 ms | 123 / 1 | 3 | 0.6885 ± 0.0017 | 0.7293 ± 0.0026 | 0.0219 ± 0.0003 | **19%** |
+| `tcn_se_la2` | 7.8 ms | 122 / 2 | 3 | 0.6806 ± 0.0018 | 0.7364 ± 0.0026 | 0.0298 ± 0.0002 | 26% |
+| `tcn_se_la4` | 15.6 ms | 121 / 3 | 3 | 0.6763 ± 0.0016 | 0.7401 ± 0.0023 | 0.0341 ± 0.0004 | 30% |
+| `tcn_se_la8` | 31.2 ms | 118 / 6 | 3 | 0.6552 ± 0.0017 | 0.7572 ± 0.0024 | 0.0552 ± 0.0004 | 48% |
+| `tcn_se_la16` | 62.5 ms | 113 / 11 | 3 | 0.6268 ± 0.0006 | 0.7796 ± 0.0009 | 0.0836 ± 0.0016 | **72%** |
+| `tcn_se_la32` | 125 ms | 102 / 22 | 3 | 0.6131 ± 0.0016 | 0.7897 ± 0.0012 | 0.0973 ± 0.0026 | 84% |
+| `tcn_se_la62` | 242 ms | 82 / 42 | 3 | 0.6046 ± 0.0012 | 0.7952 ± 0.0010 | 0.1058 ± 0.0015 | 92% |
+| `tcn_se_la124` | 484 ms | 41 / 83 | 3 | 0.6025 ± 0.0015 | 0.7964 ± 0.0008 | 0.1079 ± 0.0025 | **94%** |
+| `tcn_se_la186` | 727 ms | **0 / 124** | 3 | 0.6673 ± 0.0015 | 0.7418 ± 0.0015 | 0.0431 ± 0.0005 | 37% |
+| `tcn_se_bi` | unbounded | 62 / 62 | 3 | 0.5950 ± 0.0020 | 0.7996 ± 0.0012 | 0.1154 ± 0.0028 | 100% |
+
+**One sample of lookahead — a single sample period, 3.9 ms — recovers a fifth
+of the causality cost.** The step is 0.0219 against a paired spread of 0.0003,
+and it is in the same direction on 3 seeds of 3. Sixteen samples recover
+nearly three quarters, and 124 samples recover 94%.
+
+**Then it turns around.** The top rung, at 727 ms of latency, recovers 37% —
+worse than 16 samples at 62 ms. That is not noise (±0.0005 paired, three
+seeds of three) and not a broken run. A convolution of kernel *k* and dilation
+*d* has `(k-1)·d` taps to place and puts each one on one side of *t* or the
+other: `pad_left + pad_right` is fixed. **Lookahead does not widen the window,
+it slides it.** Every tap handed to the future is taken from the past, and at
+the full budget every `pad_left` is 0 — `tcn_se_la186` has no past at all. It
+is the causal baseline's *mirror*, not a better-informed version of it, and
+the table shows the two scoring alike (0.7104 one-sided backwards, 0.6673
+one-sided forwards; the mirror does slightly better because the SE gate's
+running mean still integrates the past, so it keeps the past's statistics
+without any of its detail).
+
+**What that rung is, exactly.** A causal layer computes
+`w0·x[t-2d] + w1·x[t-d] + w2·x[t]`; move all the padding to the right and it
+computes `w0·x[t] + w1·x[t+d] + w2·x[t+2d]`. That is the same filter applied to
+the *reversed* signal with its kernel read backwards — and the kernel is
+learned, so reading it backwards costs nothing. The tests check the identity
+to float precision: an anti-causal TCN **is** this model class run on the
+recording backwards. Not a degenerate model, just one that needs the whole
+future, which rules out online use for the obvious reason rather than a
+subtle one. (With SE it holds only approximately: the gate's squeeze is a
+running mean from sample 0, so it keeps accumulating forwards however the
+convolutions are padded. That is the one part that does not reverse, and it
+is why the mirror rung is not simply the baseline's score reflected — it has
+the past's statistics and the future's detail at once.)
+
+So its score is a measurement about the **signal**, not about the model: it
+asks whether this denoising problem is easier backwards than forwards. The
+answer is that it is, by 0.0431 ± 0.0005 paired — small beside the 0.1154
+gap, and far outside the seed spread. Whether that is the SE asymmetry above
+or a genuine time-asymmetry in EOG/EMG envelopes (sharp onset, slow decay)
+is separable by one experiment: a plain `tcn` at lookahead 124 has no SE, so
+it is an *exact* time-reverse, and if it still beats causal `tcn` the
+asymmetry is in the data. That variant is not registered yet.
+
+Read down the `window` column and the result is simpler than the latency
+axis suggests: **error tracks how far the window sits from centred.** The
+ceiling makes the point — `tcn_se_bi` is called unbounded because its SE gate
+pools globally, but its convolutions see 62 either side, the same 125 samples
+as every rung, centred. It is the best model here because it is the balanced
+one. So what the ladder prices is not "how much future" but "how much of the
+window may sit ahead of now", and the answer is: up to about half, after which
+you are paying latency to throw information away.
+
+Put the three one-sided and two-sided results side by side and the headline
+changes: 124 taps of past scores 0.7104, 124 taps of future scores 0.6673, and
+**62 of each scores 0.5950**. Half as much context on each side beats twice as
+much on one. What lookahead buys is not quantity, it is *bracketing* — and for
+artifact removal that is what one would expect, since a sample in the middle
+of a blink is resolved by seeing both of its edges, not by seeing further in
+one direction. "One sample of lookahead recovers a fifth of the causality
+cost" is better read as one sample of bracketing. The tab marks
+`tcn_se_la186` ✕ and leaves it off the price curve for that reason — it is a
+real measurement and a useless purchase.
+
+The rungs are compared **paired within each seed** and against a baseline that
+is the same model trained the same way. Both matter, and the second is not
+pedantry — it has gone wrong twice:
+
+* the first version of this table built its baseline path from the naming
+  convention (`tcn_se_both` + `_s67`) and picked up `runs/tcn_se_both_s67`,
+  which is the 48-channel run, not the 64-channel one;
+* later `runs/tcn_se_both_kd_s67` — a *distilled* student, its own row in the
+  ablation table — landed on the causal rung and was counted as a seed repeat,
+  moving the anchor from 0.7104 to 0.7118 and widening its spread from 0.0020
+  to 0.0033. Since every Δ in the table is measured from that anchor, the
+  whole column was priced against a point that was part KD.
+
+`gui/lookahead.py:why_excluded` now answers this once, for both this tab and
+the receptive-field sweep, and names what it left out rather than dropping it:
+another width, a distilled run, or another loss. The analysis has to apply the
+same rule.
+
+This is what the two-point framing hid. "Non-causal is 0.116 better" is true
+and prices nothing a real system can buy; 19% for one sample period is a
+design input.
+
+Caveats that belong next to those numbers: one artifact mix (`BOTH`), one
+width, one loss, and three seeds of a model whose seed drives the split, the
+SNR pairing, the init and the batch order together — so the spread quoted is
+total run-to-run variance, not an isolated effect. Every rung is trained at
+all three seeds, so the curve is nine points and the ceiling.
+
+**Trained models use the licence they are given.** Measured on the
+checkpoints rather than on a fresh init: `tcn_se_la1` reaches exactly 1 sample
+on all three seeds, and `tcn_se_la16` reaches 15, 16 and 15 of its 16 — 94% to
+100%, against 88% for an untrained model of the same shape. Training moves the
+SE gates out of the dead-ReLU zone described above, so the shortfall the tab
+shows on fresh models is a property of initialisation, not a ceiling on what
+the architecture can exercise.
+
+**What this cannot do yet.** A rung is not causal, and every tool here reads
+that correctly and refuses it: the ONNX exporter will not export one, and
+`models/incremental.py` and `models/step_graph.py` will not stream one. That
+is right as far as it goes — but a bounded-lookahead model *is* deployable,
+by delaying the output L samples, and no path in this repo implements that
+contract. So the ladder currently prices latency it cannot yet spend on the
+board. The arithmetic is on the Deploy tab's axis deliberately, so the two
+can be put together when it does.
+
+Averages are per rung **and per width**: a run joins a rung's mean only if its
+`hidden_channels` matches the width the rung was measured at, and excluded
+runs are counted in the row rather than dropped. That rule is not theoretical
+— `runs/tcn_se_both_s67` holds a 48-channel run beside two 64-channel ones,
+and averaging the three made a "three-seed error bar" out of two seeds and a
+width experiment.
+
+Validation: `python -m unittest discover -s tests -p 'test_lookahead.py'`
+covers the allocation, the two endpoints being bit-identical to the models
+that already exist, licensed-vs-measured on every rung, the dead-ReLU
+shortfall, the streaming refusals, and the tab's width filtering.
+
+#### Receptive field tab
+
+The mirror of the Lookahead tab, and the cheaper question. Lookahead asks what
+*future* context is worth and charges latency for it. This asks how much of
+the **past** the model actually needs — which costs no latency at all, only
+parameters.
+
+It exists because the study cannot currently separate two claims. The
+attention variants are justified by long-range context: a 512-sample window
+mixed globally, against a TCN that reaches back 125 samples (488 ms at
+256 Hz). On this project's own Pi measurements that costs roughly 5x the
+baseline's compute for about 1% of CC — inside the spread of a single seed.
+But "attention helps" and "more context helps" are different claims, and every
+run in the project was trained at the same reach, so nothing on disk tells
+them apart. A dilated stack can be made to reach as far as the window for a
+few thousand parameters and no attention at all:
+
+```
+[1]                      →    5 samples      20 ms
+[1, 2]                   →   13              51 ms
+[1, 2, 4]                →   29             113 ms
+[1, 2, 4, 8]             →   61             238 ms
+[1, 2, 4, 8, 16]         →  125             488 ms   ← the project default
+[1, 2, 4, 8, 16, 32]     →  253             988 ms
+[1, 2, 4, 8, 16, 32, 64] →  509            1988 ms   ≈ the whole 512 window
+```
+
+So if error keeps falling as the field grows, the benefit was context and the
+cheap way to buy it is another dilation level; if it flattens at 125, the
+model already had all the context it could use, and whatever attention
+contributes is not reach. Either answer is worth having and neither is
+available from the runs that exist.
+
+**The x axis is exact before anything is trained**, as on the Lookahead tab,
+and for the same reason: reach is a property of the graph. It is computed two
+ways and the tests assert they agree at every rung —
+`1 + Σ 2(k-1)d` over the schedule, and a perturbation probe that moves one
+input sample and finds how far the output moves with it.
+
+The probe runs in float64, which is not fussiness. The path that reaches
+furthest is a single chain of kernel edges, attenuated once per block, so at
+the far end of a 253-sample field the output moves by about 6e-9 while the
+output itself is of order 0.1 — below the float32 spacing at that magnitude
+(3e-8). In float32 the difference rounds to exactly zero and the probe reports
+**252**, at some initialisations and not others. Nothing is dead there: PReLU
+keeps a slope of 0.25 on its negative side, so no unit can zero the
+dependence — the same reason `licensed` and `measured` agree on the
+convolution stack in the Lookahead tab. It is pure rounding, and in float64
+that tail sits eight orders above the floor.
+
+**A rung's name states its reach**: `tcn_rf{N}` and `tcn_se_rf{N}`, with N the
+field in samples, so `tcn_rf509` is the baseline given attention's span
+without the attention. The tab launches one ordinary training run per rung,
+shortest first, through the same runner the Train tab uses, from the family's
+own recipe — `configs/tcn_both.yaml` or `configs/tcn_se_both.yaml` — with four
+things overridden: the variant, the artifact, the seed and the output
+directory.
+
+Training from a config rather than from the trainer's own fallbacks is not
+decoration. The fallbacks are `l1_combined` at lr 5e-3 for 150 epochs; every
+baseline on disk is `mse` at 5e-4 for 200. A rung launched with no config
+would differ from the 125-sample point it is plotted against in the loss, the
+learning rate and the length at once, and all three would show up as nothing
+but a worse number on the reach axis. `configs/tcn_both.yaml` was written for
+this and records what `runs/tcn_both` was actually trained with, read back out
+of its `history.json` — it is `tcn_se_both.yaml` with the gate taken off, and
+the tests compare the two files key by key to keep it that way.
+
+**A point is placed by what the run recorded, not by what it is called.** The
+dilation schedule now goes into `history.json` with the rest of the
+architecture (`### What shape a run actually trained`, below), and the curve
+reads it from there — a directory named `tcn_rf253` whose weights say
+otherwise is plotted where its weights say. Runs that predate the sweep
+recorded no schedule, and they are placed at 125 anyway, because the dilations
+were a constant until this tab made them an argument: that is what puts the
+existing `tcn` and `tcn_se` results on the curve instead of making the sweep
+re-measure a point it already has.
+
+**A rung is a point, not a run.** Several runs can sit on one reach — the 125
+rung arrives with every `tcn` or `tcn_se` run the project has ever done — so
+the table and the curve show the mean over seeds with ±1 sd whiskers, and a
+run joins that average only if it is the same model trained the same way.
+Three things on disk already break that, and each is excluded *and named* —
+the rung's `runs` cell says how many were left out and names them on hover,
+because a run that exists and is excluded is something to show, not to lose.
+The rule is `gui/lookahead.py:why_excluded`, shared with the Lookahead tab so
+one run cannot be judged two ways:
+
+| Excluded | Why | Example |
+|---|---|---|
+| another width | an error bar over widths is not an error bar over seeds | `runs/tcn_se_both_s67` is 48 channels beside its 64-channel companions |
+| a distilled run | a bidirectional teacher is a different training signal, and its own row in the ablation table | `runs/tcn_se_both_kd_s67` |
+| another loss | the val losses are not on one scale | anything trained `l1_combined` |
+
+A stale or interrupted run is in neither column: its metrics describe weights
+that are gone.
+
+**Parameters are not held constant, and the table says so.** A rung adds one
+residual block — 26,058 parameters at width 64, the same step at every rung —
+so reach and depth move
+together, and a difference between two rungs is "one more dilation level",
+not "more context" in isolation. That is the honest reading of this ladder;
+holding parameters fixed would mean widening the kernel instead, which buys
+reach far more expensively and changes what each layer computes.
+
+Validation: `python -m unittest discover -s tests -p 'test_receptive_field.py'`
+covers the architectural sum against the probe at every rung, the streaming
+wrapper's independent count, each variant reaching what its name claims, the
+one-block cost per rung, the plan the tab builds (including that each command
+carries its family's recipe and that the two recipes differ only in the gate),
+and every placement and exclusion rule above.
+
+### What shape a run actually trained
+
+`history.json` records the architecture of the model that was trained, read
+off the model itself rather than off the config meant to build it:
+
+```json
+"config": {
+  "loss_fn": "l1_combined", "master_seed": 42,
+  "n_params": 166605,
+  "arch": {"variant": "tcn_mla", "hidden_channels": 64, "n_attn_layers": 2,
+           "n_heads": 4, "kv_lora_rank": 16, "bottleneck_ratio": 0.5,
+           "causal": true, "causal_tcn": true, ...}
+}
+```
+
+This exists because the project was bitten by its absence. Every trained MLA
+checkpoint here has **4 attention layers and 2 heads**; every MHA checkpoint
+has **2 layers and 4 heads**; both YAML presets say 2 and 4. So the headline
+MHA-vs-MLA comparison differs in depth, head count and parameter count
+(167,533 against 191,085 — MLA is the *larger* model, not the smaller one),
+and the README's "isolates exactly one variable at a time" does not hold for
+it. Nothing recorded either number: the trainer filtered the architecture keys
+out of its history, and a checkpoint's `model_config` stores only what was
+explicitly passed, so a run that took a default recorded nothing at all.
+
+`resolved_arch()` resolves the constructor's signature against what was
+passed, so the record is complete and does not depend on the defaults staying
+put. A rank alias's pinned value wins, and `causal` / `causal_tcn` are
+included — a `*_bi` teacher and its causal student share a state dict, so the
+weights cannot tell them apart and only the record can.
+
+Runs trained before this carry no `arch`. The Runs tab falls back to the
+checkpoint's `model_config` for those, and leaves the columns blank where
+neither knows.
 
 ### Which loss a run used
 
@@ -1144,6 +1645,54 @@ To cut a different subset (other artifact, more epochs) on the host:
 python -m deploy.make_testdata --data_dir data/EEGdenoisenet/data --artifact EMG --n 200
 ```
 
+#### A test set belongs to the split it was cut from
+
+"Test set" is not a property of a file on its own. `EEGDenoiseDataset`
+permutes the epoch pool with `master_seed` and *then* slices train/val/test
+out of that permutation, so the two seeds in this project do not agree about
+which epochs are which: **69% of the seed-42 test epochs sit inside the
+seed-67 training split** (465 of 678). Scoring a seed-67 model against
+`EOG_test100.npz` does not crash, warn, or look odd — it returns a better
+number than the model earns, which is the worst way for a measurement to be
+wrong.
+
+So the pairing is checked, in three places:
+
+| Where | What it does |
+|---|---|
+| Deploy tab | shows the mismatch and disables **Run** before a Pi run is started |
+| `/api/pi/*` | refuses the job — the page can be stale, and the API is reachable on its own |
+| `raspi_infer.py --testdata` | refuses again on the board, which is where the number is actually produced |
+
+The check reads provenance **stamped into the `.npz`** (`master_seed`,
+`artifact`, `split`, `split_ratios`) rather than parsing the filename, because
+a name is a convention and renaming a file changes what it claims without
+changing what it holds. Sets written before this carry none, and are scored
+with a warning that says the split could not be verified; re-cut them to stamp
+it in. The model's side comes from the checkpoint's `run_config`, recorded in
+the export sidecar as `provenance.trained_master_seed`.
+
+A seed mismatch is refused; a cross-artifact pair (an EOG model on EMG epochs)
+only warns, because that is a legitimate generalisation probe. To score a
+mismatched pair deliberately, pass `--allow-split-mismatch` — the result is
+then not a test score, and the flag says so.
+
+```bash
+# the matching set for a model trained at seed 67
+python -m deploy.make_testdata --artifact BOTH --master_seed 67
+```
+
+Or let the Deploy tab do it. The **test set** control is a picker in the same
+shape as the model one, and it labels every set against the model currently
+chosen — `matches`, `wrong split`, or `unverified` — with the matching ones
+sorted to the top. Its last entry is the generator: *Cut BOTH test set for
+tcn_both (seed 67)*, which reads the artifact and seed off the model and runs
+`make_testdata` with them (~40 ms), then selects the result. An existing
+matching file is reused rather than rewritten, so a set that recorded
+measurements refer to is never churned. A run whose seed was never recorded is
+refused instead of cut at a guessed default — a set cut at the wrong seed
+would *look* matched, which is the failure this whole section is about.
+
 ### Per-hop latency monitor
 
 `--benchmark` times one window in a tight loop. `--latency` instead watches
@@ -1254,11 +1803,221 @@ one 512-sample forward faster than ~15 ms on this SoC.
   these tiny matmuls and slightly less accurate (CC 0.8754 vs 0.8772).
 - **No KV cache.** Each call recomputes attention over the whole window. With
   T = 512 and d_model = 32 this is negligible; the KV-cache size advantage of
-  MLA is therefore not exercised by this deployment path.
+  MLA is therefore not exercised by this deployment path. It is exercised by
+  [incremental inference](#incremental-inference-one-sample-at-a-time), which
+  holds a real cache and measures it.
 
 Validation: `python -m unittest discover -s tests -p 'test_export_onnx.py'`
 covers architecture inference (including legacy checkpoints and `tcn_mla_r{N}` labels), export, the per-hop latency monitor,
 agreement, causality, and the Pi-side epoch/streaming contract.
+
+## Incremental inference: one sample at a time
+
+`models/incremental.py` advances a model one sample at a time, keeping the
+state a causal model needs instead of recomputing a window: a ring buffer per
+dilated convolution, and an attention cache capped at the trained window.
+
+```bash
+# cache sizes and per-sample cost, on freshly built models
+python -m deploy.bench_incremental --variants tcn,tcn_mha,tcn_mla
+
+# a trained checkpoint, against the windowed path at two hop sizes
+python -m deploy.bench_incremental --ckpt runs/tcn_mla_eog/best.pt --hops 32,64
+```
+
+```python
+from models.incremental import IncrementalModel
+stream = IncrementalModel(model)      # causal + eval(); bidirectional is refused
+y = stream.run(signal)                # or stream.step(x_t) per sample
+stream.cache_report()                 # state bytes, split by kind
+```
+
+### What it was built to measure
+
+MLA was chosen for its KV cache, and until now no path in this repo held one —
+the ONNX export recomputes, and `gui/params.py` could only estimate. The
+streaming path holds the real thing, so the cache is read off live buffers:
+
+| Variant | Attention | Cache floats/step | Cache over 512 steps |
+|---|---|---|---|
+| `tcn` | none | 0 | 0 B |
+| `tcn_mha` | MHA (2 layers) | 128 | 262,144 B |
+| `tcn_mla` | MLA (2 layers, rank 8) | 16 | 32,768 B |
+| `tcn_mla_par` | MLA (2 layers, rank 16) | 32 | 65,536 B |
+
+MHA keeps K **and** V, so the ratio is `2 * d_model / kv_lora_rank`. Note that
+`d_model` is 32, not 64: the sandwich squeezes its 64 TCN channels by
+`bottleneck_ratio` 0.5 before attention. The constructor default
+`kv_lora_rank = d_model // 4` is therefore rank **8** and gives **8x**, while
+the rank 16 that every YAML preset sets gives **4x**. The docstrings used to
+describe `d_model // 4` as "4x", conflating the two; the arithmetic is now
+asserted in `tests/test_incremental.py`.
+
+### It is not faster in PyTorch, and the reason is worth knowing
+
+Per emitted sample the stream does about 16x less arithmetic than recomputing a
+512-wide window every 32 samples. It is nevertheless **2-3x slower** under
+PyTorch eager:
+
+| Path | ms/sample (`tcn_mla`, 1 thread) |
+|---|---|
+| incremental, per step | 0.360 |
+| windowed, hop 32 | 0.168 |
+| windowed, hop 64 | 0.084 |
+
+The cost is not arithmetic. Growing the attention window 16x — 64 to 1024 —
+moves the per-step time by 4.6% (0.364 to 0.381 ms), so the per-step cost is
+almost entirely fixed overhead. Counting operators says the same thing: one
+incremental step issues **1042** aten dispatches to emit one sample, while one
+512-wide forward issues 4987 to emit 512 (9.7 per sample). That is ~107x more
+dispatches per sample, at ~0.46 us each.
+
+So the windowed path in `deploy/raspi_infer.py` is not a workaround — at
+`d_model = 32` it is the right choice for a Python runtime, because it
+amortises dispatch over 512 positions. Realising the incremental advantage
+needs a runtime where a dispatch is cheap: ONNX with cache inputs and outputs,
+or the hand-written numpy/C loop the Pi already runs. The arithmetic saving is
+real and the cache saving is real; **PyTorch eager is simply the wrong place to
+collect either.**
+
+### Running it from the Deploy tab
+
+Tick **incremental inference** on the Deploy tab (this machine only) and it
+runs the trained checkpoint one sample at a time, writing
+`deploy/artifacts/pi_latency/incremental_<model>_hop1.json` — which the Runs
+tab then lists beside the windowed measurement of the same model.
+
+Hop 1 is the literal truth: the streaming path advances one sample, so its
+deadline is one sample period (3.9 ms at 256 Hz) rather than a hop of them.
+That is also what makes the two comparable — expressed as a duty cycle,
+compute over wall time, a windowed run at hop 32 and an incremental run at
+hop 1 are the same quantity:
+
+| | median | deadline | duty |
+|---|---|---|---|
+| `tcn_mla_eog` incremental | 0.51 ms/sample | 3.91 ms | **13.1 %** |
+| `tcn_mla_eog` windowed, hop 32 | 2.82 ms/hop | 125 ms | **2.3 %** |
+
+The option is **disabled for the Pi target**, with the reason on hover: this
+is the PyTorch path and `run_on_pi.sh` copies onnxruntime and numpy only, so
+there is no torch on the board to run it with. A split mismatch does not
+block it either — it scores nothing, so it reads no test set, and the banner
+says so rather than refusing.
+
+### On the Pi: the step graph
+
+`models/incremental.py` is PyTorch and the board has none, so the streaming
+path could be measured on the host and nowhere else. `models/step_graph.py`
+is the same computation written as a graph that takes its state in and hands
+it back:
+
+    (x_t, state...) -> (y_t, new_state...)
+
+```bash
+python -m deploy.export_onnx --ckpt runs/tcn_both/best.pt --name tcn_both --incremental
+python deploy/raspi_infer.py tcn_both_step.onnx --incremental --testdata BOTH_test100_s67.npz
+INCREMENTAL=1 deploy/run_on_pi.sh pi@raspberrypi.local tcn_both
+```
+
+The Deploy tab's **incremental inference** box now works for the Pi too; it
+asks for the step graph and says how to export one if it is missing.
+
+The ring buffers become shift-and-append — a ring needs an index that changes
+per call, which a static graph cannot carry, while a shift is pure tensor
+algebra. And because a graph cannot slice its cache to the part it has
+written, a **validity mask** rides along as state, so the first `window`
+outputs are exactly the ring-buffer path's rather than an average over
+zeroed slots.
+
+**Measured on the board**, Raspberry Pi 5, 2 threads pinned to CPU 2-3,
+51,200 samples each:
+
+| model | path | ms/sample | duty | misses | KV cache | state | RRMSE_t / CC |
+|---|---|---|---|---|---|---|---|
+| `tcn_both` | incremental, hop 1 | **0.240** | 6.1 % | 0 | — | 31 kB | 0.7125 / 0.7031 |
+| `tcn_both` | windowed, hop 8 | 0.403 | 10.3 % | 0 | — | 0 | 0.7125 / 0.7031 |
+| `tcn_both` | windowed, hop 32 | 0.101 | 2.6 % | 0 | — | 0 | 0.7125 / 0.7031 |
+| `tcn_mla_both` | incremental, hop 1 | **0.760** | 19.6 % | 0 | **64 floats/step** | 192 kB | 0.7028 / 0.7139 |
+| `tcn_mla_both` | windowed, hop 32 | 0.547 | 14.0 % | 0 | none | 0 | 0.7028 / 0.7139 |
+
+Identical scores from each model's two paths, which is the point: the step
+graph is the same function, not an approximation of it. For the baseline,
+0.228 ms of the 0.240 is onnxruntime and 0.012 the normalise/rescale around
+it; p95 0.253 ms, 15.4x inside the deadline, zero misses. The MLA row is the
+first measurement in this project where **the KV cache exists on the
+hardware** — 131 kB of it, allocated by onnxruntime on the board, next to
+64 kB of convolution state that no attention mechanism shrinks.
+
+It buys **latency, not throughput**. A windowed call amortises over the whole
+hop, so at hop 32 — 125 ms of buffering — it is still the cheaper path per
+sample. The step graph wins as the hop shrinks: it already beats hop 8, and
+at a hop of one sample the windowed path would need 3.23 ms per output (one
+whole window recomputed to emit one sample, 83 % duty) against the step
+graph's 0.240. That is the case for it — a BCI loop that cannot afford 125 ms
+of buffering has no other option — and on an attention model the KV cache is
+finally a tensor onnxruntime allocates on the board rather than an estimate
+made on a laptop.
+
+Host figures for comparison, same models: 0.061 ms/sample (`tcn_both`) and
+0.180 ms (`tcn_mla_both_s67`, 181 kB of state).
+
+Nothing here is trusted because it exported cleanly. The export verifies the
+graph against `models/incremental.py` — itself pinned to the batch model from
+both ends — over a run longer than the attention window, and refuses to write
+a sidecar if they disagree:
+
+```
+[verify] onnxruntime step loop vs models/incremental.py ...
+         max|onnx-incremental| = 2.38e-07 over 640 steps
+```
+
+### How to tell which path produced a trace
+
+Every trace now carries an `inference` block, for the same reason it carries
+an `environment` one: a latency figure is a statement about a model, a
+machine **and** a method, and the third was being left to the reader to infer
+from which files reach the board.
+
+```json
+"inference": {"mode": "windowed", "runtime": "onnxruntime", "window": 512,
+              "hop": 32, "kv_cache": false, "recompute_factor": 16.0}
+"inference": {"mode": "incremental", "runtime": "pytorch 2.12.0", "hop": 1,
+              "kv_cache": true, "kv_floats_per_step": 64,
+              "kv_cache_bytes": 131072, "recompute_factor": 1.0}
+```
+
+Traces written before this said nothing, and all of them were windowed; the
+Runs tab shows those as `windowed` without claiming the trace said so. Three
+checks work on any trace, old or new:
+
+- **the ONNX signature** — `io` is a whole window in and a whole window out,
+  with no cache tensors either side, so each call recomputes everything. This
+  is a property of the artifact, not of how it was invoked.
+- **the directory** — windowed traces are `pi_latency/{latency,host}_*`;
+  incremental ones are `pi_latency/incremental_*`.
+- **the hop** — a windowed trace is keyed by a hop of many samples; an
+  incremental one is hop 1.
+
+### Equivalence
+
+Against a single forward pass over the whole signal the stream is exact for
+every variant (~3e-7). Against the sliding-window path it is exact only for the
+baseline (~7e-8); the attention variants differ by ~1e-5 relative to signal RMS
+(up to ~3e-3 on a trained checkpoint), because attention at the window's last
+position attends over 512 cached positions whose oldest ~252 were, in the
+windowed path, computed by a TCN reading the window's left zero-padding. The
+stream has real history there instead.
+
+Neither is wrong: the windowed path reproduces the training-time computation
+(epochs are 512 samples with a padded left edge), while the stream gives the
+oldest cached positions their fully resolved features. The gap is bounded, does
+not grow with `t`, and is orders of magnitude below an RRMSE of ~0.65.
+
+Validation: `python -m unittest discover -s tests -p 'test_incremental.py'`
+covers equivalence from both ends, streaming causality (the same
+perturb-and-look-back probe as `test_variants.py`), MLA's two cache strategies
+against each other and against the batch model, the cache arithmetic, and the
+refusal of bidirectional and TurboQuant models.
 
 ## Reproducibility
 
@@ -1287,6 +2046,8 @@ The study isolates one variable at a time while sharing everything else:
 | Sandwich vs Parallel | Which topology prevents collapse? | Same components, different wiring |(not included in the paper yet, further experiment is expected)
 | KV rank sweep (r4/r8/r16/r32) | How much compression is viable? | Same architecture, only rank varies |
 | Causal vs bidirectional (`X` vs `X_bi`) | What does causality cost? | Same weights and shapes, only the attention mask differs |
+| Lookahead ladder (`tcn_se` → `tcn_se_la{N}` → `tcn_se_bi`) | What does *each millisecond* of that cost buy? | Same weights, recipe and seed; only how far ahead the model may read |
+| Receptive-field ladder (`tcn_rf5` … `tcn_rf509`) | Was the benefit attention, or just reach? | Same recipe and seed; only how far back the convolutions see (one dilation level per rung, so parameters move with it) |
 | `tcn_bi` vs `tcn_mla_bi` | Is the gain from seeing the future, or from attending to it? | Both non-causal; only one has attention |
 | `X_bi` vs `X_full_bi` | How much is attention alone worth against the full offline ceiling? | Same weights; only the convolution padding differs |
 | Student vs distilled student (`X` vs `X` + KD) | Can a non-causal teacher close that gap? | Same model, only the training signal differs |

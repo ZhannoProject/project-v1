@@ -158,6 +158,9 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(steps[0]["command"],
                          ["bash", "deploy/run_on_pi.sh", "pi@raspberrypi.local", "demo"])
         self.assertEqual(steps[0]["env"], {
+            # Empty unless the step graph was asked for: the Pi half reads it
+            # under `set -u`, so it is always sent, never omitted.
+            "INCREMENTAL": "",
             "REMOTE_DIR": "eeg", "TESTDATA": "demo.npz", "HOP": "32", "THREADS": "2",
             "LATENCY_EVERY": "400", "REALTIME_S": "30", "DUTY_HOPS": "64,8", "DUTY_S": "20",
             "CPUS": "0-1", "GOVERNOR": "performance", "REQUIRE_LOCKED": "1",
@@ -1306,7 +1309,8 @@ class PiRunnerScriptTests(unittest.TestCase):
                 'printf \'#!/bin/sh\\necho "[py] $*"\\n\' > "$HOME/$REMOTE_DIR/env/bin/python"\n'
                 'chmod +x "$HOME/$REMOTE_DIR/env/bin/python"\n'
                 ': > "$HOME/$REMOTE_DIR/requirements-raspi.txt"\n')
-        values = dict(REMOTE_DIR="eeg", MODEL="m", TESTDATA="t.npz", HOP="32", THREADS="2",
+        values = dict(REMOTE_DIR="eeg", MODEL="m", GRAPH="m", INCREMENTAL="",
+                      TESTDATA="t.npz", HOP="32", THREADS="2",
                       LATENCY_EVERY="400", LATENCY_STEM="lat", REALTIME_S="0",
                       DUTY_HOPS="", DUTY_S="20", CPUS="0-1", GOVERNOR="",
                       REQUIRE_LOCKED="", CHECK_ONLY="", SPIN="1")
@@ -1343,6 +1347,16 @@ class PiRunnerScriptTests(unittest.TestCase):
         sweep = run(DUTY_HOPS="64,8", REALTIME_S="5", SPIN="0")
         self.assertTrue(any("--duty_cycle 64,8" in c for c in sweep))
         self.assertTrue(any("--realtime" in c for c in sweep))
+
+        # The step graph: a different file and a flag, same script. STEP_ARGS
+        # is an array and cannot ride through the scalar env, so it is rebuilt
+        # on the far side -- which only this harness ever exercises.
+        step = " ".join(run(INCREMENTAL="1", GRAPH="m_step"))
+        self.assertIn("raspi_infer.py m_step.onnx", step)
+        self.assertIn("--incremental", step)
+        self.assertNotIn("raspi_infer.py m.onnx", step)
+        # ...and the windowed default must not pick the flag up.
+        self.assertNotIn("--incremental", measure)
 
         # An emptied pin field means "do not pin" — and then the command must
         # not claim otherwise.
@@ -1412,6 +1426,38 @@ class PageTests(unittest.TestCase):
         self.assertIn('<button data-tab="deploy"', self.PAGE)
         self.assertIn('<div class="tab" id="tab-deploy">', self.PAGE)
 
+    def test_the_train_tab_can_show_several_runs_at_once(self):
+        """The switcher only means anything if each run keeps its own buffer:
+        one shared log would interleave two runs' output into nonsense."""
+        self.assertIn('id="jobTabs"', self.PAGE)
+        self.assertIn("function selectJob(", self.PAGE)
+        self.assertIn("function jobState(", self.PAGE)
+        # Per-run read offset, log and curve.
+        block = self.PAGE[self.PAGE.index("function jobState("):]
+        block = block[:block.index("function renderJobTabs(")]
+        for field in ("next:", "metrics:", "log:"):
+            self.assertIn(field, block)
+        # The poll has to name the run it is asking about, or every run's
+        # lines land in whichever log is on screen.
+        poll = self.PAGE[self.PAGE.index("async function poll()"):][:600]
+        self.assertIn("&id=", poll)
+        self.assertIn("state.job.next", poll)
+
+    def test_the_switcher_hides_itself_when_there_is_one_run(self):
+        """One run is the ordinary case and needs no chooser."""
+        block = self.PAGE[self.PAGE.index("function renderJobTabs("):][:1400]
+        self.assertIn("list.length > 1", block)
+
+    def test_the_switcher_is_a_queue_not_a_history(self):
+        """Finished runs leave it — their logs and curves are still in the
+        Runs tab — except the one being read, which must not vanish mid-read."""
+        block = self.PAGE[self.PAGE.index("function renderJobTabs("):][:1400]
+        self.assertIn("j.running || j.id === state.jobId", block)
+
+    def test_stopping_means_the_run_you_are_looking_at(self):
+        block = self.PAGE[self.PAGE.index("async function stop()"):][:400]
+        self.assertIn("state.jobId", block)
+
     def test_the_duty_table_header_and_rows_have_the_same_columns(self):
         """The sweep table is built by string concatenation in two places, and
         a column added to one of them reads as a quietly ragged table."""
@@ -1445,9 +1491,14 @@ class PageTests(unittest.TestCase):
         self.assertIn('"Choose a model to deploy"', self.PAGE)
 
     def test_the_picker_says_which_runs_can_already_be_run(self):
-        block = self.PAGE[self.PAGE.index("const deployBadge"):][:700]
+        block = self.PAGE[self.PAGE.index("const deployBadge"):][:1200]
         for state in ("onnx", "export first", "no export"):
             self.assertIn(state, block)
+        # A bounded-lookahead rung is refused like a teacher but for its own
+        # reason, and the badge has to give that reason rather than the
+        # teacher's: the horizon is finite, and what it costs is a delay.
+        self.assertIn("r.lookahead", block)
+        self.assertIn("bounded lookahead", block)
         self.assertIn('state.pickFor === "deploy"', block,
                       "the deploy badge would show in the Evaluate picker too")
 
@@ -1481,11 +1532,733 @@ class PageTests(unittest.TestCase):
         self.assertRegex(block, r"if \(!v\)")
 
     def test_a_control_the_platform_cannot_hold_is_not_offered(self):
-        block = self.PAGE[self.PAGE.index("function syncPiTarget()"):][:2200]
+        # The whole function, not a fixed slice of it: a byte count silently
+        # stops covering what it was written to cover as soon as anything is
+        # added above the line it was reaching for.
+        start = self.PAGE.index("function syncPiTarget()")
+        block = self.PAGE[start:self.PAGE.index("\n  function ", start + 1)]
         self.assertIn("supports", block)
         self.assertIn("cpus.disabled", block)
         # ... and a disabled field must not still send its value.
         self.assertIn('$("#piCpus").disabled ? "" :', self.PAGE)
+
+
+class DutySweepAndSteppingTests(unittest.TestCase):
+    """
+    The duty-cycle sweep and incremental inference cannot be combined.
+
+    The sweep asks which hop size keeps up. A step graph has no hop -- it
+    emits on every sample -- so there is nothing to sweep, and its duty cycle
+    is the one number the latency run already reports.
+
+    Combining them did not fail: ``duty_cycle_check`` wraps the denoiser in
+    the windowed ``StreamingDenoiser``, which hands it a whole window per
+    hop, so the step graph re-stepped 125 samples for every emitted hop --
+    recomputing precisely what carrying state exists to avoid -- and printed
+    the result as a clean OK/FAIL table. Wrong numbers that look right are
+    the reason this is refused in three places rather than one.
+    """
+
+    PAGE = (ROOT / "gui" / "static" / "index.html").read_text()
+    SPEC = {"target": "host", "model": "tcn_se_both", "hop": 32, "threads": 2,
+            "testdata": "BOTH_test100.npz", "duty_hops": "64,32,16,8,4",
+            "allow_split_mismatch": True}
+
+    def test_the_api_refuses_the_pair(self):
+        with self.assertRaisesRegex(ValueError, "no hop"):
+            pi.build_steps({**self.SPEC, "incremental": True, "duty": True})
+
+    def test_each_on_its_own_is_fine(self):
+        for flags in ({"incremental": True}, {"duty": True}):
+            with self.subTest(**flags):
+                self.assertTrue(pi.build_steps({**self.SPEC, **flags}))
+
+    def test_the_runtime_refuses_it_too(self):
+        """The board is where the numbers are produced, so it checks as well."""
+        source = (ROOT / "deploy" / "raspi_infer.py").read_text()
+        i = source.index("if a.duty_cycle and a.incremental:")
+        guard = source[i:i + 1200]
+        self.assertIn("return 2", guard, "the refusal has to be a non-zero exit")
+        self.assertIn("--duty_cycle", guard)
+
+    def test_no_incremental_row_claims_a_duty_sweep(self):
+        """
+        A step graph has no hop to sweep, so a duty trace under its stem is
+        never part of that measurement.
+
+        It got there because the copy-back from the Pi is a glob --
+        ``<stem>*.json`` -- so a ``_duty`` file left on the board by an
+        earlier run came home with a fresh timestamp and was read as part of
+        the new one. A run with the sweep switched off still produced a row
+        reading "duty sweep · safe from hop 16".
+        """
+        for r in pi.list_deploy_runs():
+            if r["mode"] == "incremental":
+                with self.subTest(model=r["model"], where=r["where"]):
+                    self.assertIsNone(r["duty"],
+                                      "an incremental row absorbed a duty-sweep trace")
+
+    def test_the_board_is_cleared_before_it_is_measured(self):
+        """
+        The cause, not the symptom: clearing the stem on the Pi first is what
+        stops the glob picking up a previous run's output.
+        """
+        script = (ROOT / "deploy" / "run_on_pi.sh").read_text()
+        clear = script.index('rm -f "$LATENCY_STEM"')
+        measure = script.index('--latency_out "$LATENCY_STEM"')
+        self.assertLess(clear, measure, "the clear has to happen before the measurement")
+        self.assertIn('"$LATENCY_STEM"_*.json', script[clear:clear + 200],
+                      "the siblings (_duty, _realtime) have to go too")
+
+    def test_the_page_will_not_let_both_be_ticked(self):
+        block = self.PAGE[self.PAGE.index("const dutyBox = $(\"#piDutyOn\")"):][:1400]
+        self.assertIn("dutyBox.disabled = inc.checked", block)
+        self.assertIn("inc.disabled = true", block,
+                      "ticking the sweep must disable stepping as well")
+
+
+class ControlGridLayoutTests(unittest.TestCase):
+    """
+    A control that cannot shrink wrecks the row it is in.
+
+    Both control grids are ``auto-fit, minmax(190px, 1fr)``. A grid item's
+    default ``min-width`` is ``auto``, which refuses to shrink below the
+    content's minimum size -- so one field whose text is ``nowrap`` with
+    nothing allowed to clip it sizes its column to that text, overflows its
+    cell and lands on top of the field beside it. That is what the test-set
+    button did: 237px of content in a 218px cell, printing its hint through
+    the model's.
+
+    Checked as CSS rather than by rendering, because there is no browser
+    here; the geometry itself was verified in the pane.
+    """
+
+    PAGE = (ROOT / "gui" / "static" / "index.html").read_text()
+
+    def _rule(self, selector):
+        i = self.PAGE.index(selector)
+        return self.PAGE[i:self.PAGE.index("}", i)]
+
+    def test_a_nowrap_button_label_is_allowed_to_clip(self):
+        """
+        Every picker button's metadata span is nowrap, so each one needs the
+        overflow handling that lets the button shrink.
+        """
+        for selector in ("#piModelBtn .meta", "#piTestdataBtn .meta"):
+            with self.subTest(selector=selector):
+                rule = self._rule(selector)
+                self.assertIn("white-space: nowrap", rule)
+                self.assertIn("overflow: hidden", rule,
+                              f"{selector} is nowrap with no clipping: it cannot shrink")
+                self.assertIn("text-overflow: ellipsis", rule)
+                self.assertIn("min-width: 0", rule)
+
+    def test_grid_items_may_shrink_below_their_content(self):
+        for tab in ("#tab-deploy", "#tab-eval"):
+            with self.subTest(tab=tab):
+                self.assertIn("min-width: 0", self._rule(f"{tab} .efield {{"),
+                              f"{tab}'s fields keep min-width:auto and cannot shrink")
+                self.assertIn("max-width: 100%", self._rule(f"{tab} .efield > *"),
+                              f"a child of a {tab} field may still exceed its cell")
+
+
+class RunsPayloadFreshnessTests(unittest.TestCase):
+    """
+    Everything /api/runs returns has to reach the page.
+
+    ``refreshRuns`` used to copy a hand-written list of keys, so a grouping
+    added to the endpoint stayed invisible until a reload -- which reads as
+    missing data, not stale data. It cost the loss and optimizer views once,
+    and the Deploy-runs view again when those rows were added to the payload
+    and not to the list. The list is now iterated from the payload, so the
+    two cannot drift apart.
+    """
+
+    PAGE = (ROOT / "gui" / "static" / "index.html").read_text()
+
+    def _fn(self, name):
+        i = self.PAGE.index(f"async function {name}")
+        return self.PAGE[i:self.PAGE.index("\n  }", i)]
+
+    def test_the_page_copies_whatever_the_endpoint_returns(self):
+        body = self._fn("refreshRuns")
+        self.assertIn("Object.entries(payload)", body,
+                      "refreshRuns copies a hand-written key list; a new grouping will be "
+                      "invisible until the page is reloaded")
+
+    def test_a_finished_deploy_updates_the_runs_view(self):
+        """
+        A measurement is a row in the Runs tab as well as a trace in the
+        Deploy tab, and only the Deploy tab refreshes when one finishes.
+        """
+        body = self._fn("refreshPiMeta")
+        self.assertIn("/api/runs/deploys", body)
+        self.assertIn("state.meta.deploys", body)
+
+    def test_the_endpoint_returns_the_deploy_rows(self):
+        """The server half of the same contract."""
+        import gui.server as server
+        payload_keys = {"runs", "kinds", "times", "losses", "optimizers",
+                        "deploys", "deploy_logs"}
+        source = (ROOT / "gui" / "server.py").read_text()
+        handler = source[source.index('if url.path == "/api/runs":'):][:700]
+        for key in payload_keys - {"runs"}:
+            with self.subTest(key=key):
+                self.assertIn(f'"{key}"', handler)
+
+
+class DeployModelListFreshnessTests(unittest.TestCase):
+    """
+    The Deploy tab keeps its own model list, and it has to learn about runs
+    that finish while the page is open.
+
+    It did not: ``refreshRuns`` updated every Runs-tab grouping and left
+    ``state.meta.pi`` alone, so a newly trained run was selectable from the
+    Runs table but unknown to the Deploy tab. Everything keyed on finding it
+    then failed *quietly* -- no metadata line, no split check, and a test-set
+    generator that said "pick a model first" about a model that was picked.
+    """
+
+    PAGE = (ROOT / "gui" / "static" / "index.html").read_text()
+
+    def test_refreshing_the_runs_also_refreshes_the_deploy_list(self):
+        block = self.PAGE[self.PAGE.index("async function refreshRuns"):]
+        block = block[:block.index("\n  async function", 1)
+                      if "\n  async function" in block[1:] else 4000]
+        self.assertIn("refreshPiMeta()", block,
+                      "a run that finished while the page was open never reaches the Deploy tab")
+
+    def test_an_unknown_selection_is_reported_not_swallowed(self):
+        """
+        A model the tab does not know and no model at all are different
+        situations; reporting both as "pick one" is what made a stale list
+        look like a broken tab.
+        """
+        hint = self.PAGE[self.PAGE.index("function renderPiModelHint"):][:1600]
+        self.assertIn("not in this tab's list", hint)
+
+        split = self.PAGE[self.PAGE.index("function piSplitProblem"):][:1400]
+        self.assertIn("not in this tab's list", split,
+                      "an unknown model must not read as a clean split check")
+
+    def test_every_trained_run_the_tab_lists_can_be_paired(self):
+        """
+        What the bug report was really about: a new variant has to arrive with
+        everything the tab needs -- an artifact and a seed -- or the generator
+        cannot cut it a test set.
+        """
+        for m in pi.list_models():
+            if not (m["run"] and m["deployable"]):
+                continue
+            with self.subTest(model=m["name"]):
+                self.assertIsNotNone(m["variant"], f"{m['name']} has no variant")
+                if m["master_seed"] is None:
+                    continue          # pre-dates the seed being recorded; refused loudly
+                self.assertIn(m["artifact"], ("EOG", "EMG", "BOTH"),
+                              f"{m['name']} records no artifact, so no test set can be cut")
+
+
+class TestdataGeneratorTests(unittest.TestCase):
+    """
+    Cutting the matching set from the model.
+
+    The pairing rules turn "which set do I pick" into a small research question
+    whose answer the run already records, so the generator reads the artifact
+    and seed off the model instead of asking.  What it must never do is guess:
+    a set cut at a default seed for a run whose seed is unknown would look
+    matched and would not be, which is the exact failure the check exists for.
+    """
+
+    def test_it_reuses_an_existing_matching_set(self):
+        """
+        An existing file is already the right epochs. Rewriting it would churn
+        a file that recorded measurements may refer to.
+        """
+        model = next((m for m in pi.list_models()
+                      if m.get("master_seed") == 67 and m.get("artifact") == "BOTH"), None)
+        if model is None:
+            self.skipTest("no seed-67 BOTH model in the working tree")
+        before = (pi.TESTDATA_DIR / "BOTH_test100_s67.npz").stat().st_mtime
+        out = pi.cut_testdata_for(model["name"], n=100)
+        self.assertEqual(out["name"], "BOTH_test100_s67.npz")
+        self.assertFalse(out["created"])
+        self.assertEqual((pi.TESTDATA_DIR / "BOTH_test100_s67.npz").stat().st_mtime, before,
+                         "an existing matching set was rewritten instead of reused")
+
+    def test_it_refuses_a_run_with_no_recorded_seed(self):
+        model = next((m for m in pi.list_models() if m.get("master_seed") is None), None)
+        if model is None:
+            self.skipTest("every run records its seed in this tree")
+        with self.assertRaisesRegex(ValueError, "does not record the seed"):
+            pi.cut_testdata_for(model["name"])
+
+    def test_it_refuses_an_unknown_model_and_a_silly_size(self):
+        with self.assertRaisesRegex(ValueError, "no model called"):
+            pi.cut_testdata_for("no_such_model_anywhere")
+        model = next((m for m in pi.list_models() if m.get("master_seed") is not None), None)
+        if model is None:
+            self.skipTest("no model with a recorded seed")
+        for n in (0, 9, 10_000):
+            with self.subTest(n=n), self.assertRaisesRegex(ValueError, "between 10 and 2000"):
+                pi.cut_testdata_for(model["name"], n=n)
+
+    def test_a_cut_set_matches_the_model_it_was_cut_for(self):
+        """The point of the whole feature: what it writes must pass the check."""
+        data_dir = Path("data/EEGdenoisenet/data")
+        if not (data_dir / "EEG_all_epochs.npy").is_file():
+            self.skipTest("EEGdenoiseNet .npy files are not present")
+        model = next((m for m in pi.list_models()
+                      if m.get("master_seed") is not None and m.get("artifact") == "EMG"), None)
+        if model is None:
+            self.skipTest("no EMG model with a recorded seed")
+
+        out = pi.cut_testdata_for(model["name"], n=20)
+        created = pi.TESTDATA_DIR / out["name"]
+        try:
+            self.assertIsNone(pi.split_mismatch(model["name"], out["name"]),
+                              "the generator produced a set its own model would be refused on")
+            # And the API accepts the pair it just made.
+            self.assertEqual(
+                pi._testdata_name({"model": model["name"], "testdata": out["name"],
+                                   "_enforce_split": True}),
+                out["name"])
+        finally:
+            if out.get("created"):
+                created.unlink(missing_ok=True)
+
+
+class DeployRunListingTests(unittest.TestCase):
+    """
+    The Runs tab's other half: the measurements, not the training runs.
+
+    One row per ``(where, model, hop)``, because the three traces a single run
+    can write -- per-hop latency, the duty sweep, the real-time replay -- are
+    one run's output and should read as one row.
+    """
+
+    def test_a_runs_three_traces_become_one_row(self):
+        rows = pi.list_deploy_runs()
+        if not rows:
+            self.skipTest("no traces in deploy/artifacts/pi_latency/")
+        keys = [(r["where"], r["model"], r["hop"]) for r in rows]
+        self.assertEqual(len(keys), len(set(keys)), "a measurement was split across rows")
+        multi = [r for r in rows if len(r["traces"]) > 1]
+        if multi:
+            self.assertTrue(any(r["duty"] or r["realtime"] for r in multi),
+                            "extra traces were gathered but neither duty nor realtime was set")
+
+    def test_the_primary_trace_is_the_latency_one(self):
+        """
+        'Open' should land on the measurement, not on whichever sibling the
+        directory listing happened to return first.
+        """
+        for r in pi.list_deploy_runs():
+            with self.subTest(model=r["model"], where=r["where"]):
+                self.assertIn(r["primary"], r["traces"])
+                if any(not t.endswith(("_duty.json", "_realtime.json")) for t in r["traces"]):
+                    self.assertFalse(r["primary"].endswith(("_duty.json", "_realtime.json")))
+
+    def test_the_model_name_survives_underscores_and_digits(self):
+        """
+        ``tcn_mla_both_s67`` is a run name with both. Anchoring the parse on
+        the leading underscore would cut it in the wrong place.
+        """
+        rows = {r["model"] for r in pi.list_deploy_runs()}
+        if "tcn_mla_both_s67" not in {r for r in rows}:
+            self.skipTest("no trace for a model whose name carries a seed suffix")
+        self.assertIn("tcn_mla_both_s67", rows)
+
+    def test_rows_carry_the_deadline_and_the_environment(self):
+        for r in pi.list_deploy_runs():
+            with self.subTest(model=r["model"]):
+                # hop / 256 Hz, in ms -- what the median has to beat.
+                self.assertAlmostEqual(r["budget_ms"], r["hop"] / 256.0 * 1000, places=2)
+                if r["median_ms"] is not None:
+                    self.assertEqual(r["realtime_ok"], r["median_ms"] < r["budget_ms"])
+                    self.assertAlmostEqual(r["duty_cycle"], r["median_ms"] / r["budget_ms"],
+                                           places=3)
+                # A trace from before the environment was recorded must come
+                # back as None, which the page shows as "unknown" -- not as a
+                # pass, and not as "unlocked".
+                self.assertIn(r["verdict"], (None, "locked", "partial", "unlocked"))
+
+    def test_host_runs_are_labelled_not_hidden(self):
+        rows = pi.list_deploy_runs()
+        if not any(r["where"] == "host" for r in rows):
+            self.skipTest("no host traces in this tree")
+        self.assertTrue(all(r["where"] in ("host", "pi") for r in rows))
+
+    def test_newest_first(self):
+        times = [r["mtime"] for r in pi.list_deploy_runs()]
+        self.assertEqual(times, sorted(times, reverse=True))
+
+    def test_deploy_logs_are_listed_newest_first(self):
+        logs = pi.list_deploy_logs()
+        self.assertEqual([x["mtime"] for x in logs],
+                         sorted((x["mtime"] for x in logs), reverse=True))
+        self.assertTrue(all(x["name"].startswith("gui_deploy_") for x in logs))
+
+
+class TestScoreRecordingTests(unittest.TestCase):
+    """
+    A measurement's accuracy belongs in the same file as its timing.
+
+    ``evaluate_testdata`` computed RRMSE_t / RRMSE_f / CC, printed them, and
+    returned them to a caller that threw the return away -- so the trace saved
+    the milliseconds and lost the thing the milliseconds were spent on. The
+    monitor now carries them into its summary, which is what ``save()`` writes.
+    """
+
+    def test_the_monitor_writes_scores_into_its_trace(self):
+        from deploy import raspi_infer          # numpy + onnxruntime
+        m = raspi_infer.LatencyMonitor(hop=32, sample_rate=256, label="latency/test")
+        self.assertNotIn("scores", m.summary(),
+                         "a run that scored nothing should not claim an empty result")
+        m.scores = {"testdata": "EOG_test100.npz", "n_epochs": 100,
+                    "modes": {"epoch mode": {"rrmse_t": 0.46, "rrmse_s": 0.464, "acc": 0.883}}}
+        self.assertEqual(m.summary()["scores"]["modes"]["epoch mode"]["acc"], 0.883)
+
+        with tempfile.TemporaryDirectory() as td:
+            js, _ = m.save(Path(td) / "t")
+            written = json.loads(js.read_text())
+        self.assertEqual(written["scores"]["testdata"], "EOG_test100.npz")
+
+    def test_scores_are_recovered_from_a_job_log_for_older_traces(self):
+        """
+        The measurements already on disk predate scores being saved, and their
+        numbers are not lost: the job log that produced them also names the
+        traces it wrote, which is the join.
+        """
+        recovered = pi._scores_from_logs()
+        if not recovered:
+            self.skipTest("no deploy job logs with a scored test set")
+        for name, sc in recovered.items():
+            with self.subTest(trace=name):
+                self.assertEqual(sc["source"], "log")
+                self.assertTrue(sc["from_log"].startswith("gui_deploy_"))
+                # Matched by prefix: a windowed run logs "epoch mode", a step
+                # graph "epoch mode (stepped)". Both are the per-epoch score.
+                epoch = next((k for k in sc["modes"] if k.startswith("epoch mode")), None)
+                self.assertIsNotNone(epoch, f"{name} recorded no epoch-mode row")
+                for key in ("rrmse_t", "rrmse_s", "acc"):
+                    self.assertIsInstance(sc["modes"][epoch][key], float)
+
+    def test_a_row_says_where_its_numbers_came_from(self):
+        for r in pi.list_deploy_runs():
+            sc = r.get("scores")
+            if sc is None:
+                continue
+            with self.subTest(model=r["model"], where=r["where"]):
+                self.assertIn(sc["source"], ("trace", "log"))
+                if sc["source"] == "log":
+                    self.assertIn("from_log", sc)
+
+    def test_a_trace_recorded_score_beats_one_scraped_from_a_log(self):
+        """Data saved by the run wins over text parsed out of its log."""
+        import copy
+        traces = pi.list_traces()
+        if not traces:
+            self.skipTest("no traces")
+        marker = {"testdata": "FROM_TRACE.npz",
+                  "modes": {"epoch mode": {"rrmse_t": 0.1, "rrmse_s": 0.1, "acc": 0.99}}}
+        patched = copy.deepcopy(traces)
+        for t in patched:
+            if not t["name"].endswith(("_duty.json", "_realtime.json")):
+                t["scores"] = marker
+        with mock.patch.object(pi, "list_traces", return_value=patched):
+            rows = [r for r in pi.list_deploy_runs() if r.get("scores")]
+        self.assertTrue(rows, "no row picked up the trace-recorded score")
+        for r in rows:
+            self.assertEqual(r["scores"]["source"], "trace")
+            self.assertEqual(r["scores"]["testdata"], "FROM_TRACE.npz")
+
+
+class InferenceModeTests(unittest.TestCase):
+    """
+    A trace has to say how its milliseconds were produced, not only what they
+    were.
+
+    The environment block exists so a latency figure cannot be separated from
+    the machine; the same argument applies to the algorithm. Without it a
+    reader has to know which files ``run_on_pi.sh`` copies to work out that a
+    trace is the hop-and-recompute path and not a cached one — and once a
+    cached export exists, old and new traces would be indistinguishable.
+    """
+
+    def test_a_windowed_trace_says_it_recomputes(self):
+        from deploy import raspi_infer
+        m = raspi_infer.LatencyMonitor(hop=32, sample_rate=256, model_window=512)
+        inf = m.summary()["inference"]
+        self.assertEqual(inf["mode"], "windowed")
+        self.assertIs(inf["kv_cache"], False)
+        self.assertEqual(inf["recompute_factor"], 16.0)   # 512 / 32
+        self.assertEqual(inf["runtime"], "onnxruntime")
+
+    def test_the_recompute_factor_follows_the_hop(self):
+        from deploy import raspi_infer
+        for hop, expected in ((8, 64.0), (64, 8.0), (512, 1.0)):
+            with self.subTest(hop=hop):
+                m = raspi_infer.LatencyMonitor(hop=hop, sample_rate=256, model_window=512)
+                self.assertEqual(m.summary()["inference"]["recompute_factor"], expected)
+
+    def test_rows_default_to_windowed_for_traces_that_predate_the_field(self):
+        """
+        Every trace written before this said nothing, and all of them were
+        windowed — but the row must not claim the trace said so.
+        """
+        for r in pi.list_deploy_runs():
+            with self.subTest(model=r["model"], where=r["where"]):
+                self.assertIn(r["mode"], ("windowed", "incremental"))
+                if r["inference"] is None:
+                    self.assertEqual(r["mode"], "windowed")
+
+    def test_an_incremental_trace_is_listed_as_its_own_measurement(self):
+        rows = [r for r in pi.list_deploy_runs() if r["mode"] == "incremental"]
+        if not rows:
+            self.skipTest("no incremental traces in deploy/artifacts/pi_latency/")
+        for r in rows:
+            with self.subTest(model=r["model"]):
+                # Hop 1 is the literal truth and what makes the duty cycle
+                # comparable with a windowed run at any hop.
+                self.assertEqual(r["hop"], 1)
+                self.assertAlmostEqual(r["budget_ms"], 1000 / 256.0, places=2)
+                # Both machines now: the host runs it in torch, the Pi runs
+                # the exported step graph. Which one is read from the trace's
+                # environment block, not from its filename.
+                self.assertIn(r["where"], ("host", "pi"))
+                self.assertEqual(r["inference"]["recompute_factor"], 1.0)
+                self.assertIn("kv_cache", r["inference"])
+
+    def test_only_the_attention_variants_hold_a_kv_cache(self):
+        for r in pi.list_deploy_runs():
+            inf = r.get("inference") or {}
+            if inf.get("mode") != "incremental":
+                continue
+            with self.subTest(model=r["model"]):
+                has_attention = bool(inf.get("kv_floats_per_step"))
+                self.assertEqual(inf["kv_cache"], has_attention)
+
+
+class IncrementalStepTests(unittest.TestCase):
+    """The Deploy tab's incremental step: host only, and from the checkpoint."""
+
+    SPEC = {"target": "host", "model": "tcn_mla_eog", "hop": 32, "threads": 2,
+            "testdata": "EOG_test100.npz"}
+
+    def test_it_runs_the_checkpoint_not_the_export(self):
+        steps = pi.build_steps({**self.SPEC, "incremental": True})
+        self.assertEqual(len(steps), 1)
+        cmd = steps[0]["command"]
+        self.assertIn("deploy.bench_incremental", cmd)
+        self.assertIn("--ckpt", cmd)
+        self.assertIn("runs/tcn_mla_eog/best.pt", cmd)
+        self.assertIn("--trace", cmd)
+        self.assertNotIn("--testdata", cmd)   # it scores nothing
+
+    def test_the_pi_needs_a_step_graph_and_says_how_to_make_one(self):
+        """
+        The Pi runs ``<model>_step.onnx``, not ``models/incremental.py`` --
+        it has no torch. Without that graph the request is refused with the
+        command that produces it, rather than failing on the board.
+        """
+        # One that is otherwise ready to deploy, so the step graph is the only
+        # thing missing and the refusal is about that rather than the export.
+        name = next((m["name"] for m in pi.list_models()
+                     if m["exported"] and not m["bidirectional"]
+                     and not (pi.ARTIFACTS_DIR / f"{m['name']}_step.onnx").is_file()), None)
+        if name is None:
+            self.skipTest("every exported model already has a step graph")
+        with self.assertRaises(FileNotFoundError) as caught:
+            pi.build_steps({**self.SPEC, "model": name, "target": "pi",
+                            "ssh": "pi@host", "incremental": True, "measure": True,
+                            "allow_split_mismatch": True})
+        self.assertIn("--incremental", str(caught.exception))
+
+    def test_the_pi_is_told_to_run_the_step_graph(self):
+        name = next((m["name"] for m in pi.list_models()
+                     if (pi.ARTIFACTS_DIR / f"{m['name']}_step.onnx").is_file()), None)
+        if name is None:
+            self.skipTest("no step graph exported in this tree")
+        steps = pi.build_steps({**self.SPEC, "model": name, "target": "pi",
+                                "ssh": "pi@host", "incremental": True, "measure": True,
+                                "testdata": pi.list_testdata()[0]["name"],
+                                "allow_split_mismatch": True})
+        self.assertEqual(steps[-1]["env"]["INCREMENTAL"], "1")
+
+    def test_a_windowed_pi_run_does_not_ask_for_one(self):
+        steps = pi.build_steps({**self.SPEC, "model": "tcn_mla_eog", "target": "pi",
+                                "ssh": "pi@host", "measure": True,
+                                "allow_split_mismatch": True})
+        self.assertEqual(steps[-1]["env"]["INCREMENTAL"], "")
+
+    def test_it_counts_as_something_to_run(self):
+        """On its own it is a measurement, not an empty submission."""
+        steps = pi.build_steps({**self.SPEC, "incremental": True,
+                                "measure": False, "duty": False})
+        self.assertTrue(steps)
+
+    def test_it_needs_a_checkpoint(self):
+        with self.assertRaises((FileNotFoundError, ValueError)):
+            pi.build_steps({**self.SPEC, "model": "no_such_run", "incremental": True})
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class SplitProvenanceTests(unittest.TestCase):
+    """
+    A test set is only a test set for a model trained at the same seed.
+
+    ``EEGDenoiseDataset`` permutes the epoch pool with ``master_seed`` before
+    slicing train/val/test out of it, so the seed-42 test epochs are 69% of
+    them inside the seed-67 *training* split.  Scoring across that line does
+    not crash or look odd — it returns a better number than the model earns.
+    The pairing is therefore checked in three places (the page, the API, and
+    the scorer on the board) and all three are covered here.
+    """
+
+    def test_provenance_is_read_from_the_file_when_recorded(self):
+        import numpy as np
+        from deploy import raspi_infer
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "BOTH_test40_s67.npz"
+            np.savez_compressed(p, noisy=np.zeros((2, 512), np.float32),
+                                clean=np.zeros((2, 512), np.float32),
+                                snr_db=np.zeros(2, np.float32), fs=256,
+                                master_seed=7, artifact="EMG", split="test")
+            prov = raspi_infer.testdata_provenance(p)
+        # The recorded values win over everything the name claims.
+        self.assertEqual(prov["source"], "recorded")
+        self.assertEqual((prov["master_seed"], prov["artifact"]), (7, "EMG"))
+
+    def test_provenance_falls_back_to_the_filename(self):
+        import numpy as np
+        from deploy import raspi_infer
+        with tempfile.TemporaryDirectory() as td:
+            for name, seed, art in [("EOG_test100.npz", 42, "EOG"),
+                                    ("BOTH_test100_s67.npz", 67, "BOTH")]:
+                p = Path(td) / name
+                np.savez_compressed(p, noisy=np.zeros((1, 512), np.float32))
+                prov = raspi_infer.testdata_provenance(p)
+                with self.subTest(name=name):
+                    self.assertEqual(prov["source"], "filename")
+                    self.assertEqual((prov["master_seed"], prov["artifact"]), (seed, art))
+
+    def test_an_unrecognisable_file_is_unknown_not_a_guess(self):
+        import numpy as np
+        from deploy import raspi_infer
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "whatever.npz"
+            np.savez_compressed(p, noisy=np.zeros((1, 512), np.float32))
+            self.assertEqual(raspi_infer.testdata_provenance(p)["source"], "unknown")
+
+    def test_the_scorer_refuses_a_seed_mismatch(self):
+        from deploy import raspi_infer
+        meta = {"provenance": {"trained_master_seed": 67, "trained_artifact": "BOTH"}}
+        prov = {"source": "recorded", "master_seed": 42, "artifact": "BOTH", "split": "test"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "LEAK"):
+                raspi_infer.check_split(meta, prov, strict=True)
+            # ...and scores it anyway when told to, which is what the flag is for.
+            problems = raspi_infer.check_split(meta, prov, strict=False)
+        self.assertTrue(any("LEAK" in p for p in problems))
+
+    def test_the_scorer_accepts_a_matching_pair(self):
+        from deploy import raspi_infer
+        meta = {"provenance": {"trained_master_seed": 67, "trained_artifact": "BOTH"}}
+        prov = {"source": "recorded", "master_seed": 67, "artifact": "BOTH", "split": "test"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(raspi_infer.check_split(meta, prov, strict=True), [])
+
+    def test_unverifiable_pairs_warn_rather_than_refuse(self):
+        """
+        A run from before the seed was recorded cannot be checked.  That is a
+        warning, not a refusal: refusing would make every legacy checkpoint
+        unscoreable, and the warning says exactly what is unverified.
+        """
+        from deploy import raspi_infer
+        meta = {"provenance": {"trained_master_seed": None, "trained_artifact": None}}
+        prov = {"source": "recorded", "master_seed": 42, "artifact": "EOG", "split": "test"}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(raspi_infer.check_split(meta, prov, strict=True), [
+                p for p in raspi_infer.check_split(meta, prov, strict=True)])
+        self.assertIn("cannot verify the split", out.getvalue())
+
+    def test_a_non_test_split_is_refused(self):
+        from deploy import raspi_infer
+        meta = {"provenance": {"trained_master_seed": 42, "trained_artifact": "EOG"}}
+        prov = {"source": "recorded", "master_seed": 42, "artifact": "EOG", "split": "train"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "not the test split"):
+                raspi_infer.check_split(meta, prov, strict=True)
+
+    def test_make_testdata_stamps_what_it_cut(self):
+        """The provenance has to describe the cut, not the default."""
+        import numpy as np
+        from deploy.make_testdata import make_testdata
+        data_dir = Path("data/EEGdenoisenet/data")
+        if not (data_dir / "EEG_all_epochs.npy").is_file():
+            self.skipTest("EEGdenoiseNet .npy files are not present")
+        with tempfile.TemporaryDirectory() as td:
+            with contextlib.redirect_stdout(io.StringIO()):
+                p = make_testdata(str(data_dir), "EMG", 10, out_dir=td, master_seed=13)
+            d = np.load(p)
+            self.assertEqual((int(d["master_seed"]), str(d["artifact"]), str(d["split"])),
+                             (13, "EMG", "test"))
+            self.assertEqual(p.name, "EMG_test10_s13.npz")
+
+    def test_the_bundled_sets_carry_provenance(self):
+        """They are shipped in the repo, so they are the ones most likely reused."""
+        for t in pi.list_testdata():
+            with self.subTest(name=t["name"]):
+                self.assertEqual(t["source"], "recorded",
+                                 f"{t['name']} has no recorded provenance; re-cut it")
+
+    def test_the_api_refuses_a_leaking_pair(self):
+        """
+        Checked server-side too: the page can be stale and the API is reachable
+        on its own, so the browser's banner cannot be the only guard.
+        """
+        sets = {t["name"]: t for t in pi.list_testdata()}
+        models = {m["name"]: m for m in pi.list_models() if m.get("master_seed") is not None}
+        if not sets or not models:
+            self.skipTest("no exported models or test sets to pair")
+
+        pair = next(((m, t) for m in models.values() for t in sets.values()
+                     if int(m["master_seed"]) != int(t["master_seed"])), None)
+        if pair is None:
+            self.skipTest("no mismatched pair available to test with")
+        model, testset = pair
+
+        spec = {"model": model["name"], "testdata": testset["name"]}
+
+        # The run path refuses: this is the call that goes on to produce a score.
+        with self.assertRaises(ValueError):
+            pi._testdata_name({**spec, "_enforce_split": True})
+
+        # Preview does not. It is read-only, the page already shows the banner,
+        # and blocking it would hide the command from someone who means to copy
+        # it and add --allow-split-mismatch.
+        self.assertEqual(pi._testdata_name(spec), testset["name"])
+
+        # The override exists because a deliberate probe is a legitimate thing
+        # to run; it just must not be the default.
+        self.assertEqual(
+            pi._testdata_name({**spec, "_enforce_split": True,
+                               "allow_split_mismatch": True}),
+            testset["name"])
+
+    def test_split_mismatch_levels(self):
+        matched = next((t for t in pi.list_testdata() if t["master_seed"] == 67), None)
+        mismatched = next((t for t in pi.list_testdata() if t["master_seed"] == 42), None)
+        model = next((m for m in pi.list_models() if m.get("master_seed") == 67), None)
+        if not (matched and mismatched and model):
+            self.skipTest("the fixtures this needs are not in the working tree")
+        self.assertIsNone(pi.split_mismatch(model["name"], matched["name"]))
+        bad = pi.split_mismatch(model["name"], mismatched["name"])
+        self.assertEqual(bad["level"], "error")
+        self.assertIn("master_seed", bad["text"])
 
 
 if __name__ == "__main__":
