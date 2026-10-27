@@ -44,6 +44,54 @@ from metrics import compute_all_metrics
 from models.variants import build_model, build_model_from_config, VARIANT_REGISTRY
 from utils.utils import get_device
 
+DEFAULT_MASTER_SEED = 42
+
+
+# ====================================================================
+# 0. Which split belongs to this run
+# ====================================================================
+def resolve_master_seed(ckpt: Optional[dict] = None, history_path: Optional[str] = None,
+                        override: Optional[int] = None, *, what: str = "evaluation") -> int:
+    """
+    The ``master_seed`` whose splits this checkpoint was trained against.
+
+    ``master_seed`` *defines* the train/val/test partition (data/Dataloader.py),
+    so evaluating a model on a different seed's "test" split is not a weaker
+    measurement -- it is a contaminated one.  The splits of two seeds overlap
+    almost completely: ~85% of one seed's test epochs were in the other seed's
+    train or val set, so the number that comes out is partly train accuracy.
+
+    Resolution order is explicit > recorded > the historical default, and the
+    last case warns, because silently assuming 42 for a run trained at another
+    seed is exactly the failure this function exists to prevent.
+    """
+    if override is not None:
+        return int(override)
+
+    for source, cfg in (("checkpoint run_config", (ckpt or {}).get("run_config")),
+                        ("checkpoint model_config", (ckpt or {}).get("model_config"))):
+        if isinstance(cfg, dict) and cfg.get("master_seed") is not None:
+            seed = int(cfg["master_seed"])
+            print(f"[Eval] master_seed = {seed} (from the {source})")
+            return seed
+
+    if history_path:
+        try:
+            with open(history_path) as fh:
+                cfg = (json.load(fh) or {}).get("config") or {}
+            if cfg.get("master_seed") is not None:
+                seed = int(cfg["master_seed"])
+                print(f"[Eval] master_seed = {seed} (from history.json)")
+                return seed
+        except (OSError, ValueError):
+            pass
+
+    print(f"[Eval] WARNING: this run records no master_seed, so {what} falls back to "
+          f"{DEFAULT_MASTER_SEED}. If it was trained with --master_seed other than "
+          f"{DEFAULT_MASTER_SEED}, these splits are NOT its held-out data -- around 85% of "
+          f"them were in its training or validation set. Pass --master_seed to say which.")
+    return DEFAULT_MASTER_SEED
+
 
 # ====================================================================
 # 1. Per-SNR Evaluator
@@ -207,10 +255,15 @@ def visualize_samples(
     n_samples: int = 4,
     save_path: Optional[str] = None,
     device: Optional[torch.device] = None,
+    seed: int = DEFAULT_MASTER_SEED,
 ):
     """
     Plots noisy, clean (ground-truth), and denoised signals side by side
     in both the time domain and frequency domain (PSD via Welch's method).
+
+    ``seed`` must be the run's own ``master_seed``: it selects the test split
+    these waveforms are drawn from, and a mismatched seed plots epochs the
+    model was trained on.
     """
     device = device or get_device()
     model.eval().to(device)
@@ -221,17 +274,27 @@ def visualize_samples(
         artifact_type=artifact_type,
         split="test",
         fixed_snr_db=float(snr),
-        master_seed=123,
+        master_seed=seed,
     )
 
-    fig, axes = plt.subplots(2, n_samples, figsize=(4 * n_samples, 6))
+    # Spread the samples across whatever the split actually holds.  A fixed
+    # stride of 100 overruns any split smaller than n_samples * 100 -- which
+    # includes every split of a small artifact set, and the synthetic data
+    # reproduce.py falls back to.
+    if len(ds) == 0:
+        print(f"[Waveform] the {artifact_type} test split is empty — skipping.")
+        return
+    n_samples = min(n_samples, len(ds))
+    stride = max(1, len(ds) // n_samples)
+
+    fig, axes = plt.subplots(2, n_samples, figsize=(4 * n_samples, 6), squeeze=False)
     fig.suptitle(
         f"{artifact_type} Denoising Performance Comparison (SNR = {snr} dB)",
         fontsize=13,
     )
 
     for i in range(n_samples):
-        sample = ds[i * 100]
+        sample = ds[(i * stride) % len(ds)]
         noisy = sample["noisy"].unsqueeze(0).to(device)
         clean = sample["clean"].squeeze().cpu().numpy()
         sigma = sample["sigma"].item()
@@ -312,6 +375,7 @@ def plot_attention_heatmaps(
     sample_idx: int = 0,
     save_path: Optional[str] = None,
     device: Optional[torch.device] = None,
+    seed: int = DEFAULT_MASTER_SEED,
 ):
     """
     Extract attention weights from every layer / head and plot heatmaps.
@@ -337,6 +401,10 @@ def plot_attention_heatmaps(
         Which test sample to use (default: 0).
     save_path : str or None
         If provided, saves the figure instead of displaying it.
+    seed : int
+        The run's own ``master_seed``, which selects the test split the sample
+        is drawn from. A mismatched seed shows attention over an epoch the
+        model was trained on.
     """
     attn_modules = _get_attn_modules(model)
     if not attn_modules:
@@ -356,7 +424,7 @@ def plot_attention_heatmaps(
         artifact_type=artifact_type,
         split="test",
         fixed_snr_db=float(snr),
-        master_seed=123,
+        master_seed=seed,
     )
     sample = ds[sample_idx]
     noisy = sample["noisy"].unsqueeze(0).to(device)  # (1, 1, T)
@@ -624,6 +692,7 @@ def compare_snr_curves(
 
     # Collect per-model results
     all_results = []
+    seeds_used: List[tuple] = []
     for run_dir, label in zip(run_dirs, labels):
         ckpt_path = Path(run_dir) / "best.pt"
         if not ckpt_path.exists():
@@ -662,12 +731,19 @@ def compare_snr_curves(
         model.eval().to(device)
 
         print(f"\n[Compare SNR] Evaluating: {label} ({variant})")
+        # Each run is scored on its *own* seed's test split: that is the only
+        # split it was actually held out from.  Reusing one seed for all of them
+        # would score every other run on epochs it trained on.
+        seed = resolve_master_seed(ckpt, str(Path(run_dir) / "history.json"),
+                                   what=f"{label}'s evaluation")
+        seeds_used.append((label, seed))
         results, avg = evaluate_per_snr(
             model, data_dir,
             artifact_type=artifact_type,
             snr_list=snr_list,
             batch_size=batch_size,
             device=device,
+            seed=seed,
         )
         all_results.append((label, results))
 
@@ -675,13 +751,26 @@ def compare_snr_curves(
         print("[Compare SNR] No valid checkpoints found.")
         return
 
+    # Runs at different seeds were held out from different epochs, so their
+    # curves are each valid on their own but are not a head-to-head on shared
+    # data.  Say so on the figure rather than letting it read as one.
+    distinct = sorted({s for _, s in seeds_used})
+    split_note = ""
+    if len(distinct) > 1:
+        print(f"[Compare SNR] WARNING: these runs use different master_seeds "
+              f"({', '.join(f'{lbl}={s}' for lbl, s in seeds_used)}), so each curve comes "
+              f"from a different test split. Each is a valid held-out score for its own "
+              f"run, but differences between curves also carry the split change -- for a "
+              f"head-to-head, compare runs that share a seed.")
+        split_note = f"  [different test splits: seeds {', '.join(map(str, distinct))}]"
+
     # Plot
     colors = ["#2980b9", "#e74c3c", "#27ae60", "#8e44ad",
               "#d35400", "#1abc9c", "#f39c12", "#34495e"]
     markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-    fig.suptitle(f"Multi-Model Per-SNR Comparison ({artifact_type})", fontsize=13)
+    fig.suptitle(f"Multi-Model Per-SNR Comparison ({artifact_type}){split_note}", fontsize=13)
 
     for idx, (label, results) in enumerate(all_results):
         c = colors[idx % len(colors)]
@@ -739,6 +828,10 @@ def main():
     parser.add_argument("--variant", default=None, choices=list(VARIANT_REGISTRY.keys()),
                         help="Model variant (must match the checkpoint)")
     parser.add_argument("--artifact", default="EOG", choices=["EOG", "EMG"])
+    parser.add_argument("--master_seed", type=int, default=None,
+                        help="The run's master_seed, which defines its train/val/test split. "
+                             "Default: read from the checkpoint, else 42 with a warning. "
+                             "A wrong value evaluates on epochs the model was trained on.")
 
     # --- Mode selection ---
     parser.add_argument("--mode", default="all",
@@ -816,6 +909,8 @@ def main():
         model = build_model_from_config(model_cfg)
         model.load_state_dict(ckpt["model_state"])
         print(f"[Eval] Loaded checkpoint: {args.ckpt}  (epoch={ckpt['epoch']})")
+        # The split this model's held-out data actually lives in.
+        seed = resolve_master_seed(ckpt, history_path, args.master_seed)
 
     run_all = args.mode == "all"
 
@@ -824,6 +919,7 @@ def main():
         evaluate_per_snr(
             model, args.data_dir,
             artifact_type=args.artifact,
+            seed=seed,
         )
 
     # ---- 2. Training curves ----
@@ -847,6 +943,7 @@ def main():
             snr=args.vis_snr,
             n_samples=args.n_samples,
             save_path=str(save_dir / "waveforms.png") if save_dir else None,
+            seed=seed,
         )
 
     # ---- 4. Attention heatmaps ----
@@ -857,6 +954,7 @@ def main():
             snr=args.vis_snr,
             sample_idx=args.attn_sample,
             save_path=str(save_dir / "attention_heatmaps.png") if save_dir else None,
+            seed=seed,
         )
 
     # ---- 5. Per-SNR metric line chart ----
@@ -866,6 +964,7 @@ def main():
         results, _ = evaluate_per_snr(
             model, args.data_dir,
             artifact_type=args.artifact,
+            seed=seed,
         )
         variant_label = args.variant.upper().replace("_", " ")
         plot_snr_curves(

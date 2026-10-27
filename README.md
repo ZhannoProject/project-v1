@@ -134,7 +134,41 @@ data/EEGdenoisenet/data/
 └── EMG_all_epochs.npy    # 5598 EMG artifact epochs
 ```
 
-The data loader guarantees **zero leakage** between splits: clean EEG indices AND artifact indices are disjoint across train/val/test (epoch-level splitting with a fixed master seed).
+### Splits and leakage
+
+The data loader guarantees **epoch-level disjointness**: clean EEG indices AND artifact
+indices are partitioned across train/val/test, so no epoch is ever shared between two
+splits. This is structural rather than incidental — `_split_indices` slices a single
+seeded permutation into three contiguous ranges, which cannot overlap for any dataset
+size, ratio or seed. Enforced by
+`python -m unittest discover -s tests -p 'test_dataloader_leakage.py'`, which checks the
+partition across a sweep of sizes/ratios/seeds and then verifies at the level of epoch
+*contents* (not just indices) that no epoch is shared, for EOG, EMG and BOTH.
+
+Two limits on that guarantee are worth stating plainly rather than leaving for a reviewer
+to find:
+
+- **The split is epoch-level, not subject-level.** EEGdenoiseNet's 4514 clean EEG epochs
+  come from [52 participants](https://iopscience.iop.org/article/10.1088/1741-2552/ac2bf8)
+  — roughly 87 epochs each — and the released arrays carry no subject labels, so a random
+  epoch-level split puts essentially every subject in all three splits. Two-second epochs
+  from one subject and electrode share that subject's alpha rhythm and electrode
+  impedance, so test epochs are not independent of training epochs. Results here are
+  therefore *within-subject* denoising, and the same caveat applies to every published
+  result on this benchmark. A subject-level split is not possible from the distributed
+  files; cross-dataset evaluation (see `data/eeg_io.py`) is the available check on
+  generalisation.
+
+- **`master_seed` *is* the split.** The partition is a function of the seed, so two seeds
+  give different test sets that overlap heavily: around **85 %** of one seed's test epochs
+  were in another seed's train or val set. A model must therefore be evaluated at the seed
+  it was trained with. `eval.py` reads `master_seed` from the checkpoint and warns when a
+  run does not record one; pass `--master_seed` to state it explicitly. The same applies to
+  `deploy/make_testdata.py` (`--master_seed`, recorded in the `.npz`) and to
+  `python -m trainer.identify_loss`, which rebuilds each run's split from the seed that run
+  recorded. Overlaying per-SNR curves from runs with different seeds compares models on
+  different test splits; `--mode compare_snr` scores each run on its own split and labels
+  the figure when the seeds disagree.
 
 ## Training
 

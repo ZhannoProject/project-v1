@@ -168,8 +168,21 @@ def identify(run_dir: Path, data_dir: Path, device) -> dict:
     except Exception as e:
         return {**out, "status": "unloadable", "detail": str(e)[:160]}
 
-    _, val_loader, _ = build_dataloaders(data_dir=str(data_dir), artifact_type=artifact,
-                                         batch_size=32)
+    # The run's own seed and SNR range define its validation split; rebuilding
+    # with the defaults would score these weights on a split they were trained
+    # on, and the recomputed val_loss would then match no candidate loss.
+    run_cfg = {**(ck.get("run_config") or {}), **(hist.get("config") or {})}
+    seed = run_cfg.get("master_seed")
+    snr_range = run_cfg.get("snr_range_db")
+    if seed is None:
+        out["split_seed"] = "unrecorded"
+    else:
+        out["split_seed"] = int(seed)
+    _, val_loader, _ = build_dataloaders(
+        data_dir=str(data_dir), artifact_type=artifact, batch_size=32,
+        **({} if seed is None else {"master_seed": int(seed)}),
+        **({} if snr_range is None else {"snr_range_db": tuple(snr_range)}),
+    )
     losses, mets = evaluate(model, val_loader, device)
 
     out.update(artifact=artifact, best_epoch=best_epoch, checkpoint_epoch=ck.get("epoch"),
@@ -178,11 +191,15 @@ def identify(run_dir: Path, data_dir: Path, device) -> dict:
 
     # Guard 1: is best.pt the model this history describes?
     if abs(mets["rrmse_t"] - rec_rrmse_t) > METRIC_TOL:
+        unknown_seed = "" if seed is not None else (
+            " This run records no master_seed, so the split rebuilt here may also not be "
+            "the one it validated on — re-run with the seed recorded to tell the two apart.")
         return {**out, "status": "checkpoint-mismatch",
                 "detail": f"best.pt is at epoch {ck.get('epoch')} and scores RRMSE_t "
                           f"{mets['rrmse_t']:.4f}, but the history's best epoch "
-                          f"({best_epoch}) recorded {rec_rrmse_t:.4f} — the directory was "
-                          f"re-used, so the loss cannot be identified from these weights"}
+                          f"({best_epoch}) recorded {rec_rrmse_t:.4f} — most likely the "
+                          f"directory was re-used, so the loss cannot be identified from "
+                          f"these weights.{unknown_seed}"}
 
     # Guard 2: is the match unambiguous?
     winner, detail = pick(losses, target)
