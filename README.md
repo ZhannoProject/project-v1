@@ -151,7 +151,60 @@ data/EEGdenoisenet/data/
 └── EMG_all_epochs.npy    # 5598 EMG artifact epochs
 ```
 
-The data loader guarantees **zero leakage** between splits: clean EEG indices AND artifact indices are disjoint across train/val/test (epoch-level splitting with a fixed master seed).
+The data loader guarantees **zero leakage** between splits: clean EEG indices AND artifact indices are disjoint across train/val/test (epoch-level splitting with a fixed master seed). That is asserted rather than assumed — the three index sets are checked disjoint and exhaustive for all three pools.
+
+### What a BOTH sample's SNR means
+
+`snr_db` is the SNR each artifact was **asked for**, and in BOTH mode it is the
+mean of the two. It is not the SNR of the mixture: two artifacts each
+calibrated to *s* dB against the same clean signal put in twice the noise
+power, so the mixture lands at *s* − 10·log₁₀2, about 3 dB lower (measured:
+−3.00 dB on the val split). Every sample now also carries
+**`snr_mixture_db`**, the realised figure, measured off the signals
+themselves — that is the one to label an axis with. `snr_db` is still what is
+reported and what `deploy/make_testdata.py` writes into the Pi test sets,
+because every per-SNR table on disk is keyed on it.
+
+### Two sampling modes
+
+`sampling="legacy"` (the default) is what every run in `runs/` was trained and
+validated under. It has two quirks, both found by audit, both measured:
+
+- **In BOTH mode, val and test give the two artifacts the same SNR.** The
+  deterministic grid value depends on the sample index alone, and
+  `__getitem__` asks for it twice, so `snr_eog == snr_emg` on 100 % of
+  val/test samples — while training draws the two independently (they differ
+  by 3.0 dB on average, up to 8.4). Val and test therefore cover only the
+  slice of the training distribution where neither artifact dominates.
+- **The clean pool is truncated to the artifact pool, including for
+  training.** EOG and BOTH training use 2380 of 3159 clean epochs, although
+  the training loop draws its artifact per sample at random and with
+  replacement and so needs no 1:1 pairing.
+
+`sampling="balanced"` fixes both — the second artifact is offset half a grid
+away, the whole clean pool is used for training, and the grid is made to
+divide val/test exactly (EMG val was 677 epochs over 10 levels, so the lowest
+levels appeared once more than the highest).
+
+The default is the older behaviour **on purpose**: these choices decide what
+the validation set *is*, so flipping them would make every metric already in
+`runs/` describe a dataset that no longer exists. `legacy` is verified
+bit-identical to the pre-audit loader on all three artifact types and all
+three splits. A run under `balanced` is not comparable with one under
+`legacy`; the mode is recorded on the dataset.
+
+```bash
+python -m trainer --config configs/tcn_se_both.yaml      # legacy, as every run on disk
+```
+
+Neither mode changes the leak-free split, the seeding, or the artifact-switch
+probe, whose draws are bit-identical either way.
+
+Validation: `python -m unittest discover -s tests -p 'test_dataloader.py'`
+covers the split guarantee, both modes, the reported-versus-realised SNR, the
+per-worker augmentation streams, the probe's truncation, and the load-time
+checks (shape, epoch length, degenerate epochs, and that `np.load` no longer
+unpickles).
 
 ## Training
 

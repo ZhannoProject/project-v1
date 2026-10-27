@@ -4,6 +4,13 @@ EEG Denoising Dataset with leak-free train/val/test splits.
 Designed for the EEGdenoiseNet benchmark. Guarantees that no clean EEG
 epoch or artifact epoch is shared across splits, which is required for
 honest evaluation of denoising models.
+
+Two sampling modes live here, ``SAMPLING_MODES`` below.  ``"legacy"`` is the
+default and is what every run in ``runs/`` used; ``"balanced"`` fixes the two
+quirks that audit found in it.  The default is the older behaviour on purpose:
+these choices decide what the validation set *is*, so changing them silently
+would make every metric already on disk describe a dataset that no longer
+exists.
 """
 
 import os
@@ -12,6 +19,65 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+
+#: How a split draws its SNRs and how much of each pool it uses.
+#:
+#: ``"legacy"`` is what every run in ``runs/`` was trained and validated
+#: under, and it is the default for exactly that reason: changing the
+#: validation distribution would silently invalidate every number already on
+#: disk.  It has two known quirks, both measured and both documented at their
+#: sites: in BOTH mode the two artifacts land on the *same* grid point for
+#: val/test (see ``_pick_snr``), and the clean pool is truncated to the size
+#: of the artifact pool even for training, where the pairing is random anyway
+#: (see ``__init__``).
+#:
+#: ``"balanced"`` fixes both and makes the deterministic grid divide the split
+#: exactly.  It is a different dataset, so a run trained under it is not
+#: comparable with one trained under ``"legacy"``; the mode is recorded on the
+#: dataset so a caller can say which it used.
+SAMPLING_MODES = ("legacy", "balanced")
+
+#: An epoch whose RMS is below this is treated as degenerate.  Such an epoch
+#: cannot be mixed at any SNR -- ``artifact_gain`` would return 0 and the
+#: sample would silently come out as all zeros -- so it is refused at load
+#: time rather than trained on.  No epoch in EEGdenoiseNet is anywhere near
+#: it (the minima are 63.2, 18.8 and 564.1 for EEG, EOG and EMG).
+MIN_EPOCH_RMS = 1e-6
+
+
+def _load_epochs(data_dir: str, name: str, seq_len: Optional[int] = None) -> np.ndarray:
+    """
+    Load one ``<name>_all_epochs.npy`` and check it is what the mixer assumes.
+
+    ``allow_pickle`` is off: these are plain float arrays, and leaving it on
+    lets a crafted .npy execute code on load.
+
+    The three checks are here because each failure is otherwise reported far
+    away from its cause: a 1-D or 3-D array fails inside ``__getitem__``, an
+    epoch length that differs from the clean signal's fails as a broadcast
+    error one sample at a time, and a degenerate epoch fails as nothing at
+    all -- it trains, on a silently all-zero sample.
+    """
+    path = os.path.join(data_dir, f"{name}_all_epochs.npy")
+    arr = np.load(path, allow_pickle=False).astype(np.float32)
+
+    if arr.ndim != 2:
+        raise ValueError(f"{path}: expected (n_epochs, n_samples), got shape {arr.shape}")
+    if seq_len is not None and arr.shape[1] != seq_len:
+        raise ValueError(
+            f"{path}: epoch length {arr.shape[1]} does not match the clean "
+            f"signal's {seq_len}; they are added sample by sample"
+        )
+
+    rms = np.sqrt((arr.astype(np.float64) ** 2).mean(axis=1))
+    bad = int((rms < MIN_EPOCH_RMS).sum())
+    if bad:
+        raise ValueError(
+            f"{path}: {bad} epoch(s) have an RMS below {MIN_EPOCH_RMS:g} and "
+            f"cannot be mixed at any SNR (first at index {int(np.argmin(rms))})"
+        )
+    return arr
 
 
 # ============================================================
@@ -61,6 +127,23 @@ def mix_at_snr(clean: np.ndarray, artifact: np.ndarray, snr_db: float) -> np.nda
     return clean + scale_artifact(clean, artifact, snr_db)
 
 
+def realised_snr_db(clean: np.ndarray, noise: np.ndarray) -> float:
+    """
+    The SNR a mixture actually came out at, measured off the two signals.
+
+    The inverse of `scale_artifact`, and it exists because the two are not
+    always the same number.  Ask for one artifact at s dB and you get s dB.
+    Ask for *two*, each calibrated to s dB against the same clean signal, and
+    each contributes the same noise power, so the mixture holds twice as much
+    and lands at s - 10*log10(2), about 3 dB below what was requested.
+    """
+    rms_clean = float(np.sqrt(np.mean(np.asarray(clean, dtype=np.float64) ** 2)))
+    rms_noise = float(np.sqrt(np.mean(np.asarray(noise, dtype=np.float64) ** 2)))
+    if rms_noise < 1e-12 or rms_clean < 1e-12:
+        return float("inf") if rms_noise < 1e-12 else float("-inf")
+    return 20.0 * np.log10(rms_clean / rms_noise)
+
+
 # ============================================================
 # Dataset
 # ============================================================
@@ -78,11 +161,24 @@ class EEGDenoiseDataset(Dataset):
     - Training set uses random SNR sampling (data augmentation).
       Val/test use a deterministic SNR grid, so val_loss is comparable
       across epochs and runs.
+
+    What it does NOT guarantee under the default ``sampling="legacy"``, both
+    measured rather than assumed:
+
+    - In BOTH mode the two artifacts of a val/test sample are mixed at the
+      *same* SNR, while training draws the two independently.  See
+      ``_pick_snr``; ``sampling="balanced"`` offsets the second artifact.
+    - ``snr_db`` in BOTH mode is the mean of the two requested SNRs, which
+      is about 3 dB above the mixture's realised SNR.  ``snr_mixture_db``
+      carries the realised figure.
     """
 
     # Per-split offset for deriving sub-seeds from `master_seed`.
     # This keeps the three splits' RNG streams independent.
     SPLIT_OFFSET = {"train": 0, "val": 1, "test": 2}
+
+    #: Levels in the deterministic val/test SNR grid.
+    SNR_GRID_LEVELS = 10
 
     def __init__(
         self,
@@ -93,22 +189,24 @@ class EEGDenoiseDataset(Dataset):
         snr_range_db: Tuple[float, float] = (-7.0, 2.0),
         fixed_snr_db: Optional[float] = None,
         master_seed: int = 42,
+        sampling: str = "legacy",
     ):
         assert split in self.SPLIT_OFFSET, f"split must be one of {list(self.SPLIT_OFFSET)}"
         assert artifact_type in ("EOG", "EMG", "BOTH"), \
             "artifact_type must be 'EOG', 'EMG', or 'BOTH'"
         assert abs(sum(split_ratios) - 1.0) < 1e-6, "split_ratios must sum to 1.0"
+        assert sampling in SAMPLING_MODES, f"sampling must be one of {list(SAMPLING_MODES)}"
 
         self.split = split
         self.artifact_type = artifact_type
         self.snr_range_db = snr_range_db
         self.fixed_snr_db = fixed_snr_db
+        self.sampling = sampling
+        self.master_seed = int(master_seed)
 
         # ---- 1. Load raw numpy arrays ----
-        clean_all = np.load(
-            os.path.join(data_dir, "EEG_all_epochs.npy"),
-            allow_pickle=True,
-        ).astype(np.float32)
+        clean_all = _load_epochs(data_dir, "EEG")
+        seq_len = clean_all.shape[1]
 
         # Build disjoint clean indices for this split
         clean_idx = self._split_indices(len(clean_all), split_ratios, split, master_seed)
@@ -117,46 +215,46 @@ class EEGDenoiseDataset(Dataset):
 
         if artifact_type == "BOTH":
             # ---- BOTH mode: load EOG and EMG, pair each independently ----
-            eog_all = np.load(
-                os.path.join(data_dir, "EOG_all_epochs.npy"),
-                allow_pickle=True,
-            ).astype(np.float32)
-            emg_all = np.load(
-                os.path.join(data_dir, "EMG_all_epochs.npy"),
-                allow_pickle=True,
-            ).astype(np.float32)
+            eog_all = _load_epochs(data_dir, "EOG", seq_len)
+            emg_all = _load_epochs(data_dir, "EMG", seq_len)
 
             eog_idx = self._split_indices(len(eog_all), split_ratios, split, master_seed + 99)
             emg_idx = self._split_indices(len(emg_all), split_ratios, split, master_seed + 199)
 
-            n = min(len(clean_idx), len(eog_idx), len(emg_idx))
-            self.clean = clean_all[pair_rng.choice(clean_idx, n, replace=False)]
+            n = self._pair_count(len(clean_idx), len(eog_idx), len(emg_idx))
+            n_clean = self._clean_count(len(clean_idx), n)
+            self.clean = clean_all[pair_rng.choice(clean_idx, n_clean, replace=False)]
             self.artifact_eog = eog_all[pair_rng.choice(eog_idx, n, replace=False)]
             self.artifact_emg = emg_all[pair_rng.choice(emg_idx, n, replace=False)]
             self.artifact = None   # not used in BOTH mode
 
-            print(f"[Dataset] {split:>5s} | BOTH (EOG+EMG) | pairs={n}")
+            print(f"[Dataset] {split:>5s} | BOTH (EOG+EMG) | pairs={n_clean}"
+                  f"{'' if n_clean == n else f' (artifacts resampled from {n})'}"
+                  f"{'' if sampling == 'legacy' else ' | sampling=balanced'}")
         else:
             # ---- Single artifact mode (EOG or EMG) ----
-            art_all = np.load(
-                os.path.join(data_dir, f"{artifact_type}_all_epochs.npy"),
-                allow_pickle=True,
-            ).astype(np.float32)
+            art_all = _load_epochs(data_dir, artifact_type, seq_len)
 
             art_idx = self._split_indices(len(art_all), split_ratios, split, master_seed + 99)
 
-            n = min(len(clean_idx), len(art_idx))
-            self.clean = clean_all[pair_rng.choice(clean_idx, n, replace=False)]
+            n = self._pair_count(len(clean_idx), len(art_idx))
+            n_clean = self._clean_count(len(clean_idx), n)
+            self.clean = clean_all[pair_rng.choice(clean_idx, n_clean, replace=False)]
             self.artifact = art_all[pair_rng.choice(art_idx, n, replace=False)]
             self.artifact_eog = None  # not used in single mode
             self.artifact_emg = None
 
-            print(f"[Dataset] {split:>5s} | {artifact_type} | pairs={n}")
+            print(f"[Dataset] {split:>5s} | {artifact_type} | pairs={n_clean}"
+                  f"{'' if n_clean == n else f' (artifacts resampled from {n})'}"
+                  f"{'' if sampling == 'legacy' else ' | sampling=balanced'}")
 
         # ---- Per-sample RNG (only used for random SNR in training) ----
-        self.sample_rng = np.random.default_rng(
-            master_seed + self.SPLIT_OFFSET[split] + 7777
-        )
+        # Kept as an attribute, which is why ``worker_init_fn`` below exists:
+        # a DataLoader worker is a fork, so every worker would otherwise hold
+        # a copy of this generator at the same state and draw the same
+        # artifacts and SNRs as all the others.
+        self._sample_seed = master_seed + self.SPLIT_OFFSET[split] + 7777
+        self.sample_rng = np.random.default_rng(self._sample_seed)
 
         # ---- Deterministic SNR grid for val/test ----
         self.snr_grid = np.linspace(snr_range_db[0], snr_range_db[1], 10)
@@ -177,19 +275,78 @@ class EEGDenoiseDataset(Dataset):
             "test":  perm[n_tr + n_va:],
         }[split]
 
-    def _pick_snr(self, idx: int) -> float:
+    def _pair_count(self, *pool_sizes: int) -> int:
+        """
+        How many 1:1 (clean, artifact) pairs this split holds.
+
+        ``"balanced"`` additionally trims val/test to a whole number of SNR
+        grid cycles.  Without that, the deterministic grid does not divide the
+        split -- EMG val is 677 epochs over 10 levels -- so the lowest levels
+        appear once more than the highest and the split-averaged metric is
+        tilted very slightly towards low SNR.
+        """
+        n = min(pool_sizes)
+        if self.sampling == "balanced" and self.split != "train":
+            n -= n % self.SNR_GRID_LEVELS
+        return n
+
+    def _clean_count(self, clean_pool: int, n_pairs: int) -> int:
+        """
+        How many clean epochs this split actually uses.
+
+        Legacy uses ``n_pairs`` everywhere, which throws clean epochs away
+        whenever the artifact pool is the smaller one: EOG and BOTH training
+        drop 779 of 3159 clean epochs for no reason the training loop needs,
+        since it already draws its artifact for each sample at random and with
+        replacement.  ``"balanced"`` keeps the whole clean pool for training
+        and leaves val/test at 1:1, where the pairing has to be fixed.
+        """
+        if self.sampling == "balanced" and self.split == "train":
+            return clean_pool
+        return n_pairs
+
+    def reseed_for_worker(self, worker_id: int) -> None:
+        """
+        Give this copy of the dataset its own augmentation stream.
+
+        A DataLoader worker is a fork, so without this every worker inherits
+        ``sample_rng`` at the same state and draws the same artifact indices
+        and the same SNRs as every other worker -- the augmentation would
+        repeat once per worker instead of being independent.  Wired up by
+        ``worker_init_fn`` below; harmless at ``num_workers=0``, which never
+        calls it and therefore keeps the single-process stream exactly as it
+        has always been.
+        """
+        self.sample_rng = np.random.default_rng(
+            [self._sample_seed, 0x5EED, int(worker_id)]
+        )
+
+    def _pick_snr(self, idx: int, second: bool = False) -> float:
         """
         SNR selection priority:
           1. If `fixed_snr_db` was given, always use it (per-SNR evaluation).
           2. Training split -> uniform random from snr_range_db.
           3. Val/test split -> deterministic SNR from the precomputed grid,
              so every sample gets a reproducible SNR across runs.
+
+        ``second`` marks the second of the two artifacts in BOTH mode.  Under
+        ``"legacy"`` it changes nothing, and that is the quirk: the grid value
+        depends on ``idx`` alone, so both artifacts of a val/test sample are
+        mixed at *exactly* the same SNR, while training draws the two
+        independently (they differ by 3.0 dB on average and by up to 8.4).
+        Val and test therefore cover only the slice of the training
+        distribution where neither artifact dominates.  Under ``"balanced"``
+        the second artifact is offset half a grid away, so the pair spans the
+        range and each artifact's marginal stays uniform over the grid.
         """
         if self.fixed_snr_db is not None:
             return float(self.fixed_snr_db)
         if self.split == "train":
             return float(self.sample_rng.uniform(*self.snr_range_db))
-        return float(self.snr_grid[idx % len(self.snr_grid)])
+        n_levels = len(self.snr_grid)
+        if second and self.sampling == "balanced":
+            idx += n_levels // 2
+        return float(self.snr_grid[idx % n_levels])
 
     # -------- Dataset interface --------
     def __len__(self):
@@ -208,15 +365,21 @@ class EEGDenoiseDataset(Dataset):
                 eog = self.artifact_eog[idx]
                 emg = self.artifact_emg[idx]
 
-            # Each artifact gets its own independent SNR
+            # One SNR per artifact.  Independent on train; under "legacy"
+            # these are the *same* number on val/test -- see _pick_snr.
             snr_eog = self._pick_snr(idx)
-            snr_emg = self._pick_snr(idx)
+            snr_emg = self._pick_snr(idx, second=True)
 
             # Both contributions are calibrated against the original clean signal
             noisy = clean + scale_artifact(clean, eog, snr_eog) \
                          + scale_artifact(clean, emg, snr_emg)
 
-            # Report the average SNR for logging purposes
+            # The mean of the two per-artifact SNRs, which is NOT the SNR of
+            # the mixture: two artifacts each calibrated to s dB against the
+            # same clean signal put in twice the noise power, so the mixture
+            # sits about 3 dB below s.  Kept as the reported value because
+            # every per-SNR table and test set on disk is keyed on it;
+            # ``snr_mixture_db`` below is the realised figure.
             snr_db = (snr_eog + snr_emg) / 2.0
         else:
             # ---- Single artifact mode ----
@@ -237,7 +400,14 @@ class EEGDenoiseDataset(Dataset):
             "noisy":  torch.tensor(noisy / sigma).unsqueeze(0),   # (1, T)
             "clean":  torch.tensor(clean / sigma).unsqueeze(0),   # (1, T)
             "sigma":  torch.tensor(sigma, dtype=torch.float32),
+            # What the mix was *asked* for, per artifact.  In BOTH mode the
+            # mean of the two, which is not the mixture's SNR (see above).
             "snr_db": torch.tensor(snr_db, dtype=torch.float32),
+            # What the mix actually realised, measured off the signals
+            # themselves.  Equal to snr_db for a single artifact; about 3 dB
+            # below it for BOTH.  This is the one to label an axis with.
+            "snr_mixture_db": torch.tensor(
+                realised_snr_db(clean, noisy - clean), dtype=torch.float32),
         }
 
 
@@ -279,7 +449,9 @@ class ArtifactSwitchDataset(Dataset):
 
     Every draw is made once in ``__init__`` and stored, so ``__getitem__`` is
     a pure function of the index: shuffling, re-batching or scoring a subset
-    cannot change what a given sample contains.
+    cannot change what a given sample contains.  ``n_epochs`` cuts the probe
+    after those draws are made, so a short probe is the first n epochs of the
+    full one and the two can be compared.
 
     Parameters
     ----------
@@ -360,12 +532,9 @@ class ArtifactSwitchDataset(Dataset):
         self.control = bool(control)
 
         # ---- 1. Same leak-free pools as EEGDenoiseDataset(BOTH) ----
-        clean_all = np.load(os.path.join(data_dir, "EEG_all_epochs.npy"),
-                            allow_pickle=True).astype(np.float32)
-        eog_all = np.load(os.path.join(data_dir, "EOG_all_epochs.npy"),
-                          allow_pickle=True).astype(np.float32)
-        emg_all = np.load(os.path.join(data_dir, "EMG_all_epochs.npy"),
-                          allow_pickle=True).astype(np.float32)
+        clean_all = _load_epochs(data_dir, "EEG")
+        eog_all = _load_epochs(data_dir, "EOG", clean_all.shape[1])
+        emg_all = _load_epochs(data_dir, "EMG", clean_all.shape[1])
 
         split_fn = EEGDenoiseDataset._split_indices
         clean_idx = split_fn(len(clean_all), split_ratios, split, master_seed)
@@ -377,13 +546,20 @@ class ArtifactSwitchDataset(Dataset):
         # seed: probe_seed 1 is not master_seed 43's anything.
         rng = np.random.default_rng([master_seed, 20260926, self.probe_seed])
 
-        n = min(len(clean_idx), len(eog_idx), len(emg_idx))
-        if n_epochs is not None:
-            n = min(n, int(n_epochs))
+        # Every draw below is made at the *full* split size and only then cut
+        # down to ``n_epochs``, so a short probe is the first n epochs of the
+        # long one rather than an unrelated draw.  It used to shrink ``n``
+        # first, which changed how many numbers each ``choice`` consumed and
+        # so changed everything downstream of it: a 100-epoch probe and the
+        # full 510-epoch probe at the same seed shared no clean epoch and no
+        # switch index.  Direction balance is restored afterwards, at the cut
+        # size, because it is the last thing drawn (see step 5).
+        n_full = min(len(clean_idx), len(eog_idx), len(emg_idx))
+        n = n_full if n_epochs is None else min(n_full, int(n_epochs))
 
-        eog_pick = rng.choice(eog_idx, n, replace=False)
-        emg_pick = rng.choice(emg_idx, n, replace=False)
-        self.clean = clean_all[rng.choice(clean_idx, n, replace=False)]
+        eog_pick = rng.choice(eog_idx, n_full, replace=False)
+        emg_pick = rng.choice(emg_idx, n_full, replace=False)
+        self.clean = clean_all[rng.choice(clean_idx, n_full, replace=False)]
         self.eog = eog_all[eog_pick]
         self.emg = emg_all[emg_pick]
 
@@ -394,9 +570,9 @@ class ArtifactSwitchDataset(Dataset):
         # the picks are without replacement, so it is guaranteed different,
         # and a control that spliced the very same epoch back in would have no
         # discontinuity to control for.
-        roll = (np.arange(n) + 1) % n
-        eog_alt = rng.choice(eog_idx, n, replace=False)
-        emg_alt = rng.choice(emg_idx, n, replace=False)
+        roll = (np.arange(n_full) + 1) % n_full
+        eog_alt = rng.choice(eog_idx, n_full, replace=False)
+        emg_alt = rng.choice(emg_idx, n_full, replace=False)
         self.eog_alt = eog_all[np.where(eog_alt == eog_pick, eog_pick[roll], eog_alt)]
         self.emg_alt = emg_all[np.where(emg_alt == emg_pick, emg_pick[roll], emg_alt)]
 
@@ -413,18 +589,29 @@ class ArtifactSwitchDataset(Dataset):
                 f"switch_range {switch_range} leaves no room for a "
                 f"{self.ramp_samples}-sample ramp in a {T}-sample epoch"
             )
-        self.switch_idx = rng.integers(lo, hi + 1, size=n)
+        self.switch_idx = rng.integers(lo, hi + 1, size=n_full)
         self.switch_bounds = (lo, hi)
 
         # ---- 4. Independent SNR per artifact type ----
         if fixed_snr_db is not None:
-            self.snr_eog = np.full(n, float(fixed_snr_db))
-            self.snr_emg = np.full(n, float(fixed_snr_db))
+            self.snr_eog = np.full(n_full, float(fixed_snr_db))
+            self.snr_emg = np.full(n_full, float(fixed_snr_db))
         else:
-            self.snr_eog = rng.uniform(snr_range_db[0], snr_range_db[1], size=n)
-            self.snr_emg = rng.uniform(snr_range_db[0], snr_range_db[1], size=n)
+            self.snr_eog = rng.uniform(snr_range_db[0], snr_range_db[1], size=n_full)
+            self.snr_emg = rng.uniform(snr_range_db[0], snr_range_db[1], size=n_full)
+
+        # ---- 4b. Cut to n_epochs, now that every draw above has been made ----
+        if n < n_full:
+            self.clean, self.eog, self.emg = self.clean[:n], self.eog[:n], self.emg[:n]
+            self.eog_alt, self.emg_alt = self.eog_alt[:n], self.emg_alt[:n]
+            self.switch_idx = self.switch_idx[:n]
+            self.snr_eog, self.snr_emg = self.snr_eog[:n], self.snr_emg[:n]
 
         # ---- 5. Direction, balanced exactly rather than in expectation ----
+        # Drawn at the cut size, and last, so that a truncated probe is still
+        # exactly half of each direction -- slicing a balanced array of n_full
+        # would only be balanced on average.  Nothing is drawn after this, so
+        # taking a different count of random numbers here changes nothing else.
         if order == "both":
             flags = np.zeros(n, dtype=bool)
             flags[: n // 2] = True
@@ -543,6 +730,23 @@ def build_switch_probes(
 # ============================================================
 # DataLoader builder
 # ============================================================
+def worker_init_fn(worker_id: int) -> None:
+    """
+    Give each DataLoader worker its own augmentation stream.
+
+    A worker is a fork of the parent, so it inherits ``sample_rng`` at
+    whatever state the parent held: with four workers and no hook, all four
+    draw the same artifact indices and the same SNRs, and the training set's
+    augmentation silently repeats four times over instead of being
+    independent.  Pass this as ``worker_init_fn`` to any loader built over
+    ``EEGDenoiseDataset`` with ``num_workers > 0``.
+    """
+    info = torch.utils.data.get_worker_info()
+    ds = getattr(info, "dataset", None)
+    if hasattr(ds, "reseed_for_worker"):
+        ds.reseed_for_worker(worker_id)
+
+
 def build_dataloaders(
     data_dir: str,
     artifact_type: str = "EMG",
@@ -550,6 +754,8 @@ def build_dataloaders(
     split_ratios: Tuple[float, float, float] = (0.7, 0.15, 0.15),
     snr_range_db: Tuple[float, float] = (-7.0, 2.0),
     master_seed: int = 42,
+    sampling: str = "legacy",
+    num_workers: int = 0,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build train, val, and test DataLoaders that share the same master seed
@@ -559,6 +765,12 @@ def build_dataloaders(
     ``master_seed``, not from torch's global RNG: batch order is then a
     function of the seed alone and is identical across model variants,
     regardless of how many random numbers their construction consumed.
+
+    ``num_workers`` defaults to 0, which is what every run on disk used and
+    the only setting that is bit-reproducible: with workers the augmentation
+    stream is split per worker (see ``worker_init_fn``), so the same seed
+    gives the same *distribution* but not the same samples in the same order.
+    ``sampling`` is passed through to the dataset; see ``SAMPLING_MODES``.
     """
     # Enable pinned memory for faster host-to-device transfer when on GPU/MPS
     pin = torch.cuda.is_available() or torch.backends.mps.is_available()
@@ -571,6 +783,7 @@ def build_dataloaders(
             split_ratios=split_ratios,
             snr_range_db=snr_range_db,
             master_seed=master_seed,
+            sampling=sampling,
         )
         train = split == "train"
         return DataLoader(
@@ -579,6 +792,8 @@ def build_dataloaders(
             shuffle=train,               # only training set is shuffled
             generator=torch.Generator().manual_seed(master_seed) if train else None,
             pin_memory=pin,
+            num_workers=num_workers,
+            worker_init_fn=worker_init_fn if num_workers else None,
         )
 
     train_loader = make("train")
@@ -597,17 +812,32 @@ def build_dataloaders(
 # Entry point: quick smoke test
 # ============================================================
 if __name__ == "__main__":
-    DATA_DIR = "/Users/zhanlungo/Desktop/Mphil Conference project/project v1/data/EEGdenoisenet/data/"
+    import argparse
+
+    # Relative to the project root, which is this file's parent's parent, so
+    # the smoke test runs from anywhere.  It used to hard-code an absolute
+    # path to a directory that no longer exists, which made `python
+    # data/Dataloader.py` fail before it reached any of the code below.
+    default_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "data", "EEGdenoisenet", "data",
+    )
+    ap = argparse.ArgumentParser(description="Dataloader smoke test")
+    ap.add_argument("--data_dir", default=default_dir)
+    ap.add_argument("--artifact", default="EMG", choices=["EOG", "EMG", "BOTH"])
+    ap.add_argument("--sampling", default="legacy", choices=list(SAMPLING_MODES))
+    args = ap.parse_args()
 
     # Build the three loaders
     train_loader, val_loader, test_loader = build_dataloaders(
-        data_dir=DATA_DIR,
-        artifact_type="EMG",
+        data_dir=args.data_dir,
+        artifact_type=args.artifact,
         batch_size=32,
+        sampling=args.sampling,
     )
 
     # Inspect a single training batch to confirm shapes and ranges
     batch = next(iter(train_loader))
     print("\n[Smoke test] First training batch:")
     for k, v in batch.items():
-        print(f"  {k:8s} shape={tuple(v.shape)}  min={v.min():.2f}  max={v.max():.2f}")
+        print(f"  {k:15s} shape={tuple(v.shape)}  min={v.min():.2f}  max={v.max():.2f}")
