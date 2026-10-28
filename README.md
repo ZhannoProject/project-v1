@@ -388,9 +388,9 @@ Failures show an alert pointing at `~/Library/Logs/eeg-training-gui.log`.
 The bundle is git-ignored. Closing the window stops the server (and asks
 first if a training run is still going).
 
-The page has eight tabs: **YAML** (the text a save would write), **Train**,
-**Evaluate**, **Deploy**, **Lookahead**, **Receptive field**, **Params** and
-**Runs**. The Evaluate and Deploy tabs borrow the Runs table as a run picker,
+The page has nine tabs: **YAML** (the text a save would write), **Train**,
+**Evaluate**, **Deploy**, **Lookahead**, **Receptive field**, **KD audit**,
+**Params** and **Runs**. The Evaluate and Deploy tabs borrow the Runs table as a run picker,
 so all three share one renderer.
 
 - **Form ↔ YAML.** Every key of `trainer/__main__.py` is a field, grouped as in
@@ -1282,7 +1282,79 @@ the clean signal), so `runs/tcn_mla_eog_kd/best.pt` is a drop-in for `eval.py`
 and `deploy/export_onnx.py`. Its `history.json` additionally records the
 per-epoch `kd_task` / `kd_output` / `kd_feature` terms and the teacher's own
 validation metrics under `teacher`. The ONNX exporter refuses `*_bi`
-checkpoints, since they are not causal.
+checkpoints, since they are not causal. It also records the recipe —
+`kd_alpha`, `kd_feature_weight`, `kd_feature_layers`, `kd_output_loss`,
+`kd_feature_loss`, `init_from_teacher` — which runs trained before 28 October
+2026 did not: the history allow-list kept `teacher_ckpt` and dropped the rest,
+so `runs/tcn_se_both_kd_s67` says it was distilled and from whom, and nothing
+about how.
+
+#### KD audit tab
+
+The project's one distilled run is **worse** than the plain student at the
+same seed and width — RRMSE_t 0.7161 against 0.7110. That has two
+explanations and they have to be separated before either is reported: the KD
+was broken, or it worked and distilling from this teacher costs accuracy. The
+Evaluate tab cannot tell them apart, because both look like a student with a
+worse number. The **KD audit** tab asks the two questions in order. Nothing
+in it trains; it reads `runs/` and makes a few forward passes over the
+validation split.
+
+**Was it wired correctly?** Six invariants, each shown with its evidence:
+
+| check | on `tcn_se_both_kd_s67` |
+|---|---|
+| teacher loads under `strict=True` | pass |
+| teacher frozen and in `eval()` | pass |
+| teacher is the non-causal twin | pass — `tcn_se_bi` |
+| teacher reproduces its run's recorded metrics | pass — 0.5928 to 7.5e-09, whole split |
+| student and teacher share a split | pass — seed 67 both |
+| student's `best.pt` selected against the clean signal | pass — epoch 152, the argmin |
+
+The reproduce check runs the whole validation split with no batch cap: the
+recorded figure is a whole-split average, and a prefix measures sampling
+rather than agreement — three batches of sixteen read 0.6018 against the
+recorded 0.5928, which looks exactly like a mismatch and is not one. A check
+that cannot run (no teacher recorded, no data) is shown as *skipped*, not as
+passing.
+
+**If it was, where did the accuracy go?** Expand each student's error about
+the teacher:
+
+```
+||S−G||² = ||S−T||² + ||T−G||² + 2⟨S−T, T−G⟩
+```
+
+`||T−G||²` is the teacher's own error and the same constant for every
+student, so a difference between two students lives entirely in the other two
+terms. The tab finds the plain run at the same variant, seed and width
+automatically and puts the two side by side:
+
+| | ‖S−T‖² | ‖T−G‖² | 2⟨S−T,T−G⟩ | ‖S−G‖² |
+|---|---|---|---|---|
+| `tcn_se_both_s67_h64` (no KD) | 0.037836 | 0.079448 | −0.003476 | 0.113809 |
+| `tcn_se_both_kd_s67` (KD) | 0.036861 | 0.079448 | −0.000690 | 0.115619 |
+
+KD cut ‖S−T‖² by 0.00098 — it really did move the student onto the teacher —
+and the cross term rose by 0.00279 while it did. The cross term is negative
+for the plain student: its deviation from the teacher partly *cancels* the
+teacher's own error. The teacher is non-causal, so `T−G` is largely the part
+of its behaviour that depends on future context, which a causal student
+cannot reproduce; pulling the student onto the teacher gives the cancellation
+up and imports that error as noise. So the negative result is a finding, not
+a failed experiment — on one seed, and with a recipe the run did not record.
+
+Each row reports the residual between the three terms and the directly
+measured ‖S−G‖², so a reader can see the identity close (~2e-9 here).
+
+Not yet in the tab: the positive controls — distilling from the ground truth
+itself, and the GT-scarce setting — need a teacher that is not a checkpoint,
+which the trainer does not support yet.
+
+Validation: `python -m unittest discover -s tests -p 'test_kd_tab.py'` covers
+the recipe now being recorded, the control-run matching, the identity closing
+on synthetic models, the read-off's three verdicts, and — when `runs/` and
+the data are present — all six checks on the real run.
 
 ## Evaluation
 
