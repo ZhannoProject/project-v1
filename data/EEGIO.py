@@ -504,6 +504,8 @@ def write_synthetic_recording(
     n_soft: int = 2,
     corrupt: Sequence[Tuple[float, float]] = (),
     seed: int = 0,
+    amplitude: float = 30.0,
+    drift: float = 1.0,
 ) -> Recording:
     """
     Write a fake subject in EEG-IO's exact on-disk format and return it.
@@ -513,14 +515,22 @@ def write_synthetic_recording(
     exists so that the reader, the windowing, the masks and the corrupt-interval
     handling can be tested, and so that someone without the download can see
     the pipeline run end to end.
+
+    ``amplitude`` and ``drift`` set how far the bumps stand out of the
+    background.  The defaults give a drift-dominated recording, which is what
+    a reader test wants -- nothing about parsing a CSV should depend on the
+    signal being clean.  Anything that detects blinks wants the opposite, and
+    ``drift=0`` with a large amplitude gives a recording where the bumps are
+    the only large excursions.
     """
     os.makedirs(data_dir, exist_ok=True)
     rng = np.random.default_rng(seed)
     n = int(duration_s * EEGIO_FS)
     t = np.arange(n) / EEGIO_FS
 
-    sig = np.cumsum(rng.normal(0.0, 1.0, size=(2, n)), axis=1)      # drifting noise
-    sig += rng.normal(0.0, 2.0, size=(2, n))
+    sig = rng.normal(0.0, 2.0, size=(2, n))
+    if drift:
+        sig = sig + drift * np.cumsum(rng.normal(0.0, 1.0, size=(2, n)), axis=1)
 
     edge = 1.5
     times = np.sort(rng.uniform(edge, max(duration_s - edge, edge + 1e-3),
@@ -531,7 +541,8 @@ def write_synthetic_recording(
         c = int(round(ts * EEGIO_FS))
         half = int(0.15 * EEGIO_FS)
         a, b = max(c - half, 0), min(c + half, n)
-        bump = np.hanning(b - a) * (30.0 if code != SOFT_BLINK_CODE else 10.0)
+        scale = amplitude if code != SOFT_BLINK_CODE else amplitude / 3.0
+        bump = np.hanning(b - a) * scale
         sig[:, a:b] += bump
 
     with open(os.path.join(data_dir, f"{subject}_data.csv"), "w") as fh:

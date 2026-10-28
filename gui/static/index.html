@@ -194,6 +194,17 @@
   /* KD audit. .hint elsewhere is scoped inside .efield, and there is no
      counterpart to .ok for a failed check, so both are given here rather
      than widened globally and changing three other tabs. */
+  #tab-eegio .hint { font-size: 11px; color: var(--muted); max-width: 86ch; line-height: 1.5; }
+  #tab-eegio .bad { color: var(--err); }
+  #tab-eegio h3 { font-size: 12px; font-weight: 600; margin: 14px 0 6px; }
+  #tab-eegio table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  #tab-eegio th { text-align: left; font-weight: 600; color: var(--muted); padding: 4px 8px 4px 0; }
+  #tab-eegio td { padding: 3px 8px 3px 0; border-top: 1px solid var(--border); }
+  #tab-eegio #eegioRuns { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+  #tab-eegio details { width: 100%; }
+  #tab-eegio summary { cursor: pointer; font-size: 11px; }
+  #tab-eegio .eegio-more { display: flex; flex-wrap: wrap; gap: 4px 12px;
+                           max-height: 150px; overflow-y: auto; margin-top: 4px; }
   #tab-kd .hint { font-size: 11px; color: var(--muted); max-width: 72ch; line-height: 1.5; }
   #tab-kd .hint.bad, #tab-kd .bad { color: var(--err); }
   #tab-kd h3 { font-size: 12px; font-weight: 600; margin: 14px 0 6px; }
@@ -363,6 +374,7 @@
       <button data-tab="deploy" title="Export a checkpoint to ONNX and measure what it costs to run: per-hop latency, deadline misses and the duty-cycle sweep — on this machine, or on a Raspberry Pi 5 over SSH">Deploy</button>
       <button data-tab="lookahead" title="What a millisecond of future context is worth: the ladder between the causal SE baseline and its unbounded twin, priced in output latency">Lookahead</button>
       <button data-tab="rf" title="How far back the TCN needs to look: one run per rung of the dilation ladder, from 5 samples to 509 — the span attention gets, without the attention">Receptive field</button>
+      <button data-tab="eegio" title="Run the models on real EEG-IO recordings, where there is no clean signal: blink suppression, background fidelity, residual detections and how far before a blink each model starts correcting">EEG-IO test</button>
       <button data-tab="kd" title="Audit a distilled run: the six invariants that have to hold for its number to mean anything, and the decomposition that says where its accuracy went">KD audit</button>
       <button data-tab="params" title="Parameter count of the model the form describes, broken down by stage">Params</button>
       <button data-tab="runs">Runs</button>
@@ -703,6 +715,28 @@
       <pre id="rfLog"></pre>
     </div>
 
+    <div class="tab" id="tab-eegio">
+      <div class="row">
+        <span class="muted" id="eegioData">…</span>
+      </div>
+      <div class="row">
+        <label class="muted">models</label>
+        <span id="eegioRuns"></span>
+      </div>
+      <div class="row">
+        <label class="muted" for="eegioN">subjects</label>
+        <input id="eegioN" type="number" min="1" max="20" value="4" style="width:60px">
+        <label class="muted" for="eegioHop">hop</label>
+        <input id="eegioHop" type="number" min="1" max="512" value="32" style="width:70px">
+        <label class="chk"><input type="checkbox" id="eegioZero"> zero-phase filter (non-causal control)</label>
+        <label class="chk"><input type="checkbox" id="eegioSoft"> count soft blinks</label>
+        <button id="btnEegio" class="primary">Run</button>
+        <span class="grow"></span>
+        <span class="muted" id="eegioNote"></span>
+      </div>
+      <div id="eegioBody"></div>
+    </div>
+
     <div class="tab" id="tab-kd">
       <div class="row">
         <label class="muted" for="kdRun">distilled run</label>
@@ -793,6 +827,7 @@
     jobs: {}, jobId: null, jobList: [], runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0, params: { a: null, b: null, error: null }, paramCmp: "", evalRows: [], evalRun: null, pickView: null, pickFor: "eval", evalJob: { running: false, next: 0, artifacts: [] },
     la: { meta: null, data: null, error: null, artifact: "BOTH" },
     kd: { meta: null, run: null, checks: null, decomp: null, busy: false, error: null },
+    eegio: { meta: null, picked: [], out: null, busy: false, error: null },
     pi: { target: "host", model: null, testdata: null, running: false, next: 0,
           returncode: null, parsed: {}, steps: [], step: 0, formTouched: false, seenTraces: [],
           loaded: { latency: null, duty: null } } };
@@ -3708,7 +3743,144 @@
     if (b.dataset.tab === "params") refreshParams(true);
     if (b.dataset.tab === "lookahead" && !state.la.data) refreshLookahead(true);
     if (b.dataset.tab === "kd" && !state.kd.meta) refreshKd();
+    if (b.dataset.tab === "eegio" && !state.eegio.meta) refreshEegio();
   }));
+  // ------------------------------------------------------------- EEG-IO test
+  // The models on real recordings, where there is no clean signal and so no
+  // RRMSE. Two numbers that have to be read together -- how much blink the
+  // model removed, and how much background it left alone -- plus how far
+  // before a blink each one starts correcting, which is the lookahead
+  // ladder's claim meeting data it was not trained on.
+  const EEGIO_COLS = [
+    ["suppression_db", "suppression dB", "blink-interval power removed; higher is more"],
+    ["fidelity_db", "fidelity dB", "background left alone; higher is more faithful"],
+    ["residual_rate", "residual", "blinks the detector still finds; lower is better"],
+    ["onset_leakage_ms", "lead ms", "correction starts this long before the signal moves"],
+  ];
+
+  async function refreshEegio() {
+    try { state.eegio.meta = await api("/api/eegio/meta"); state.eegio.error = null; }
+    catch (e) { state.eegio.error = e.message; }
+    const m = state.eegio.meta;
+    if (m && !state.eegio.picked.length) state.eegio.picked = m.suggested.filter(
+      n => m.runs.some(r => r.name === n));
+    renderEegio();
+  }
+
+  async function runEegio() {
+    if (!state.eegio.picked.length) return;
+    state.eegio.busy = true; state.eegio.error = null; renderEegio();
+    try {
+      state.eegio.out = await api("/api/eegio/evaluate", {
+        runs: state.eegio.picked,
+        n_subjects: Number($("#eegioN").value) || 4,
+        hop: Number($("#eegioHop").value) || 32,
+        zero_phase: $("#eegioZero").checked,
+        include_soft: $("#eegioSoft").checked,
+      });
+    } catch (e) { state.eegio.error = e.message; state.eegio.out = null; }
+    state.eegio.busy = false; renderEegio();
+  }
+
+  function renderEegio() {
+    const m = state.eegio.meta;
+    if (!$("#eegioData")) return;
+    const ds = m && m.dataset;
+    $("#eegioData").innerHTML = !ds ? "…" : ds.present
+      ? `${ds.n} subject(s) in <code>${ds.dir}</code> at ${ds.fs} Hz · ${m.band_note}`
+      : `<span class="bad">EEG-IO is not on disk.</span> It is not redistributable;
+         request it from <a href="${ds.url}" target="_blank">${ds.url}</a> and unpack it
+         into <code>${ds.dir}</code> as <code>&lt;subject&gt;_data.csv</code> /
+         <code>&lt;subject&gt;_labels.csv</code> pairs.`;
+
+    // Model picker: the badge says what each run may read ahead, because a
+    // _bi twin is a legitimate offline control here and is refused on Deploy.
+    // 82 finished runs would bury the results under their own picker, so the
+    // three this tab exists to compare (and anything already ticked) are the
+    // list, and the rest is one disclosure away.
+    const runs = (m && m.runs) || [];
+    const box = r => {
+      const badge = r.bidirectional ? '<b class="bad">bi</b>'
+        : r.lookahead ? `<b>la${r.lookahead}</b>` : "<span class='muted'>causal</span>";
+      const on = state.eegio.picked.includes(r.name);
+      return `<label class="chk" title="${r.variant} · seed ${r.master_seed}">
+        <input type="checkbox" data-eegio-run="${r.name}" ${on ? "checked" : ""}>
+        ${r.name} ${badge}</label>`;
+    };
+    const front = runs.filter(r => r.suggested || state.eegio.picked.includes(r.name));
+    const rest = runs.filter(r => !front.includes(r));
+    $("#eegioRuns").innerHTML = front.map(box).join(" ")
+      + (rest.length ? `<details><summary class="muted">${rest.length} other finished
+         run(s)</summary><div class="eegio-more">${rest.map(box).join(" ")}</div></details>`
+         : "");
+
+    $("#btnEegio").disabled = state.eegio.busy || !ds || !ds.present || !state.eegio.picked.length;
+    $("#eegioNote").textContent = state.eegio.error ? state.eegio.error
+      : state.eegio.busy ? "filtering, detecting and running the models…"
+      : state.eegio.picked.length ? `${state.eegio.picked[0]} is the baseline` : "pick a model";
+
+    const out = state.eegio.out;
+    if (!out) { $("#eegioBody").innerHTML = ""; return; }
+    const c = out.causality;
+    const num = v => (v == null || !isFinite(v)) ? "—" : v.toFixed(2);
+
+    $("#eegioBody").innerHTML = `
+      <p class="hint">Preprocessing ${$("#eegioZero").checked
+        ? '<b class="bad">zero-phase — the non-causal control; it cannot run online</b>'
+        : "causal (sosfilt, one pass forwards)"}:
+        a perturbation moved the filtered signal <b>${c.past_diff.toExponential(1)}</b>
+        backwards. Every number below is relative to the preprocessed signal that went
+        into the model, never the raw recording.</p>
+      <h3>Per model, median over ${out.subjects.length} subject(s)</h3>
+      <table>
+        <tr><th>run</th>${EEGIO_COLS.map(([, l, t]) =>
+          `<th class="num" title="${t}">${l}</th>`).join("")}<th class="num">blinks kept</th></tr>
+        ${out.results.map(r => `<tr>
+          <td>${r.run}${r.run === out.baseline ? " <span class='muted'>(baseline)</span>" : ""}</td>
+          ${EEGIO_COLS.map(([k]) => `<td class="num">${num(r.summary[k].median)}</td>`).join("")}
+          <td class="num muted">${r.rows.reduce((a, x) => a + x.n_kept, 0)}</td></tr>`).join("")}
+      </table>
+      ${!out.tests.length ? "" : `
+        <h3>Paired by subject (Wilcoxon signed-rank)</h3>
+        <p class="hint">Paired because subjects differ far more than models do —
+           electrode placement, how hard someone blinks — and that spread would swamp
+           the comparison if the groups were pooled.</p>
+        <table>
+          <tr><th>comparison</th><th>metric</th><th class="num">median Δ</th>
+              <th class="num">better on</th><th class="num">p</th></tr>
+          ${out.tests.map(t => `<tr><td>${t.b} vs ${t.a}</td><td>${t.metric}</td>
+            <td class="num">${t.median_diff >= 0 ? "+" : ""}${num(t.median_diff)}</td>
+            <td class="num">${t.b_better_on}/${t.n_pairs}</td>
+            <td class="num">${t.p_value != null && isFinite(t.p_value) ? t.p_value.toFixed(4)
+              : `<span class="muted" title="${t.note || ""}">—</span>`}</td></tr>`).join("")}
+        </table>`}
+      <h3>Risk check: are real blinks as strong as the training mixtures?</h3>
+      <table>
+        <tr><th>subject</th><th class="num">blinks</th><th class="num">est. SNR dB</th>
+            <th class="num">inside ${out.results[0].rows[0]
+              ? out.results[0].rows[0].risk.train_range_db.join(" … ") : ""} dB</th>
+            <th class="num">corrupt</th></tr>
+        ${out.results[0].rows.map(r => `<tr><td>${r.subject}</td>
+          <td class="num">${r.n_kept}</td><td class="num">${num(r.risk.median_db)}</td>
+          <td class="num">${num(100 * r.risk.inside_train_range)}%</td>
+          <td class="num muted">${num(100 * r.corrupt_fraction)}%</td></tr>`).join("")}
+      </table>
+      <p class="hint">The estimate treats the background between blinks as the brain
+         signal and the excess power inside a blink as the artifact, so it assumes the
+         two add incoherently. It is a range check, not a measurement: the question is
+         only whether real blinks land anywhere near what the models were trained on.</p>`;
+  }
+
+  $("#eegioRuns").addEventListener("change", e => {
+    const name = e.target.dataset && e.target.dataset.eegioRun;
+    if (!name) return;
+    state.eegio.picked = e.target.checked
+      ? [...state.eegio.picked, name]
+      : state.eegio.picked.filter(n => n !== name);
+    renderEegio();
+  });
+  $("#btnEegio").addEventListener("click", runEegio);
+
   // ---------------------------------------------------------------- KD audit
   // Two questions in order: was the distillation wired correctly, and if it
   // was, where did the accuracy go. The second is only worth asking once the

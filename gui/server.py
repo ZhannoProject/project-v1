@@ -29,6 +29,11 @@ Local HTTP server behind the training GUI (stdlib only).
     GET  /api/pi/meta            exports, test sets and latency traces on disk
     POST /api/pi/testdata        {model, n} → cut the test set matching that model's
                                  split, and the refreshed list
+    GET  /api/eegio/meta         EEG-IO recordings on disk, and the runs worth
+                                 comparing on them
+    POST /api/eegio/evaluate     {runs, n_subjects, ...} → suppression, fidelity,
+                                 residual detections and onset lead per subject,
+                                 paired by subject between models
     GET  /api/kd/meta            distilled runs, their teachers and their controls
     GET  /api/kd/checks?student=X    the six KD invariants, with their evidence
     POST /api/kd/decompose       {teacher, students, ...} → ||S-G||^2 split into
@@ -69,7 +74,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from gui import config_io, kd, lookahead, params, pi, rfsweep
+from gui import config_io, eegio_tab, kd, lookahead, params, pi, rfsweep
 # The one place the "seed 42 keeps the bare name" rule is written down; the
 # run titles have to derive the same path the trainer will.
 from trainer.__main__ import DEFAULT_MASTER_SEED
@@ -1075,6 +1080,8 @@ class Handler(BaseHTTPRequestHandler):
                     q.get("variant", "tcn"), q.get("artifact", "BOTH"),
                     int(q["seed"]) if q.get("seed") else None,
                     int(q.get("hidden_channels") or rfsweep.DEFAULT_HIDDEN))})
+            if url.path == "/api/eegio/meta":
+                return self._json(eegio_tab.meta(q.get("data_dir")))
             if url.path == "/api/kd/meta":
                 return self._json(kd.meta())
             if url.path == "/api/kd/checks":
@@ -1181,6 +1188,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({**EVAL_JOB.status(0), "save_dir": save_dir})
             if url.path == "/api/eval/stop":
                 return self._json({"stopped": EVAL_JOB.stop(), **EVAL_JOB.status(0)})
+            if url.path == "/api/eegio/evaluate":
+                try:
+                    return self._json(eegio_tab.evaluate(body))
+                except (FileNotFoundError, ValueError) as e:
+                    return self._error(str(e), 400)
             if url.path == "/api/kd/decompose":
                 students = body.get("students") or []
                 if not body.get("teacher") or not students:

@@ -11,6 +11,8 @@ __pycache__/
 .idea/
 runs/
 data/EEGdenoisenet/
+# EEG-IO is not redistributable either; see data/EEGIO.py
+data/EEG-IO/
 *.pth
 *.pt
 *.ckpt

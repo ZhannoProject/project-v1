@@ -275,6 +275,90 @@ the directory is missing. `write_synthetic_recording()` writes a fake subject
 in the same on-disk format so the pipeline can be exercised without it; it is
 a fixture for tests and demos, never a result.
 
+### Testing a model on it: the EEG-IO test tab
+
+`eegio_eval.py` and the GUI's **EEG-IO test** tab run the project's models on
+the real recordings. With no clean signal there is no RRMSE, so the
+measurement is a contrast instead: the annotated blink intervals against the
+background between them. Everything is relative to **the preprocessed signal
+that went into the model**, never the raw recording.
+
+**Preprocessing is causal, and that is not free.** EEGdenoiseNet's own
+pipeline bandpasses 1–80 Hz and notches 60 Hz — read off
+`data/EEGdenoisenet/code/preprocessing/EEG/IC_label_artifact_removal.m`,
+not guessed — with a zero-phase filter, which is two passes, one of them
+backwards. No online system can run that. So `eegio_eval.preprocess` uses
+`scipy.signal.sosfilt`, one pass forwards: the band matches training and the
+phase does not. The same perturb-and-look-back probe the models get is run on
+the filter itself, and reports `past_diff = 0.0`. The zero-phase filter stays
+available as a control that prices the difference.
+
+Four numbers, and the first two only mean anything together:
+
+| | what it is |
+|---|---|
+| **suppression S** (dB) | blink-interval power the model removed; higher is more |
+| **fidelity D_b** (dB) | background power over what the model changed there; higher is more faithful |
+| **residual detectability** | annotated blinks the detector still finds in the output; lower is better |
+| **onset lead** (ms) | how far before the signal moves the model's correction starts |
+
+A model that simply attenuated everything would score well on suppression
+alone, which is why fidelity sits beside it — there is a test asserting
+exactly that pairing still catches it.
+
+**Blink intervals** come from a detector (smooth, then threshold on a robust
+background spread) filtered down to **only the intervals that also contain a
+human annotation**. That is what makes the detector's own errors irrelevant: a
+false positive has no annotation in it and is dropped, and a missed blink
+contributes nothing rather than a wrong interval. Corrupt stretches are
+excluded from both.
+
+**Onset lead** is the one this project cares about, and it took two attempts
+to define. Measuring where `|y − x|` first crosses a multiple of its
+background spread gives a *strictly causal* model tens of samples of apparent
+lookahead — because outside the blinks a good model's correction is nearly
+zero, so its background spread is tiny and it crosses immediately, while the
+signal's spread is the ambient EEG and it crosses late. The asymmetry is in
+the thresholds, not the timing. Both onsets are now defined as the point
+where each quantity reaches 10 % of **its own** peak over that blink, which
+is scale-free; a test plants a correction shifted by a known 8, 16 or 32
+samples and the metric recovers it to within 2.
+
+**Risk check**: whether real blinks are as strong as the training mixtures.
+With no clean signal the estimate treats the background between blinks as the
+brain signal and the excess power inside a blink as the artifact, so it
+assumes the two add incoherently. It is a range check against the
+`[-7, 2]` dB the models were trained over, not a measurement.
+
+**Controls and the test.** The zero-phase filter, the bidirectional twin
+(legitimate here, where it runs offline, and refused on the Deploy tab), and
+the INT8 graph are all selectable. Models are compared **paired by subject**
+with a Wilcoxon signed-rank test, because subjects differ far more than
+models do — electrode placement, how hard someone blinks — and that spread
+would swamp the comparison if the groups were pooled.
+
+```bash
+python eegio_eval.py --data_dir data/EEG-IO \
+       --runs runs/tcn_se_both runs/tcn_se_la16_both runs/tcn_se_bi_both
+```
+
+The first run is the baseline the rest are paired against. The tab suggests
+exactly that triple: the causal model, the rung licensed 62.5 ms of
+lookahead, and the unbounded twin.
+
+Not yet done: the 250 Hz retraining. Every model here was trained at 256 Hz
+and is run on EEG-IO by resampling 250 → 256, which is exact in rate
+(128/125) but is not the same as training at the recording's own rate.
+
+Validation: `python -m unittest discover -s tests -p 'test_eegio_eval.py'`
+covers the filter's causality and the zero-phase control's lack of it, the
+band and notch, detection and annotation filtering, each metric against a
+model whose answer is known in advance (identity, attenuator, a correction
+shifted by a known amount), the risk check, the streaming wrapper, the
+pairing, and that the JSON the tab returns has no bare `NaN` in it —
+`json.dumps` writes those unquoted and `JSON.parse` rejects the whole
+document.
+
 Validation: `python -m unittest discover -s tests -p 'test_eegio.py'` covers
 the reader against files in the dataset's own format, the `corrupt,<n>`
 convention including the `-1` end, the subject-level split, the 250 → 256 Hz
@@ -388,9 +472,9 @@ Failures show an alert pointing at `~/Library/Logs/eeg-training-gui.log`.
 The bundle is git-ignored. Closing the window stops the server (and asks
 first if a training run is still going).
 
-The page has nine tabs: **YAML** (the text a save would write), **Train**,
-**Evaluate**, **Deploy**, **Lookahead**, **Receptive field**, **KD audit**,
-**Params** and **Runs**. The Evaluate and Deploy tabs borrow the Runs table as a run picker,
+The page has ten tabs: **YAML** (the text a save would write), **Train**,
+**Evaluate**, **Deploy**, **Lookahead**, **Receptive field**, **EEG-IO
+test**, **KD audit**, **Params** and **Runs**. The Evaluate and Deploy tabs borrow the Runs table as a run picker,
 so all three share one renderer.
 
 - **Form ↔ YAML.** Every key of `trainer/__main__.py` is a field, grouped as in
