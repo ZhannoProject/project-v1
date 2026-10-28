@@ -75,6 +75,8 @@ Not to be confused with `bottleneck_ratio`, which is the channel squeeze between
 ├── data/
 │   ├── Dataloader.py           # Leak-free train/val/test splits + SNR mixing (seeded),
 │   │                           #   and the non-stationary artifact-switch probe
+│   ├── EEGIO.py                # the other kind of data: real recordings with
+│   │                           #   hand-annotated blinks and no clean reference
 │   └── EEGdenoisenet/data/     # .npy files (not in repo, see Data below)
 ├── models/
 │   ├── TCN_backbone.py         # CausalConv1d → ResidualBlock → CausalTCNBackbone
@@ -199,6 +201,86 @@ python -m trainer --config configs/tcn_se_both.yaml      # legacy, as every run 
 
 Neither mode changes the leak-free split, the seeding, or the artifact-switch
 probe, whose draws are bit-identical either way.
+
+## A second dataset: EEG-IO (real recordings, annotated blinks)
+
+`data/EEGIO.py` reads [EEG-IO](https://gnan.ece.gatech.edu/eeg-eyeblinks), and
+it is the opposite kind of dataset to everything above. EEGdenoiseNet is a
+*synthetic mixture*: clean EEG plus an artifact at an SNR we choose, so the
+target is known exactly and RRMSE is computable. EEG-IO is 20 subjects of
+**real frontal EEG** (Fp1, Fp2; OpenBCI with a BIOPAC Cap100C; 250 Hz; one
+session each of ~75–100 s, ~25 blinks per subject) with the blink instants
+annotated by hand from a video feed — and **no clean reference at all**.
+
+That decides what it is for:
+
+- **It cannot train or score a denoiser the way EEGdenoiseNet does.** No
+  target means no RRMSE_t, no RRMSE_f, no CC. `EEGIOWindows` returns no
+  `clean` key, deliberately, so a scoring loop written against
+  `EEGDenoiseDataset` fails loudly instead of quietly scoring against
+  something invented.
+- **It can say what a model does to a real blink.** Every window carries a
+  mask of the annotated blink instants inside it, so a denoiser's output at
+  blink times can be compared against the same recording away from them.
+  That is a statement about artifact suppression that needs no target.
+- **It can supply real non-stationarity.** The switch probe splices two
+  synthetic regimes at a drawn index; here the onsets are real events with
+  real timestamps, and the bracketing result above — a sample inside a blink
+  is resolved by seeing both of its edges — makes a prediction about them.
+
+```python
+from data.EEGIO import EEGIOWindows, build_eegio_loader, split_subjects, list_subjects
+
+ds = EEGIOWindows("data/EEG-IO", win=512, hop=256)      # 512 @ 256 Hz, Fp1
+item = ds[0]            # noisy (1,512), sigma, blink_mask (512,), n_blinks, subject
+loader = build_eegio_loader("data/EEG-IO", split="test", batch_size=32)
+```
+
+```bash
+python data/EEGIO.py --data_dir data/EEG-IO      # per-subject seconds, blinks, corrupt time
+```
+
+Four things worth knowing before using it:
+
+- **250 Hz, not 256.** Every model here was trained at 256 Hz, so a raw
+  EEG-IO window is the wrong rate for a checkpoint. `target_fs` defaults to
+  256 and resamples with `scipy.signal.resample_poly` at the exact rational
+  ratio 128/125; `target_fs=None` keeps the native rate for analysis that
+  involves no checkpoint.
+- **Splits are by subject, not by window.** Two windows of one recording
+  share a session, an electrode placement and a person, so splitting windows
+  would leak all three. `split_subjects` is the same guarantee
+  `Dataloader._split_indices` gives at the epoch level, one level coarser,
+  because here the unit of independence is coarser.
+- **Corrupt intervals are honoured.** The annotators marked stretches as
+  unusable; windows overlapping one are dropped by default and the count is
+  reported rather than silently absorbed.
+- **Soft blinks are a choice, not a default.** The dataset's label code 2 is
+  a soft blink, which the reference implementation gates behind its own
+  `flag_soft`. `include_soft` does the same here, and is off by default.
+
+The format is taken from the reference implementation released with the
+dataset ([`meagmohit/BLINK`](https://github.com/meagmohit/BLINK),
+`blink.py`), not guessed: `<subject>_data.csv` is `;`-delimited with one
+header row and columns `(time_s, ch1, ch2)`; `<subject>_labels.csv` is
+`,`-delimited, where a `corrupt,<n>` row announces `<n>` interval rows (an
+end of `-1` meaning "to the end of the recording") and every other row is
+`<time_s>,<code>`. Two things the sources do not settle are flagged in the
+code where they are used: which electrode is `ch1` versus `ch2`, and what
+codes 0 and 1 mean (the reference only ever separates `< 2` from `== 2`).
+
+**The data is not in this repository and is not redistributable** — it comes
+through a registration form on the dataset page, which the loader prints when
+the directory is missing. `write_synthetic_recording()` writes a fake subject
+in the same on-disk format so the pipeline can be exercised without it; it is
+a fixture for tests and demos, never a result.
+
+Validation: `python -m unittest discover -s tests -p 'test_eegio.py'` covers
+the reader against files in the dataset's own format, the `corrupt,<n>`
+convention including the `-1` end, the subject-level split, the 250 → 256 Hz
+conversion, the blink mask and soft-blink gating, window counts, the absent
+`clean` key, the missing-data message, and that a project model runs on a
+window unchanged.
 
 Validation: `python -m unittest discover -s tests -p 'test_dataloader.py'`
 covers the split guarantee, both modes, the reported-versus-realised SNR, the
