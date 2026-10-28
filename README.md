@@ -1931,7 +1931,9 @@ one 512-sample forward faster than ~15 ms on this SoC.
 
 ### What the export does not do
 
-- **No INT8.** Dynamic INT8 quantisation was tried and rejected: it derives
+- **No dynamic INT8.** Static INT8 *is* available and is causal — see
+  [Static INT8](#static-int8-the-quantisation-that-keeps-the-graph-causal)
+  below. Dynamic INT8 was tried and rejected: it derives
   activation scales per tensor at run time, so a future sample changes the
   scale applied to past samples and the graph stops being causal
   (past_diff = 0.32 on the reference checkpoint). It was also slower for
@@ -1945,6 +1947,101 @@ one 512-sample forward faster than ~15 ms on this SoC.
 Validation: `python -m unittest discover -s tests -p 'test_export_onnx.py'`
 covers architecture inference (including legacy checkpoints and `tcn_mla_r{N}` labels), export, the per-hop latency monitor,
 agreement, causality, and the Pi-side epoch/streaming contract.
+
+## Static INT8: the quantisation that keeps the graph causal
+
+`deploy/quantize_int8.py` turns an exported fp32 graph into an INT8 one that
+passes the same causality probe the fp32 export has to pass. It exists
+because the earlier rejection of INT8 was a rejection of *dynamic* INT8
+specifically, and the distinction is the whole point:
+
+| | where the activation scale comes from | `past_diff` |
+|---|---|---|
+| dynamic INT8 | the tensor being quantised, at run time — the whole 512-sample window, future included | **0.32** |
+| static INT8 | a calibration set, offline; written into the graph as constants | **0.0** |
+
+A sample at *t* takes part in a dynamic scale applied to every sample before
+it, so perturbing sample 256 moves the output at sample 0. That is what
+dynamic quantisation *is*, not a tuning problem. Static calibration has
+nothing at run time that depends on the window's contents, so the graph is
+causal for the same reason the fp32 graph is — and every graph this module
+writes is probed to prove it, at the same `1e-5` tolerance.
+
+```bash
+python -m deploy.quantize_int8 --onnx deploy/artifacts/tcn_both.onnx \
+       --data_dir data/EEGdenoisenet/data --artifact BOTH --master_seed 67
+python -m deploy.quantize_int8 --onnx deploy/artifacts/tcn_mla_both.onnx \
+       --data_dir data/EEGdenoisenet/data --artifact BOTH --master_seed 67 --conv_only
+```
+
+Measured on the full test split, Apple-silicon host, 2 threads, QDQ,
+per-channel weights, percentile calibration, 512 calibration windows from the
+**train** split:
+
+| graph | quantised | `past_diff` | size | per window | RRMSE_t | ΔRRMSE_t | ΔCC |
+|---|---|---|---|---|---|---|---|
+| `tcn_both` | all ops | 0.0 | 578.6 → 265.0 kB (2.18×) | 0.70 → 0.56 ms (1.26×) | 0.7245 | +0.0007 | −0.0006 |
+| `tcn_se_both` | all ops | 0.0 | 673 → 352 kB (1.91×) | 1.20 → 1.12 ms (1.07×) | 0.7132 | +0.0009 | −0.0007 |
+| `tcn_mla_both` | all ops | 0.0 | 1824 → 1392 kB (1.31×) | 3.42 → 5.03 ms (**0.68×**) | 0.7847 | **+0.0725** | **−0.0209** |
+| `tcn_mla_both` | `Conv` only | 0.0 | 1824 → 1438 kB (1.27×) | 3.46 → 3.12 ms (1.11×) | 0.7128 | +0.0006 | −0.0004 |
+
+Three things follow, and the third is the one to read twice.
+
+**Convolutions quantise almost for free.** The baseline gives up 0.0007
+RRMSE_t — a tenth of the seed spread — for 2.18× off the file and 1.26× off
+the time. That is the deployable configuration.
+
+**Attention does not.** Quantising the MLA sandwich end to end costs
+**+0.0725 RRMSE_t**, which is 5.4× the entire gain the attention decoder buys
+over the baseline in the first place (0.0134, [the capacity
+axis](#what-a-millisecond-is-worth)), and it comes out **1.5× slower** than
+fp32. An 8-bit MLA model is worse than the fp32 TCN baseline it was supposed
+to improve on, at five times the compute. `--conv_only` leaves the attention
+in fp32 and recovers all of it: +0.0006 RRMSE_t and 1.11× faster.
+
+**The causal mask breaks two of the three calibrators.** A causal attention
+graph carries a scalar `-inf` initializer — the mask value fed to `Where`
+before `Softmax`, i.e. the thing that makes the model causal. `percentile`
+and `entropy` build a histogram per tensor and cannot take a range of
+`[-inf, inf]`, so they abort. onnxruntime reports that as *"autodetected
+range … is not finite"*, which says nothing about masks, so the module
+refuses first and names the cause, pointing at `--conv_only`. Causality and
+quantisation are not independent here: the construct that buys the one
+obstructs the other.
+
+Notes on the settings: `uint8` and `int8` activations measured identically on
+this host and both are offered, because the right one is a property of the
+target CPU rather than the model. `percentile` beat `minmax` on every graph it
+could run on (+0.0007 against +0.0014 on the baseline), and is the default.
+Calibration draws from the **train** split at the checkpoint's own
+`master_seed` — calibrating on val or test would fit the quantisation scales
+to the data the model is then scored on, which is the leakage the epoch-level
+split exists to prevent, one level down. A sidecar records the calibration
+set, the settings, both probes, the sizes, the latencies and the accuracy of
+both graphs.
+
+The Pi runtime needs no changes — `deploy/raspi_infer.py` takes the INT8
+graph as it stands:
+
+```
+$ python raspi_infer.py artifacts/tcn_both_int8.onnx --testdata testdata/BOTH_test100_s67.npz
+       epoch mode                   0.7135   0.6638  0.7021      (fp32: 0.7125 / 0.7031)
+$ python raspi_infer.py artifacts/tcn_mla_both_int8conv.onnx --testdata testdata/BOTH_test100_s67.npz
+       epoch mode                   0.7033   0.6484  0.7136      (fp32: 0.7028 / 0.7139)
+```
+
+The latency figures above are a **host** measurement; the board's own numbers
+need a run through the Deploy tab or `run_on_pi.sh`, and INT8's speedup is
+the figure most likely to differ there, since the Pi 5's Cortex-A76 has
+different 8-bit throughput from Apple silicon.
+
+Validation: `python -m unittest discover -s tests -p 'test_quantize_int8.py'`
+exports a small causal TCN and then asserts both halves of the claim in one
+run — static quantisation keeps `past_diff` under tolerance, dynamic
+quantisation of the same graph does not — plus that the probe detects a
+genuinely non-causal model, that every activation type and calibrator yields
+a causal graph, the mask preflight and its message, the calibration reader's
+semantics, and what the sidecar records.
 
 ## Incremental inference: one sample at a time
 
