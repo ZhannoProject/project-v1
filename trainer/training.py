@@ -109,7 +109,17 @@ class Trainer:
                                                "learning_rate", "attn_lr_scale", "weight_decay",
                                                "sched_warmup_epochs", "eta_min",
                                                "snr_range_db", "master_seed",
-                                               "staged", "teacher_ckpt")},
+                                               "staged", "teacher_ckpt",
+                                               # The recipe a distilled run was made with.
+                                               # teacher_ckpt alone says a run was distilled and
+                                               # from whom, and nothing about how: runs/
+                                               # tcn_se_both_kd_s67 is the project's only KD run
+                                               # and reads back kd_alpha=None, so the result it
+                                               # carries cannot be reproduced or interpreted.
+                                               "kd_alpha", "kd_feature_weight",
+                                               "kd_feature_layers", "kd_output_loss",
+                                               "kd_feature_loss", "init_from_teacher",
+                                               "teacher_config")},
                                    "arch": self._architecture(),
                                    "n_params": sum(p.numel() for p in self.model.parameters())}}
 

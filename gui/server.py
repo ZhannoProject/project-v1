@@ -29,6 +29,10 @@ Local HTTP server behind the training GUI (stdlib only).
     GET  /api/pi/meta            exports, test sets and latency traces on disk
     POST /api/pi/testdata        {model, n} → cut the test set matching that model's
                                  split, and the refreshed list
+    GET  /api/kd/meta            distilled runs, their teachers and their controls
+    GET  /api/kd/checks?student=X    the six KD invariants, with their evidence
+    POST /api/kd/decompose       {teacher, students, ...} → ||S-G||^2 split into
+                                 ||S-T||^2 + ||T-G||^2 + the cross term
     GET  /api/rf/meta            the receptive-field ladder and its defaults
     GET  /api/rf/results         one row per trained rung: reach vs metrics, over seeds
     POST /api/rf/preview         {variant, rungs, …} → the training commands
@@ -65,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from gui import config_io, lookahead, params, pi, rfsweep
+from gui import config_io, kd, lookahead, params, pi, rfsweep
 # The one place the "seed 42 keeps the bare name" rule is written down; the
 # run titles have to derive the same path the trainer will.
 from trainer.__main__ import DEFAULT_MASTER_SEED
@@ -1071,6 +1075,12 @@ class Handler(BaseHTTPRequestHandler):
                     q.get("variant", "tcn"), q.get("artifact", "BOTH"),
                     int(q["seed"]) if q.get("seed") else None,
                     int(q.get("hidden_channels") or rfsweep.DEFAULT_HIDDEN))})
+            if url.path == "/api/kd/meta":
+                return self._json(kd.meta())
+            if url.path == "/api/kd/checks":
+                if not q.get("student"):
+                    return self._error("kd/checks needs a student run", 400)
+                return self._json(kd.static_checks(q["student"], q.get("teacher") or None))
             if url.path == "/api/rf/status":
                 return self._json(SWEEP_JOB.status(int(q.get("since", 0))))
             if url.path == "/api/pi/meta":
@@ -1171,6 +1181,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({**EVAL_JOB.status(0), "save_dir": save_dir})
             if url.path == "/api/eval/stop":
                 return self._json({"stopped": EVAL_JOB.stop(), **EVAL_JOB.status(0)})
+            if url.path == "/api/kd/decompose":
+                students = body.get("students") or []
+                if not body.get("teacher") or not students:
+                    return self._error("kd/decompose needs a teacher and at least one student", 400)
+                return self._json(kd.decompose(
+                    body["teacher"], students,
+                    body.get("artifact") or "BOTH",
+                    int(body.get("master_seed") or 42),
+                    int(body.get("max_batches") or kd.DEFAULT_MAX_BATCHES)))
             if url.path == "/api/rf/preview":
                 return self._json({"steps": pi.describe(rfsweep.build_steps(body))})
             if url.path == "/api/rf/run":

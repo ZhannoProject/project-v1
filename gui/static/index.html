@@ -191,6 +191,15 @@
   #tab-deploy .efield > * { min-width: 0; max-width: 100%; }
   #tab-deploy .efield label { font-size: 11.5px; color: var(--muted); }
   #tab-deploy .efield .hint { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+  /* KD audit. .hint elsewhere is scoped inside .efield, and there is no
+     counterpart to .ok for a failed check, so both are given here rather
+     than widened globally and changing three other tabs. */
+  #tab-kd .hint { font-size: 11px; color: var(--muted); max-width: 72ch; line-height: 1.5; }
+  #tab-kd .hint.bad, #tab-kd .bad { color: var(--err); }
+  #tab-kd h3 { font-size: 12px; font-weight: 600; margin: 14px 0 6px; }
+  #tab-kd table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  #tab-kd th { text-align: left; font-weight: 600; color: var(--muted); padding: 4px 8px 4px 0; }
+  #tab-kd td { padding: 3px 8px 3px 0; border-top: 1px solid var(--border); }
   /* A hint worth keeping but not worth three lines of column on every render:
      collapsed into a marker, shown on hover or keyboard focus. Nothing in the
      grid clips, so the tip can be positioned absolutely against the field. */
@@ -354,6 +363,7 @@
       <button data-tab="deploy" title="Export a checkpoint to ONNX and measure what it costs to run: per-hop latency, deadline misses and the duty-cycle sweep — on this machine, or on a Raspberry Pi 5 over SSH">Deploy</button>
       <button data-tab="lookahead" title="What a millisecond of future context is worth: the ladder between the causal SE baseline and its unbounded twin, priced in output latency">Lookahead</button>
       <button data-tab="rf" title="How far back the TCN needs to look: one run per rung of the dilation ladder, from 5 samples to 509 — the span attention gets, without the attention">Receptive field</button>
+      <button data-tab="kd" title="Audit a distilled run: the six invariants that have to hold for its number to mean anything, and the decomposition that says where its accuracy went">KD audit</button>
       <button data-tab="params" title="Parameter count of the model the form describes, broken down by stage">Params</button>
       <button data-tab="runs">Runs</button>
     </div>
@@ -693,6 +703,20 @@
       <pre id="rfLog"></pre>
     </div>
 
+    <div class="tab" id="tab-kd">
+      <div class="row">
+        <label class="muted" for="kdRun">distilled run</label>
+        <select id="kdRun" title="Every run in runs/ whose history records a teacher"></select>
+        <button id="btnKdCheck" class="primary" title="Run the six invariants and the decomposition">Audit</button>
+        <span class="grow"></span>
+        <span class="muted" id="kdNote"></span>
+      </div>
+      <div class="row" style="margin-top:-4px"><span class="muted" id="kdPair"></span></div>
+      <div id="kdRecipe"></div>
+      <div id="kdChecks"></div>
+      <div id="kdDecomp"></div>
+    </div>
+
     <div class="tab" id="tab-params">
       <div class="row">
         <span class="muted" id="paramTitle">…</span>
@@ -768,6 +792,7 @@
     job: { running: false, next: 0, metrics: [], maxEpochs: null, log: "" },
     jobs: {}, jobId: null, jobList: [], runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0, params: { a: null, b: null, error: null }, paramCmp: "", evalRows: [], evalRun: null, pickView: null, pickFor: "eval", evalJob: { running: false, next: 0, artifacts: [] },
     la: { meta: null, data: null, error: null, artifact: "BOTH" },
+    kd: { meta: null, run: null, checks: null, decomp: null, busy: false, error: null },
     pi: { target: "host", model: null, testdata: null, running: false, next: 0,
           returncode: null, parsed: {}, steps: [], step: 0, formTouched: false, seenTraces: [],
           loaded: { latency: null, duty: null } } };
@@ -3682,7 +3707,134 @@
     showTab(b.dataset.tab);
     if (b.dataset.tab === "params") refreshParams(true);
     if (b.dataset.tab === "lookahead" && !state.la.data) refreshLookahead(true);
+    if (b.dataset.tab === "kd" && !state.kd.meta) refreshKd();
   }));
+  // ---------------------------------------------------------------- KD audit
+  // Two questions in order: was the distillation wired correctly, and if it
+  // was, where did the accuracy go. The second is only worth asking once the
+  // first is answered, so the panels render in that order and the
+  // decomposition says so when a check failed.
+  const KD_MARK = { true: ["ok", "pass"], false: ["bad", "FAIL"], null: ["muted", "skipped"] };
+
+  async function refreshKd() {
+    try {
+      state.kd.meta = await api("/api/kd/meta");
+      state.kd.error = null;
+    } catch (e) { state.kd.error = e.message; }
+    renderKd();
+  }
+
+  function kdRunRow() {
+    const runs = (state.kd.meta && state.kd.meta.kd_runs) || [];
+    return runs.find(r => r.name === state.kd.run) || runs[0] || null;
+  }
+
+  async function auditKd() {
+    const row = kdRunRow();
+    if (!row) return;
+    state.kd.busy = true; state.kd.error = null; renderKd();
+    try {
+      state.kd.checks = await api(`/api/kd/checks?student=${encodeURIComponent(row.name)}`);
+      // The control is what the KD run has to be better than; without one
+      // there is a decomposition but nothing to read off it.
+      const students = row.control ? [row.control, row.name] : [row.name];
+      state.kd.decomp = row.teacher_run
+        ? await api("/api/kd/decompose", { teacher: row.teacher_run, students,
+                                           artifact: row.artifact,
+                                           master_seed: row.master_seed })
+        : null;
+    } catch (e) { state.kd.error = e.message; }
+    state.kd.busy = false; renderKd();
+  }
+
+  function renderKd() {
+    const meta = state.kd.meta, sel = $("#kdRun");
+    if (!sel) return;
+    if (state.kd.error) { $("#kdNote").textContent = state.kd.error; }
+    const runs = (meta && meta.kd_runs) || [];
+    if (sel.options.length !== runs.length) {
+      sel.innerHTML = "";
+      for (const r of runs) sel.appendChild(new Option(r.name, r.name));
+    }
+    if (!state.kd.run && runs.length) state.kd.run = runs[0].name;
+    if (state.kd.run) sel.value = state.kd.run;
+    $("#btnKdCheck").disabled = !runs.length || state.kd.busy;
+
+    const row = kdRunRow();
+    $("#kdNote").textContent = state.kd.error ? state.kd.error
+      : state.kd.busy ? "scoring the validation split…"
+      : runs.length ? (meta.note || "") : "no run in runs/ records a teacher";
+    $("#kdPair").innerHTML = !row ? "" :
+      `teacher <b>${row.teacher_run || "(unresolved)"}</b> · student <b>${row.name}</b>` +
+      (row.control ? ` · control <b>${row.control}</b>` : " · <span class='bad'>no control run found</span>") +
+      ` · ${row.artifact} seed ${row.master_seed}` +
+      (row.control_rrmse_t != null
+        ? ` · RRMSE_t ${row.rrmse_t.toFixed(4)} against ${row.control_rrmse_t.toFixed(4)} without KD` : "");
+
+    // What recipe produced it. A run whose alpha was never recorded cannot be
+    // reproduced, and that is said rather than filled in with the default.
+    const rec = row && row.recipe;
+    $("#kdRecipe").innerHTML = !rec ? "" : rec.recorded
+      ? `<p class="hint">recipe: ${Object.entries(rec).filter(([k]) => k !== "recorded")
+            .map(([k, v]) => `${k}=${v === null ? "—" : v}`).join(" · ")}</p>`
+      : `<p class="hint bad">This run recorded no KD hyperparameters — kd_alpha, kd_feature_weight
+         and init_from_teacher all read back empty, so it cannot be reproduced. Runs trained from
+         now on record them.</p>`;
+
+    const c = state.kd.checks;
+    $("#kdChecks").innerHTML = !c ? "" : `
+      <h3>Was it wired correctly?</h3>
+      <table><tr><th></th><th>check</th><th>evidence</th></tr>
+      ${c.checks.map(x => { const [cls, label] = KD_MARK[String(x.ok)];
+        return `<tr><td class="${cls}">${label}</td><td>${x.name}</td>
+                <td class="muted">${x.detail}</td></tr>`; }).join("")}
+      </table>
+      <p class="hint">${c.n_failed ? `<b class="bad">${c.n_failed} check(s) failed</b> — the
+         numbers below describe a run that is not what it claims to be.`
+         : c.n_skipped ? `${c.n_skipped} check(s) could not be run.`
+         : "All six hold, so the run is what it claims to be."}</p>`;
+
+    const d = state.kd.decomp;
+    if (!d) { $("#kdDecomp").innerHTML = ""; return; }
+    const f = v => (v >= 0 ? "+" : "") + v.toFixed(6);
+    $("#kdDecomp").innerHTML = `
+      <h3>Where did the accuracy go?</h3>
+      <p class="hint">${meta.identity} — over ${d.max_batches} batches of the validation split.
+         ‖T−G‖² is the teacher's own error and is the same for every student, so a difference
+         between two students lives entirely in the other two terms.</p>
+      <table>
+        <tr><th>run</th><th class="num">‖S−T‖²</th><th class="num">‖T−G‖²</th>
+            <th class="num">2⟨S−T,T−G⟩</th><th class="num">‖S−G‖²</th><th class="num">residual</th></tr>
+        ${d.rows.map(r => `<tr><td>${r.run}${r.kd ? " <b>(KD)</b>" : ""}</td>
+          <td class="num">${r.s_minus_t.toFixed(6)}</td><td class="num">${r.t_minus_g.toFixed(6)}</td>
+          <td class="num">${f(r.cross)}</td><td class="num">${r.s_minus_g.toFixed(6)}</td>
+          <td class="num muted">${r.residual.toExponential(1)}</td></tr>`).join("")}
+      </table>
+      ${!d.delta ? "" : `
+        <table style="margin-top:8px">
+          <tr><th>what KD changed</th><th class="num">Δ</th><th>reading</th></tr>
+          <tr><td>distance to the teacher ‖S−T‖²</td><td class="num">${f(d.delta.d_s_minus_t)}</td>
+              <td class="muted">${d.delta.d_s_minus_t < 0
+                ? "negative: the student really did move onto the teacher"
+                : "not negative: the distillation moved the student nowhere"}</td></tr>
+          <tr><td>cross term 2⟨S−T,T−G⟩</td><td class="num">${f(d.delta.d_cross)}</td>
+              <td class="muted">${d.delta.d_cross > 0
+                ? "positive: the error cancellation the plain student had is gone"
+                : "negative: the cancellation survived"}</td></tr>
+          <tr><td><b>error against ground truth ‖S−G‖²</b></td>
+              <td class="num"><b>${f(d.delta.d_s_minus_g)}</b></td>
+              <td class="muted">the sum of the two above</td></tr>
+        </table>
+        <p class="hint">${d.delta.verdict}.</p>`}`;
+  }
+
+  $("#kdRun").addEventListener("change", () => {
+    state.kd.run = $("#kdRun").value;
+    state.kd.checks = null; state.kd.decomp = null;
+    renderKd();
+  });
+  $("#btnKdCheck").addEventListener("click", auditKd);
+
   $("#btnLaRefresh").addEventListener("click", () => refreshLookahead(true));
   $("#laArtifact").addEventListener("change", () => refreshLookahead(true));
   $("#laWidth").addEventListener("change", () => refreshLookahead(true));
