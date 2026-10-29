@@ -272,9 +272,30 @@ the later columns are unused electrodes parked at a constant. One thing the
 sources still do not settle is flagged in the code: what codes 0 and 1 mean,
 since the reference only ever separates `< 2` from `== 2`.
 
-Read against the real download, the loader finds **20 subjects, 102.3 s each,
-517 blinks and 41 soft blinks** — about 25 per subject, as the dataset page
-describes.
+Read against the real download the loader finds **20 subjects, 517 blinks and
+41 soft**, about 25 per subject as the dataset page describes, and it parses
+**identically to the `read_data.py` shipped with the dataset** on all twenty —
+a test asserts that against a port of the dataset's own `decode_stim`.
+
+Two things the audit turned up that are worth knowing before trusting a
+number from this loader:
+
+- **Sessions are not all the same length** (77–103 s; S06 is the short one),
+  so nothing may assume a fixed one.
+- **The sampling rate is 250 Hz, and the timestamp column looks like it says
+  otherwise.** Its steps are quantised to 1/256, with a longer step every
+  twentieth or so, which reads as a 256 Hz clock if only the median is taken.
+  The column's *span* is `n/250` s (250.001 Hz measured), the file's own
+  `Sampling Rate` field says 250, and converting the annotations at 250 Hz
+  lands them on a blink 32 % of the time against 8 % at 256 Hz — chance, by
+  construction of that test. `Recording.t` is therefore `arange(n)/fs`, with
+  the file's column kept beside it as `t_recorded` for inspection; the two
+  agree to under a millisecond over 100 s.
+
+The hand annotations sit within about 100 ms of the blink for most of them
+(median lag −24 ms), so **73 % of them fall inside a detected interval** and
+are the ones measured; `evaluate_recording` reports that fraction per subject
+as `annotations_matched` rather than letting it pass unnoticed.
 
 **The data is not in this repository and is not redistributable** — it comes
 through a registration form on the dataset page, which the loader prints when

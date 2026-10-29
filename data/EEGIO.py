@@ -40,7 +40,9 @@ released with the dataset (``meagmohit/BLINK``, ``blink.py``):
     └── ...
 
 Twenty subjects, frontal electrodes (Fp1, Fp2), OpenBCI with a BIOPAC
-Cap100C, one session each of roughly 75-100 s, about 25 blinks per subject.
+Cap100C, about 25 blinks per subject. Sessions run 77-103 s at 250 Hz (S06
+is the short one); the dataset page's "75 to 100 seconds" is approximate, and
+the lengths are not all equal, so nothing here may assume a fixed one.
 ``fs`` is 250 Hz -- taken from the reference implementation's own ``fs =
 250.0``, not from the dataset page, which does not state it.  (The "500" in
 the paper's dataset table is the blink count across the 20 subjects, not a
@@ -66,6 +68,19 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 #: Sampling rate of every EEG-IO recording, in Hz.
+#:
+#: Confirmed three ways, because everything downstream is placed by it and
+#: the timestamp column looks wrong at first glance.  Each ``_data.csv``
+#: carries a ``Sampling Rate`` column reading 250; its timestamps span
+#: ``n/250`` seconds (250.001 Hz measured across subjects); and converting
+#: the hand annotations to samples at 250 Hz lands them on a large
+#: low-frequency excursion 32% of the time against 8% at 256 Hz, which is
+#: chance by construction of that test.
+#:
+#: The trap is the *step* between timestamps: it is 1/256 for most samples,
+#: with a longer step every twentieth or so, which reads as a 256 Hz clock
+#: if only the median is looked at.  It is a 1/256-quantised timestamp on a
+#: 250 Hz acquisition, not a 256 Hz one -- the column's own span says so.
 EEGIO_FS = 250.0
 
 #: The two frontal channels, in the column order the data file stores them.
@@ -99,11 +114,20 @@ class Recording:
 
     subject: str
     signal: np.ndarray          # (n_channels, n_samples), float32
-    t: np.ndarray               # (n_samples,) seconds, as recorded
+    #: Seconds, on the ``fs`` clock: ``arange(n) / fs``. Regular by
+    #: construction, unlike the file's own timestamp column, which is
+    #: quantised to 1/256 and steps unevenly (see EEGIO_FS). Everything here
+    #: -- blink_samples, corrupt_mask, duration_s -- is on this axis, so they
+    #: cannot disagree with each other.
+    t: np.ndarray
     fs: float
     blinks: np.ndarray          # (n_blinks, 2) -> time_s, type_code
     corrupt: np.ndarray         # (n_intervals, 2) -> start_s, end_s
     channels: Tuple[str, ...]
+    #: The timestamp column exactly as the file stores it, for provenance.
+    #: Kept so its jitter can be inspected rather than taken on trust;
+    #: nothing in this module computes with it.
+    t_recorded: Optional[np.ndarray] = None
 
     @property
     def n_samples(self) -> int:
@@ -182,8 +206,14 @@ def _read_labels(path: str, t_last: float) -> Tuple[np.ndarray, np.ndarray]:
 
     The layout is the reference implementation's: an optional ``corrupt,<n>``
     row announces that the next ``<n>`` rows are intervals rather than
-    blinks, and an interval end of -1 means "to the end of the recording",
-    which is resolved here so that no consumer has to know the convention.
+    blinks, a bare ``blinks`` row separates the two blocks, and an interval
+    end of -1 means "to the end of the recording", which is resolved here so
+    that no consumer has to know the convention.
+
+    ``blinks`` is matched by name rather than left to fall through the
+    too-few-fields branch below.  Every real file writes it on a line of its
+    own, so either works today; one written ``blinks,25`` would be read as a
+    blink at time "blinks" and crash, which is a silly way to lose a dataset.
     """
     blinks: List[Tuple[float, int]] = []
     corrupt: List[Tuple[float, float]] = []
@@ -191,6 +221,8 @@ def _read_labels(path: str, t_last: float) -> Tuple[np.ndarray, np.ndarray]:
     with open(path, newline="") as fh:
         for row in csv.reader(fh, delimiter=","):
             row = [c.strip() for c in row if c.strip() != ""]
+            if not row or row[0].lower() == "blinks":
+                continue
             if len(row) < 2:
                 continue
             if row[0].lower() == "corrupt":
@@ -227,13 +259,25 @@ def read_recording(data_dir: str, subject: str) -> Recording:
     if raw.shape[1] != 3:
         raise ValueError(f"{sig_path}: expected 3 columns (time, ch1, ch2), "
                          f"got {raw.shape[1]}")
+    if raw.shape[0] == 0:
+        raise ValueError(f"{sig_path}: no samples")
+    if not np.isfinite(raw[:, 1:]).all():
+        n_bad = int((~np.isfinite(raw[:, 1:])).sum())
+        raise ValueError(f"{sig_path}: {n_bad} non-finite sample(s) in the EEG columns")
 
-    t = raw[:, 0].astype(np.float64)
     signal = np.ascontiguousarray(raw[:, 1:].T, dtype=np.float32)   # (2, N)
-    blinks, corrupt = _read_labels(lab_path, float(t[-1]) if len(t) else 0.0)
+    n = signal.shape[1]
+    # The canonical axis is the rate's, not the file's: the recorded
+    # timestamps are quantised to 1/256 and so step unevenly (see EEGIO_FS),
+    # and an axis that jitters is a poor thing to place annotations on even
+    # when its average is right.  The two agree to under a millisecond over
+    # a 100 s recording, so this is tidiness rather than a correction.
+    t = np.arange(n, dtype=np.float64) / EEGIO_FS
+    blinks, corrupt = _read_labels(lab_path, float(n / EEGIO_FS))
 
     return Recording(subject=subject, signal=signal, t=t, fs=EEGIO_FS,
-                     blinks=blinks, corrupt=corrupt, channels=EEGIO_CHANNELS)
+                     blinks=blinks, corrupt=corrupt, channels=EEGIO_CHANNELS,
+                     t_recorded=raw[:, 0].astype(np.float64))
 
 
 # ============================================================

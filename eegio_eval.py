@@ -566,12 +566,19 @@ def evaluate_recording(rec: Recording, apply_fn: Callable[[np.ndarray], np.ndarr
 
     found = detect_blinks(x, fs, k=cfg.detect_k, exclude=corrupt)
     kept = keep_annotated(found, ann)
+    # How much of the ground truth survived the intersection. On the real
+    # recordings this is about 73%: the annotations were made from video and
+    # sit within ~100 ms of the blink for most of them, so some fall outside
+    # the detector's interval. A reader should see that rather than assume
+    # every annotated blink was measured.
+    matched = float(len(kept) / len(ann)) if len(ann) else float("nan")
     bg = background_mask(n, kept, fs, cfg.guard_s, exclude=corrupt)
 
     y = apply_fn(x)
     return {
         "subject": rec.subject, "fs": fs, "n_samples": n,
         "n_annotated": int(len(ann)), "n_detected": len(found), "n_kept": len(kept),
+        "annotations_matched": matched,
         "corrupt_fraction": float(corrupt.mean()) if corrupt.size else 0.0,
         "background_fraction": float(bg.mean()),
         "suppression_db": suppression_db(x, y, kept),

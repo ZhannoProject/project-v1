@@ -109,7 +109,10 @@ class TestCorruptIntervals(_Fixture):
         write_synthetic_recording(self.dir, "C1", duration_s=12.0, n_blinks=3,
                                   n_soft=0, corrupt=[(8.0, -1)], seed=3)
         rec = read_recording(self.dir, "C1")
-        self.assertAlmostEqual(rec.corrupt[0, 1], float(rec.t[-1]), places=6)
+        # Resolved on the rate's axis (n / fs), which is one sample past the
+        # last timestamp rather than equal to it -- so the mask covers the
+        # final sample instead of stopping just short of it.
+        self.assertAlmostEqual(rec.corrupt[0, 1], rec.n_samples / rec.fs, places=6)
         self.assertTrue(rec.corrupt_mask()[-1])
 
     def test_a_file_without_a_corrupt_header_parses_as_all_blinks(self):
@@ -326,3 +329,138 @@ class TestModelCompatibility(_Fixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ============================================================
+# The real download, when it is present
+# ============================================================
+def _real_dir():
+    from gui.eegio_tab import find_data_dir
+    d = find_data_dir()
+    return d if (d.is_dir() and any(f.name.endswith("_data.csv") for f in d.iterdir())) else None
+
+
+REAL = _real_dir()
+
+
+@unittest.skipUnless(REAL, "the EEG-IO download is not present")
+class TestAgainstTheRealDownload(unittest.TestCase):
+    """
+    What the audit established, pinned so it cannot quietly stop being true.
+
+    These run only where the recordings are; the rest of this file works on
+    fixtures so CI keeps passing without them.
+    """
+
+    def test_it_parses_identically_to_the_dataset_s_own_reader(self):
+        # The strongest check available: a faithful port of decode_stim()
+        # from the read_data.py shipped with the dataset, on every subject.
+        import csv as _csv
+
+        def reference(path, last_t):
+            corrupt, blinks, n_corrupt = [], [], 0
+            for row in _csv.reader(open(path), delimiter=","):
+                if row[0] == "corrupt":
+                    n_corrupt = int(row[1])
+                elif n_corrupt > 0:
+                    end = last_t if float(row[1]) == -1 else float(row[1])
+                    corrupt.append([float(row[0]), end])
+                    n_corrupt -= 1
+                elif row[0] == "blinks":
+                    self.assertEqual(n_corrupt, 0, "corrupt block was short")
+                else:
+                    blinks.append([float(row[0]), int(row[1])])
+            return np.asarray(corrupt).reshape(-1, 2), np.asarray(blinks).reshape(-1, 2)
+
+        subs = list_subjects(str(REAL))
+        self.assertEqual(len(subs), 20)
+        for s in subs:
+            rec = read_recording(str(REAL), s)
+            ref_c, ref_b = reference(os.path.join(str(REAL), f"{s}_labels.csv"),
+                                     rec.n_samples / rec.fs)
+            with self.subTest(subject=s):
+                np.testing.assert_allclose(
+                    rec.blinks[np.argsort(rec.blinks[:, 0])],
+                    ref_b[np.argsort(ref_b[:, 0])] if len(ref_b) else ref_b)
+                np.testing.assert_allclose(rec.corrupt, ref_c)
+
+    def test_the_whole_cohort_is_what_the_dataset_page_describes(self):
+        subs = list_subjects(str(REAL))
+        hard = soft = 0
+        for s in subs:
+            rec = read_recording(str(REAL), s)
+            hard += int((rec.blinks[:, 1] < SOFT_BLINK_CODE).sum())
+            soft += int((rec.blinks[:, 1] == SOFT_BLINK_CODE).sum())
+        self.assertEqual(len(subs), 20)
+        self.assertEqual(hard, 517)        # the page says ~25 per subject
+        self.assertEqual(soft, 41)
+        # Five corrupt intervals across the cohort. Pinned because a count
+        # taken by grepping the label files instead of parsing them reads 42
+        # soft blinks: a corrupt interval's *end time* can round to 2 and be
+        # mistaken for the soft-blink code.
+        self.assertEqual(sum(len(read_recording(str(REAL), x).corrupt) for x in subs), 5)
+
+    def test_the_recordings_are_not_all_the_same_length(self):
+        # Nothing may assume a fixed one: S06 is much shorter than the rest.
+        lengths = {read_recording(str(REAL), s).n_samples for s in list_subjects(str(REAL))}
+        self.assertGreater(len(lengths), 1)
+
+    def test_the_sampling_rate_matches_the_files_own_timestamps(self):
+        # EEGIO_FS is 250 and the timestamp column spans n/250 seconds, even
+        # though its individual steps are quantised to 1/256.
+        for s in list_subjects(str(REAL))[:5]:
+            rec = read_recording(str(REAL), s)
+            implied = (rec.n_samples - 1) / (rec.t_recorded[-1] - rec.t_recorded[0])
+            with self.subTest(subject=s):
+                self.assertAlmostEqual(implied, EEGIO_FS, delta=0.01)
+                self.assertAlmostEqual(float(np.median(np.diff(rec.t_recorded))),
+                                       1 / 256, places=8)   # the trap
+
+    def test_the_canonical_axis_agrees_with_the_recorded_one(self):
+        for s in list_subjects(str(REAL))[:5]:
+            rec = read_recording(str(REAL), s)
+            with self.subTest(subject=s):
+                self.assertLess(float(np.abs(rec.t - rec.t_recorded).max()), 0.005)
+
+    def test_every_annotation_lands_inside_its_recording(self):
+        for s in list_subjects(str(REAL)):
+            rec = read_recording(str(REAL), s)
+            idx = rec.blink_samples(include_soft=True)
+            with self.subTest(subject=s):
+                self.assertEqual(len(idx), len(rec.blinks),
+                                 "an annotation fell outside the recording")
+
+    def test_annotations_land_on_blinks_at_250_hz_and_not_at_256(self):
+        # The measurement that settled the rate. At the wrong rate the
+        # annotations are no better than chance against a top-decile mask.
+        from scipy.signal import butter, sosfiltfilt
+
+        sos = butter(4, 10 / (EEGIO_FS / 2), btype="low", output="sos")
+        hit = {250.0: [], 256.0: []}
+        for s in list_subjects(str(REAL)):
+            rec = read_recording(str(REAL), s)
+            x = np.abs(sosfiltfilt(sos, rec.signal[0].astype(np.float64)))
+            thr = np.percentile(x, 90)
+            times = rec.blink_times(include_soft=False)
+            for fs in hit:
+                idx = np.round(times * fs).astype(int)
+                idx = idx[(idx >= 0) & (idx < len(x))]
+                hit[fs].append(float(np.mean(
+                    [np.any(x[max(i - 2, 0):i + 3] > thr) for i in idx])))
+        self.assertGreater(np.mean(hit[250.0]), 2 * np.mean(hit[256.0]))
+        self.assertGreater(np.mean(hit[250.0]), 0.15)      # well above chance (0.10)
+        self.assertLess(np.mean(hit[256.0]), 0.15)         # at chance
+
+    def test_the_signal_columns_are_finite_and_two_channels(self):
+        for s in list_subjects(str(REAL)):
+            rec = read_recording(str(REAL), s)
+            with self.subTest(subject=s):
+                self.assertEqual(rec.signal.shape[0], 2)
+                self.assertTrue(np.isfinite(rec.signal).all())
+
+    def test_windows_can_be_built_over_the_whole_cohort(self):
+        ds = EEGIOWindows(str(REAL), win=512, hop=512)
+        self.assertGreater(len(ds), 100)
+        item = ds[0]
+        self.assertEqual(tuple(item["noisy"].shape), (1, 512))
+        self.assertNotIn("clean", item)
