@@ -19,8 +19,27 @@ from typing import List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-#: Where the recordings are expected, if anyone has downloaded them.
-DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "EEG-IO"
+#: Where the recordings might be.  The download unpacks as
+#: ``EEG-EyeBlinks/`` holding EEG-IO beside EEG-VV and EEG-VR, so that layout
+#: is searched as it arrives rather than asking anyone to rename a directory
+#: to match a constant in here.  First hit wins, in this order.
+DATA_DIR_CANDIDATES = (
+    PROJECT_ROOT / "data" / "EEG-IO",
+    PROJECT_ROOT / "data" / "EEG-EyeBlinks" / "EEG-IO",
+    PROJECT_ROOT / "data" / "EEGIO",
+)
+
+
+def find_data_dir() -> Path:
+    """The first candidate that actually holds recordings, else the first."""
+    for d in DATA_DIR_CANDIDATES:
+        if d.is_dir() and any(f.name.endswith("_data.csv") for f in d.iterdir()):
+            return d
+    return DATA_DIR_CANDIDATES[0]
+
+
+#: Kept for callers that want a path without searching.
+DEFAULT_DATA_DIR = DATA_DIR_CANDIDATES[0]
 
 #: Subjects per comparison unless the page says otherwise.  Twenty subjects
 #: times three models times a forward pass over 100 s is minutes, and the
@@ -92,14 +111,16 @@ def dataset_status(data_dir: Optional[str] = None) -> dict:
     import eegio_eval as E
     from data.EEGIO import DATASET_URL, list_subjects
 
-    d = Path(data_dir or DEFAULT_DATA_DIR)
+    d = Path(data_dir) if data_dir else find_data_dir()
     try:
         subs = list_subjects(str(d))
         return {"present": True, "dir": str(d), "subjects": subs, "n": len(subs),
-                "url": DATASET_URL, "fs": E.EEGIO_FS}
+                "url": DATASET_URL, "fs": E.EEGIO_FS,
+                "searched": [str(c) for c in DATA_DIR_CANDIDATES]}
     except FileNotFoundError as e:
         return {"present": False, "dir": str(d), "subjects": [], "n": 0,
-                "url": DATASET_URL, "message": str(e)}
+                "url": DATASET_URL, "message": str(e),
+                "searched": [str(c) for c in DATA_DIR_CANDIDATES]}
 
 
 def meta(data_dir: Optional[str] = None) -> dict:
@@ -135,7 +156,7 @@ def evaluate(spec: dict) -> dict:
     runs = [r for r in (spec.get("runs") or []) if r]
     if not runs:
         raise ValueError("pick at least one run")
-    data_dir = str(spec.get("data_dir") or DEFAULT_DATA_DIR)
+    data_dir = str(spec.get("data_dir") or find_data_dir())
 
     status = dataset_status(data_dir)
     if not status["present"]:
@@ -161,6 +182,7 @@ def evaluate(spec: dict) -> dict:
         "tests": E.compare(results),
         "subjects": subjects,
         "baseline": runs[0],
+        "hop": cfg.hop,
         "causality": results[0]["causality"],
         "metrics": list(E.METRIC_PATHS),
     })

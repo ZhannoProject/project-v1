@@ -50,10 +50,10 @@ The data is not in this repository and is not redistributable: it is obtained
 through the registration form on the dataset page, which
 ``require_dataset()`` prints when the directory is missing.
 
-Two things this module assumes and cannot verify, both flagged where they are
-used: which recorded electrode is ``ch1`` and which is ``ch2`` (the reference
-implementation names neither; it simply takes the first), and what the blink
-codes below 2 mean (it only ever separates ``< 2`` from ``== 2``).
+One thing this module cannot verify, flagged where it is used: what the blink
+codes below 2 mean, since the reference implementation only ever separates
+``< 2`` from ``== 2``. The channel order is no longer among them -- a real
+``_data.csv`` names its columns ``Time (s);FP1;FP2;…`` in its header row.
 """
 
 import csv
@@ -69,9 +69,10 @@ from torch.utils.data import Dataset, DataLoader
 EEGIO_FS = 250.0
 
 #: The two frontal channels, in the column order the data file stores them.
-#: The dataset page says Fp1 and Fp2 were recorded; neither the page nor the
-#: reference implementation says which column is which, so this order is an
-#: assumption and a caller who needs the distinction should verify it.
+#: Confirmed from the files themselves: the header row of a real EEG-IO
+#: ``_data.csv`` reads ``Time (s);FP1;FP2;Channel 3;…``, so column 1 is Fp1
+#: and column 2 is Fp2. (The later columns are unused electrodes parked at a
+#: constant, and the last carries the sampling rate on the first row only.)
 EEGIO_CHANNELS: Tuple[str, ...] = ("Fp1", "Fp2")
 
 #: Label code the reference implementation treats as a *soft* blink.  It

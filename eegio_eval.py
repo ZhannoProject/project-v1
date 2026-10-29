@@ -370,6 +370,14 @@ def onset_leakage(x: np.ndarray, y: np.ndarray, fs: float,
     trained on.  A strictly causal model should measure about zero; one
     licensed 16 samples ahead can lead by up to 16 (62.5 ms at 256 Hz).
     ``background`` is still taken, and still used, to centre the signal.
+
+    **Only meaningful at ``hop=1``.**  The windowed runner hands every model
+    ``hop - 1`` samples of future from its own buffer (see ``stream_apply``),
+    which at any practical hop is larger than the licence being measured and
+    hides it completely.  The first run of this on real recordings was at
+    hop 64 and found no difference at all between a causal model and one
+    licensed 62.5 ms ahead -- not because there is none, but because the
+    buffer had already given both of them more than that.
     """
     x = np.asarray(x, dtype=np.float64)
     base = float(np.median(x[background])) if background.any() else float(np.median(x))
@@ -456,6 +464,17 @@ def stream_apply(model, x: np.ndarray, win: int = 512, hop: int = 32) -> np.ndar
     each window are kept, because those are the samples a live loop would
     have had full context for.  The first window fills the head, which has
     the warm-up every causal model has at the start of a recording.
+
+    **``hop`` is buffering latency, and it is also lookahead.**  The output
+    at sample *t* comes from the window that ends at the next multiple of
+    ``hop`` at or after *t*, so it may depend on inputs up to ``hop - 1``
+    samples past *t*.  In a deployment that is exactly the trade the Deploy
+    tab prices -- hop 32 is 125 ms of buffering -- and it is not a bug.  For
+    ``onset_leakage`` it is fatal: at hop 64 every model, causal or not,
+    gets up to 63 samples of effective lookahead from the buffer alone,
+    which is four times the 16 samples that distinguish the models being
+    compared.  Measure onset lead at ``hop=1``; the other three metrics are
+    power ratios over whole intervals and are not sensitive to it.
     """
     import torch
 
@@ -660,7 +679,10 @@ def compare(results: Sequence[dict], metrics: Sequence[str] = tuple(METRIC_PATHS
 # ============================================================
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Evaluate denoisers on real EEG-IO recordings")
-    ap.add_argument("--data_dir", default=str(PROJECT_ROOT / "data" / "EEG-IO"))
+    from gui.eegio_tab import find_data_dir
+    ap.add_argument("--data_dir", default=str(find_data_dir()),
+                    help="EEG-IO recordings; data/EEG-IO and "
+                         "data/EEG-EyeBlinks/EEG-IO are both found automatically")
     ap.add_argument("--runs", nargs="+", required=True,
                     help="run directories; the first is the baseline the rest are tested against")
     ap.add_argument("--subjects", nargs="*", default=None)

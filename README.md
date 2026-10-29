@@ -264,14 +264,26 @@ dataset ([`meagmohit/BLINK`](https://github.com/meagmohit/BLINK),
 `blink.py`), not guessed: `<subject>_data.csv` is `;`-delimited with one
 header row and columns `(time_s, ch1, ch2)`; `<subject>_labels.csv` is
 `,`-delimited, where a `corrupt,<n>` row announces `<n>` interval rows (an
-end of `-1` meaning "to the end of the recording") and every other row is
-`<time_s>,<code>`. Two things the sources do not settle are flagged in the
-code where they are used: which electrode is `ch1` versus `ch2`, and what
-codes 0 and 1 mean (the reference only ever separates `< 2` from `== 2`).
+end of `-1` meaning "to the end of the recording"), a bare `blinks` line
+separates the two blocks, and every other row is `<time_s>,<code>`. The real
+files settle the channel order themselves — their header reads
+`Time (s);FP1;FP2;Channel 3;…`, so column 1 is Fp1 and column 2 is Fp2, and
+the later columns are unused electrodes parked at a constant. One thing the
+sources still do not settle is flagged in the code: what codes 0 and 1 mean,
+since the reference only ever separates `< 2` from `== 2`.
+
+Read against the real download, the loader finds **20 subjects, 102.3 s each,
+517 blinks and 41 soft blinks** — about 25 per subject, as the dataset page
+describes.
 
 **The data is not in this repository and is not redistributable** — it comes
 through a registration form on the dataset page, which the loader prints when
-the directory is missing. `write_synthetic_recording()` writes a fake subject
+the directory is missing. The download unpacks as `EEG-EyeBlinks/` holding
+`EEG-IO` beside `EEG-VV` and `EEG-VR`, so both `data/EEG-IO/` and
+`data/EEG-EyeBlinks/EEG-IO/` are found automatically; the EEG-IO test tab has
+a **Refresh** button for the case where it is unpacked while the page is
+open. Only EEG-IO is read — `EEG-VV` and `EEG-VR` are a different file format
+(comma-delimited, five header rows). `write_synthetic_recording()` writes a fake subject
 in the same on-disk format so the pipeline can be exercised without it; it is
 a fixture for tests and demos, never a result.
 

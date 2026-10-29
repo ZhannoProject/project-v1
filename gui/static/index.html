@@ -717,6 +717,7 @@
 
     <div class="tab" id="tab-eegio">
       <div class="row">
+        <button id="btnEegioRefresh" title="Look again for the recordings and the runs — after unpacking the dataset, or finishing a training run, without reloading the page">Refresh</button>
         <span class="muted" id="eegioData">…</span>
       </div>
       <div class="row">
@@ -726,8 +727,9 @@
       <div class="row">
         <label class="muted" for="eegioN">subjects</label>
         <input id="eegioN" type="number" min="1" max="20" value="4" style="width:60px">
-        <label class="muted" for="eegioHop">hop</label>
+        <label class="muted" for="eegioHop" title="Samples of buffering between forward passes. It is also lookahead: the output at t comes from the window ending at the next multiple of hop, so every model gets hop-1 samples of future from the buffer. Onset lead is only measurable at hop 1.">hop</label>
         <input id="eegioHop" type="number" min="1" max="512" value="32" style="width:70px">
+        <span class="muted" id="eegioHopWarn"></span>
         <label class="chk"><input type="checkbox" id="eegioZero"> zero-phase filter (non-causal control)</label>
         <label class="chk"><input type="checkbox" id="eegioSoft"> count soft blinks</label>
         <button id="btnEegio" class="primary">Run</button>
@@ -3758,10 +3760,18 @@
     ["onset_leakage_ms", "lead ms", "correction starts this long before the signal moves"],
   ];
 
-  async function refreshEegio() {
+  async function refreshEegio(explicit) {
+    // Re-asked rather than cached for the session: the dataset is unpacked by
+    // hand and runs appear while the page is open, so the answer to "what is
+    // on disk" goes stale without the page doing anything wrong.
+    const btn = $("#btnEegioRefresh");
+    if (explicit && btn) { btn.disabled = true; btn.textContent = "Refreshing…"; }
     try { state.eegio.meta = await api("/api/eegio/meta"); state.eegio.error = null; }
     catch (e) { state.eegio.error = e.message; }
+    if (btn) { btn.disabled = false; btn.textContent = "Refresh"; }
     const m = state.eegio.meta;
+    // Only seed the picks the first time; an explicit refresh must not undo
+    // a selection someone has just made.
     if (m && !state.eegio.picked.length) state.eegio.picked = m.suggested.filter(
       n => m.runs.some(r => r.name === n));
     renderEegio();
@@ -3790,8 +3800,9 @@
       ? `${ds.n} subject(s) in <code>${ds.dir}</code> at ${ds.fs} Hz · ${m.band_note}`
       : `<span class="bad">EEG-IO is not on disk.</span> It is not redistributable;
          request it from <a href="${ds.url}" target="_blank">${ds.url}</a> and unpack it
-         into <code>${ds.dir}</code> as <code>&lt;subject&gt;_data.csv</code> /
-         <code>&lt;subject&gt;_labels.csv</code> pairs.`;
+         so that <code>&lt;subject&gt;_data.csv</code> / <code>&lt;subject&gt;_labels.csv</code>
+         pairs land in any of: ${(ds.searched || [ds.dir]).map(x =>
+           `<code>${x}</code>`).join(", ")} — then press Refresh.`;
 
     // Model picker: the badge says what each run may read ahead, because a
     // _bi twin is a legitimate offline control here and is refused on Deploy.
@@ -3814,6 +3825,14 @@
          run(s)</summary><div class="eegio-more">${rest.map(box).join(" ")}</div></details>`
          : "");
 
+    // hop is buffering, and buffering is lookahead: at hop N every model gets
+    // N-1 samples of future for free, which swamps the licence the ladder is
+    // about. Said here rather than left in the output to be puzzled over.
+    const hop = Number($("#eegioHop").value) || 1;
+    $("#eegioHopWarn").innerHTML = hop > 1
+      ? `<span class="bad">onset lead is not measurable at hop ${hop}</span> —
+         the buffer gives every model ${hop - 1} samples of future; use hop 1 for it`
+      : "";
     $("#btnEegio").disabled = state.eegio.busy || !ds || !ds.present || !state.eegio.picked.length;
     $("#eegioNote").textContent = state.eegio.error ? state.eegio.error
       : state.eegio.busy ? "filtering, detecting and running the models…"
@@ -3837,7 +3856,11 @@
           `<th class="num" title="${t}">${l}</th>`).join("")}<th class="num">blinks kept</th></tr>
         ${out.results.map(r => `<tr>
           <td>${r.run}${r.run === out.baseline ? " <span class='muted'>(baseline)</span>" : ""}</td>
-          ${EEGIO_COLS.map(([k]) => `<td class="num">${num(r.summary[k].median)}</td>`).join("")}
+          ${EEGIO_COLS.map(([k]) => {
+            const dim = k === "onset_leakage_ms" && (out.hop || 1) > 1;
+            return `<td class="num${dim ? " muted" : ""}"${dim
+              ? ' title="not measurable at this hop; the buffer supplies more lookahead than the model does"'
+              : ""}>${num(r.summary[k].median)}</td>`; }).join("")}
           <td class="num muted">${r.rows.reduce((a, x) => a + x.n_kept, 0)}</td></tr>`).join("")}
       </table>
       ${!out.tests.length ? "" : `
@@ -3880,6 +3903,8 @@
     renderEegio();
   });
   $("#btnEegio").addEventListener("click", runEegio);
+  $("#btnEegioRefresh").addEventListener("click", () => refreshEegio(true));
+  $("#eegioHop").addEventListener("input", renderEegio);
 
   // ---------------------------------------------------------------- KD audit
   // Two questions in order: was the distillation wired correctly, and if it
