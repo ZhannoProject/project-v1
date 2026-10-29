@@ -210,6 +210,95 @@ class TestSamplingModes(unittest.TestCase):
 
 
 # ============================================================
+# Training at another sampling rate
+# ============================================================
+@needs_data
+class TestTargetRate(unittest.TestCase):
+    """
+    EEGdenoiseNet arrives at 256 Hz; EEG-IO is 250. Training at the
+    recording's rate removes the resampling step the evaluation would
+    otherwise run, so the epochs can be brought to it at load time.
+    """
+
+    def test_the_default_leaves_the_epochs_exactly_as_they_arrive(self):
+        a = EEGDenoiseDataset(DATA_DIR, "BOTH", "val", master_seed=SEED)
+        b = EEGDenoiseDataset(DATA_DIR, "BOTH", "val", master_seed=SEED, target_fs=None)
+        self.assertEqual(a[0]["noisy"].shape[-1], 512)
+        self.assertEqual(a.fs, 256.0)
+        self.assertIsNone(a.target_fs)
+        for i in (0, 7, 101):
+            self.assertTrue(torch.equal(a[i]["noisy"], b[i]["noisy"]))
+
+    def test_250_hz_gives_500_sample_epochs(self):
+        # 256 -> 250 is exactly 125/128, so 512 becomes 500 and no sample
+        # lands between two others.
+        for art in ("EOG", "EMG", "BOTH"):
+            ds = EEGDenoiseDataset(DATA_DIR, art, "val", master_seed=SEED, target_fs=250.0)
+            with self.subTest(artifact=art):
+                self.assertEqual(ds[0]["noisy"].shape[-1], 500)
+                self.assertEqual(ds.fs, 250.0)
+                self.assertTrue(torch.isfinite(ds[0]["noisy"]).all())
+
+    def test_the_split_does_not_move_with_the_rate(self):
+        # Resampling happens to the pools, not the index sets, so which
+        # epochs are in which split is untouched.
+        a = EEGDenoiseDataset(DATA_DIR, "BOTH", "val", master_seed=SEED)
+        b = EEGDenoiseDataset(DATA_DIR, "BOTH", "val", master_seed=SEED, target_fs=250.0)
+        self.assertEqual(len(a), len(b))
+
+    def test_the_snr_is_still_realised_exactly(self):
+        # The mixing happens after the resampling, so the calibration is
+        # done at the rate the model will see and stays exact.
+        ds = EEGDenoiseDataset(DATA_DIR, "EOG", "val", master_seed=SEED, target_fs=250.0)
+        for i in (0, 11, 97):
+            item = ds[i]
+            sigma = float(item["sigma"])
+            clean = item["clean"][0].numpy() * sigma
+            noise = (item["noisy"][0] - item["clean"][0]).numpy() * sigma
+            self.assertAlmostEqual(realised_snr_db(clean, noise),
+                                   float(item["snr_db"]), places=3)
+
+    def test_a_model_runs_on_a_500_sample_epoch(self):
+        from models.variants import build_model
+
+        ds = EEGDenoiseDataset(DATA_DIR, "BOTH", "val", master_seed=SEED, target_fs=250.0)
+        model = build_model("tcn_se", hidden_channels=16).eval()
+        with torch.no_grad():
+            out = model(ds[0]["noisy"].unsqueeze(0))
+        self.assertEqual(tuple(out.shape), (1, 1, 500))
+
+
+class TestResampleEpochs(unittest.TestCase):
+    """The resampler itself, which needs no dataset."""
+
+    def test_the_identity_case_copies_rather_than_resamples(self):
+        from data.Dataloader import resample_epochs
+
+        x = np.random.default_rng(0).normal(size=(4, 512)).astype(np.float32)
+        np.testing.assert_array_equal(resample_epochs(x, 256.0, 256.0), x)
+
+    def test_256_to_250_is_exactly_125_over_128(self):
+        from data.Dataloader import resample_epochs
+
+        x = np.random.default_rng(1).normal(size=(3, 512)).astype(np.float32)
+        y = resample_epochs(x, 256.0, 250.0)
+        self.assertEqual(y.shape, (3, 500))
+        self.assertEqual(y.dtype, np.float32)
+
+    def test_a_slow_sine_survives_the_conversion(self):
+        # EEG and blink energy are low-frequency; what matters is that the
+        # band the artifacts live in is not disturbed.
+        from data.Dataloader import resample_epochs
+
+        t = np.arange(512) / 256.0
+        x = np.sin(2 * np.pi * 5.0 * t)[None, :].astype(np.float32)
+        y = resample_epochs(x, 256.0, 250.0)
+        t2 = np.arange(y.shape[1]) / 250.0
+        want = np.sin(2 * np.pi * 5.0 * t2)
+        self.assertLess(float(np.abs(y[0][40:-40] - want[40:-40]).max()), 0.02)
+
+
+# ============================================================
 # What a sample says about itself
 # ============================================================
 @needs_data

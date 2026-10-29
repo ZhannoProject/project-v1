@@ -96,6 +96,10 @@ SCHEMA: List[Section] = [
         Field("batch_size", "int", 32, min=1),
         Field("snr_range_db", "range2", [-7.0, 2.0],
               help="Train: uniform in [lo, hi]; val/test: 10-point grid over it"),
+        Field("target_fs", "float", None, nullable=True, min=1.0, max=100000.0,
+              help="Resample the epochs to this rate before training (e.g. 250, "
+                   "EEG-IO's rate: 512-sample epochs become 500). Empty leaves "
+                   "them at the 256 Hz they arrive at, as every run on disk did"),
         Field("master_seed", "int", 42, min=0,
               help="Seed for splits, SNR, weight init, dropout and batch order"),
         Field("device", "select", "auto", choices="devices",

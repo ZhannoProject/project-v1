@@ -202,6 +202,35 @@ python -m trainer --config configs/tcn_se_both.yaml      # legacy, as every run 
 Neither mode changes the leak-free split, the seeding, or the artifact-switch
 probe, whose draws are bit-identical either way.
 
+### Training at another sampling rate
+
+EEGdenoiseNet arrives at 256 Hz — 512-sample epochs over 2 s — and EEG-IO,
+the real recordings the models are tested on, is 250 Hz. Everything in
+`runs/` was trained at 256 and reaches EEG-IO by resampling 250 → 256, which
+is a step a deployment would also have to run. `target_fs` removes it from
+the other end:
+
+```bash
+python -m trainer --config configs/tcn_se_both_250hz.yaml
+python -m trainer --config configs/tcn_se_both.yaml --target_fs 250
+```
+
+The epochs are resampled **once, at load, before anything is split or
+mixed**, so the split is untouched (it is index-level and the index sets do
+not change) and the SNR calibration still happens at the rate the model will
+see — measured still exact to 0.00000 dB. 256 → 250 is exactly 125/128, so a
+512-sample epoch becomes 500 and no sample lands between two others.
+
+What moves with it: the receptive field is still 125 samples but now covers
+**500 ms instead of 488**, and every figure in milliseconds divides by 250
+rather than 256 — including the lookahead ladder's rungs, where `la16` is
+64 ms rather than 62.5. A run records `target_fs` in its `history.json` so
+that cannot be got wrong afterwards, and it is a field in the GUI's form.
+
+`target_fs: null` (the default, and absent from every preset but the 250 Hz
+one) leaves the epochs exactly as they arrive, verified bit-identical against
+the loader before this existed.
+
 ## A second dataset: EEG-IO (real recordings, annotated blinks)
 
 `data/EEGIO.py` reads [EEG-IO](https://gnan.ece.gatech.edu/eeg-eyeblinks), and

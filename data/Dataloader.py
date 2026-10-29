@@ -38,6 +38,36 @@ from torch.utils.data import Dataset, DataLoader
 #: dataset so a caller can say which it used.
 SAMPLING_MODES = ("legacy", "balanced")
 
+#: The rate EEGdenoiseNet's epochs arrive at: 512 samples over 2 seconds.
+#: Written down rather than inferred, because it is the denominator of every
+#: "ms" in this project and a run that trains at another rate has to record
+#: which one it used.
+NATIVE_FS = 256.0
+
+
+def resample_epochs(epochs: np.ndarray, fs_in: float, fs_out: float) -> np.ndarray:
+    """
+    Resample ``(n_epochs, n_samples)`` from one rate to another.
+
+    Done once, on the raw pools, before anything is split or mixed -- so the
+    SNR calibration still happens at the rate the model will see, and the
+    splits are untouched (they are index-level and the index set does not
+    change). 256 -> 250 is exactly 125/128, so a 512-sample epoch becomes
+    500 samples and no sample lands between two others.
+    """
+    if fs_in == fs_out:
+        return np.ascontiguousarray(epochs, dtype=np.float32)
+    from fractions import Fraction
+
+    from scipy.signal import resample_poly
+
+    ratio = (Fraction(fs_out).limit_denominator(10_000)
+             / Fraction(fs_in).limit_denominator(10_000))
+    out = resample_poly(np.asarray(epochs, dtype=np.float64),
+                        ratio.numerator, ratio.denominator, axis=-1)
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
 #: An epoch whose RMS is below this is treated as degenerate.  Such an epoch
 #: cannot be mixed at any SNR -- ``artifact_gain`` would return 0 and the
 #: sample would silently come out as all zeros -- so it is refused at load
@@ -190,6 +220,7 @@ class EEGDenoiseDataset(Dataset):
         fixed_snr_db: Optional[float] = None,
         master_seed: int = 42,
         sampling: str = "legacy",
+        target_fs: Optional[float] = None,
     ):
         assert split in self.SPLIT_OFFSET, f"split must be one of {list(self.SPLIT_OFFSET)}"
         assert artifact_type in ("EOG", "EMG", "BOTH"), \
@@ -203,10 +234,16 @@ class EEGDenoiseDataset(Dataset):
         self.fixed_snr_db = fixed_snr_db
         self.sampling = sampling
         self.master_seed = int(master_seed)
+        # None means "leave it alone", which is what every run on disk did
+        # and what keeps them reproducible; a number resamples the pools.
+        self.fs = float(target_fs) if target_fs else NATIVE_FS
+        self.target_fs = target_fs
 
         # ---- 1. Load raw numpy arrays ----
         clean_all = _load_epochs(data_dir, "EEG")
         seq_len = clean_all.shape[1]
+        rs = (lambda a: resample_epochs(a, NATIVE_FS, self.fs)) if target_fs else (lambda a: a)
+        clean_all = rs(clean_all)
 
         # Build disjoint clean indices for this split
         clean_idx = self._split_indices(len(clean_all), split_ratios, split, master_seed)
@@ -215,8 +252,8 @@ class EEGDenoiseDataset(Dataset):
 
         if artifact_type == "BOTH":
             # ---- BOTH mode: load EOG and EMG, pair each independently ----
-            eog_all = _load_epochs(data_dir, "EOG", seq_len)
-            emg_all = _load_epochs(data_dir, "EMG", seq_len)
+            eog_all = rs(_load_epochs(data_dir, "EOG", seq_len))
+            emg_all = rs(_load_epochs(data_dir, "EMG", seq_len))
 
             eog_idx = self._split_indices(len(eog_all), split_ratios, split, master_seed + 99)
             emg_idx = self._split_indices(len(emg_all), split_ratios, split, master_seed + 199)
@@ -230,10 +267,11 @@ class EEGDenoiseDataset(Dataset):
 
             print(f"[Dataset] {split:>5s} | BOTH (EOG+EMG) | pairs={n_clean}"
                   f"{'' if n_clean == n else f' (artifacts resampled from {n})'}"
-                  f"{'' if sampling == 'legacy' else ' | sampling=balanced'}")
+                  f"{'' if sampling == 'legacy' else ' | sampling=balanced'}"
+                  f"{'' if not target_fs else f' | {self.fs:g} Hz, {clean_all.shape[1]} samples'}")
         else:
             # ---- Single artifact mode (EOG or EMG) ----
-            art_all = _load_epochs(data_dir, artifact_type, seq_len)
+            art_all = rs(_load_epochs(data_dir, artifact_type, seq_len))
 
             art_idx = self._split_indices(len(art_all), split_ratios, split, master_seed + 99)
 
@@ -246,7 +284,8 @@ class EEGDenoiseDataset(Dataset):
 
             print(f"[Dataset] {split:>5s} | {artifact_type} | pairs={n_clean}"
                   f"{'' if n_clean == n else f' (artifacts resampled from {n})'}"
-                  f"{'' if sampling == 'legacy' else ' | sampling=balanced'}")
+                  f"{'' if sampling == 'legacy' else ' | sampling=balanced'}"
+                  f"{'' if not target_fs else f' | {self.fs:g} Hz, {clean_all.shape[1]} samples'}")
 
         # ---- Per-sample RNG (only used for random SNR in training) ----
         # Kept as an attribute, which is why ``worker_init_fn`` below exists:
@@ -756,6 +795,7 @@ def build_dataloaders(
     master_seed: int = 42,
     sampling: str = "legacy",
     num_workers: int = 0,
+    target_fs: Optional[float] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build train, val, and test DataLoaders that share the same master seed
@@ -771,6 +811,10 @@ def build_dataloaders(
     stream is split per worker (see ``worker_init_fn``), so the same seed
     gives the same *distribution* but not the same samples in the same order.
     ``sampling`` is passed through to the dataset; see ``SAMPLING_MODES``.
+    ``target_fs`` resamples the epochs before anything else happens -- 250
+    gives 500-sample epochs instead of 512 -- and ``None``, the default,
+    leaves them at the 256 Hz they arrive at, which is what every run on
+    disk used.
     """
     # Enable pinned memory for faster host-to-device transfer when on GPU/MPS
     pin = torch.cuda.is_available() or torch.backends.mps.is_available()
@@ -784,6 +828,7 @@ def build_dataloaders(
             snr_range_db=snr_range_db,
             master_seed=master_seed,
             sampling=sampling,
+            target_fs=target_fs,
         )
         train = split == "train"
         return DataLoader(

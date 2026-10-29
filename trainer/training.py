@@ -109,6 +109,12 @@ class Trainer:
                                                "learning_rate", "attn_lr_scale", "weight_decay",
                                                "sched_warmup_epochs", "eta_min",
                                                "snr_range_db", "master_seed",
+                                               # The rate the epochs were resampled
+                                               # to, if any. Every "ms" in this
+                                               # project is divided by it, so a run
+                                               # that does not record it cannot be
+                                               # read on the latency axis at all.
+                                               "target_fs",
                                                "staged", "teacher_ckpt",
                                                # The recipe a distilled run was made with.
                                                # teacher_ckpt alone says a run was distilled and

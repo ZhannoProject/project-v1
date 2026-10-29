@@ -96,6 +96,10 @@ def main():
                         help="Replace the identity skip around each attention block with a "
                              "low-rank BottleneckSkip of this ratio (e.g. 0.5), so attention "
                              "cannot be bypassed. Default: off (identity skip).")
+    parser.add_argument("--target_fs", type=float, default=None,
+                        help="resample the EEGdenoiseNet epochs to this rate before "
+                             "training (e.g. 250 for EEG-IO's rate; 512-sample epochs "
+                             "become 500). Default: leave them at 256 Hz.")
     parser.add_argument("--master_seed", type=int, default=None,
                         help="Seed for data splits, SNR draws, weight init, dropout and "
                              "batch order (default 42)")
@@ -166,6 +170,7 @@ def main():
     cfg.setdefault("master_seed",       DEFAULT_MASTER_SEED)
     cfg.setdefault("overwrite",         False)
     cfg.setdefault("device",            "auto")
+    cfg.setdefault("target_fs",         None)
     cfg.setdefault("teacher_ckpt",      None)
     cfg.setdefault("teacher_config",    None)
     cfg.setdefault("kd_alpha",          0.5)
@@ -259,6 +264,7 @@ def main():
         batch_size=cfg["batch_size"],
         snr_range_db=tuple(cfg["snr_range_db"]),
         master_seed=cfg["master_seed"],
+        target_fs=cfg["target_fs"],
     )
 
     # Model settings, including optional quantization, are saved in checkpoints.
