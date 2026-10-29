@@ -522,6 +522,27 @@ def load_run(run: str):
 # ============================================================
 @dataclass
 class EvalConfig:
+    """
+    How a recording is brought to the model.
+
+    ``target_fs`` is the one with a real trade-off behind it and no right
+    answer, so both settings are offered rather than one being chosen here:
+
+      * ``256`` (the default) resamples EEG-IO's 250 Hz to the rate every
+        model in this project was trained at.  The ratio is exactly 128/125
+        so the rate conversion itself is clean, but it is a resampling step
+        the deployment would also have to run.
+      * ``250`` or ``None`` keeps the native rate and skips the conversion.
+        Nothing touches the samples -- but the model then sees time dilated
+        by 2.4%: its 125-sample receptive field covers 500 ms of recording
+        instead of the 488 ms it was trained on, and every filter inside it
+        sits 2.4% low in frequency.
+
+    Neither is the honest default for a deployment, which would retrain at
+    the acquisition rate; this is an evaluation, and running both says how
+    much the choice is worth.
+    """
+
     band: Tuple[float, float] = TRAIN_BAND_HZ
     notch_hz: Optional[float] = POWERLINE_HZ
     zero_phase: bool = False
@@ -695,6 +716,12 @@ def main(argv=None):
     ap.add_argument("--subjects", nargs="*", default=None)
     ap.add_argument("--channel", type=int, default=0)
     ap.add_argument("--hop", type=int, default=32)
+    ap.add_argument("--target_fs", type=float, default=PROJECT_FS,
+                    help=f"rate to run the model at: {PROJECT_FS:g} (default) resamples "
+                         f"to the training rate, {EEGIO_FS:g} keeps EEG-IO's native one "
+                         f"and skips the conversion at the cost of 2.4%% time dilation")
+    ap.add_argument("--native", action="store_true",
+                    help=f"shorthand for --target_fs {EEGIO_FS:g}")
     ap.add_argument("--zero_phase", action="store_true",
                     help="control: the non-causal filter EEGdenoiseNet itself used")
     ap.add_argument("--no_notch", action="store_true")
@@ -704,12 +731,15 @@ def main(argv=None):
 
     cfg = EvalConfig(channel=a.channel, hop=a.hop, zero_phase=a.zero_phase,
                      notch_hz=None if a.no_notch else POWERLINE_HZ,
+                     target_fs=EEGIO_FS if a.native else a.target_fs,
                      include_soft=a.include_soft)
     results = [evaluate_subjects(a.data_dir, Path(r).name, a.subjects, cfg) for r in a.runs]
 
     c = results[0]["causality"]
+    rate = (f"native {EEGIO_FS:g} Hz, no resampling" if cfg.target_fs in (None, EEGIO_FS)
+            else f"resampled {EEGIO_FS:g} -> {cfg.target_fs:g} Hz")
     print(f"\n  preprocessing: {'zero-phase (NON-CAUSAL control)' if cfg.zero_phase else 'causal, sosfilt'}"
-          f"  past_diff={c['past_diff']:.2e}")
+          f"  past_diff={c['past_diff']:.2e}   rate: {rate}")
     print(f"  {'run':<26}{'supp dB':>9}{'fidel dB':>10}{'resid':>8}{'lead ms':>9}{'subj':>6}")
     for r in results:
         s = r["summary"]

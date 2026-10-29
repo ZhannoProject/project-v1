@@ -136,6 +136,10 @@ def meta(data_dir: Optional[str] = None) -> dict:
             "band_hz": list(E.TRAIN_BAND_HZ), "notch_hz": E.POWERLINE_HZ,
             "target_fs": E.PROJECT_FS, "detect_k": 4.0,
         },
+        "rates": [{"value": E.PROJECT_FS, "label": f"{E.PROJECT_FS:g} Hz (training rate)",
+                   "note": "resamples 250 -> 256, exactly 128/125"},
+                  {"value": E.EEGIO_FS, "label": f"{E.EEGIO_FS:g} Hz (native)",
+                   "note": "no resampling; the model sees time dilated by 2.4%"}],
         "band_note": (f"{E.TRAIN_BAND_HZ[0]:g}–{E.TRAIN_BAND_HZ[1]:g} Hz with a "
                       f"{E.POWERLINE_HZ:g} Hz notch, read off EEGdenoiseNet's own "
                       f"preprocessing script, applied with sosfilt so the filter is "
@@ -174,6 +178,7 @@ def evaluate(spec: dict) -> dict:
         notch_hz=None if spec.get("no_notch") else E.POWERLINE_HZ,
         include_soft=bool(spec.get("include_soft")),
         detect_k=float(spec.get("detect_k") or 4.0),
+        target_fs=float(spec.get("target_fs") or E.PROJECT_FS),
     )
 
     results = [E.evaluate_subjects(data_dir, r, subjects, cfg) for r in runs]
@@ -183,6 +188,8 @@ def evaluate(spec: dict) -> dict:
         "subjects": subjects,
         "baseline": runs[0],
         "hop": cfg.hop,
+        "target_fs": cfg.target_fs,
+        "native_fs": E.EEGIO_FS,
         "causality": results[0]["causality"],
         "metrics": list(E.METRIC_PATHS),
     })

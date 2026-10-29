@@ -730,6 +730,8 @@
         <label class="muted" for="eegioHop" title="Samples of buffering between forward passes. It is also lookahead: the output at t comes from the window ending at the next multiple of hop, so every model gets hop-1 samples of future from the buffer. Onset lead is only measurable at hop 1.">hop</label>
         <input id="eegioHop" type="number" min="1" max="512" value="32" style="width:70px">
         <span class="muted" id="eegioHopWarn"></span>
+        <label class="muted" for="eegioRate">rate</label>
+        <select id="eegioRate" title="256 Hz resamples EEG-IO's 250 to the rate the models were trained at (exactly 128/125). 250 Hz skips the conversion, at the cost of the model seeing time dilated by 2.4%."></select>
         <label class="chk"><input type="checkbox" id="eegioZero"> zero-phase filter (non-causal control)</label>
         <label class="chk"><input type="checkbox" id="eegioSoft"> count soft blinks</label>
         <button id="btnEegio" class="primary">Run</button>
@@ -3786,6 +3788,7 @@
         n_subjects: Number($("#eegioN").value) || 4,
         hop: Number($("#eegioHop").value) || 32,
         zero_phase: $("#eegioZero").checked,
+        target_fs: Number($("#eegioRate").value) || undefined,
         include_soft: $("#eegioSoft").checked,
       });
     } catch (e) { state.eegio.error = e.message; state.eegio.out = null; }
@@ -3833,6 +3836,14 @@
       ? `<span class="bad">onset lead is not measurable at hop ${hop}</span> —
          the buffer gives every model ${hop - 1} samples of future; use hop 1 for it`
       : "";
+    const sel = $("#eegioRate");
+    if (m && m.rates && sel.options.length !== m.rates.length) {
+      sel.innerHTML = "";
+      for (const r of m.rates) {
+        const o = new Option(r.label, r.value); o.title = r.note; sel.appendChild(o);
+      }
+      sel.value = String(m.defaults.target_fs);
+    }
     $("#btnEegio").disabled = state.eegio.busy || !ds || !ds.present || !state.eegio.picked.length;
     $("#eegioNote").textContent = state.eegio.error ? state.eegio.error
       : state.eegio.busy ? "filtering, detecting and running the models…"
@@ -3844,7 +3855,12 @@
     const num = v => (v == null || !isFinite(v)) ? "—" : v.toFixed(2);
 
     $("#eegioBody").innerHTML = `
-      <p class="hint">Preprocessing ${$("#eegioZero").checked
+      <p class="hint">Rate: ${out.target_fs === out.native_fs
+        ? `<b>native ${out.native_fs} Hz</b>, no resampling — the model sees time dilated
+           by 2.4% relative to its training rate`
+        : `resampled ${out.native_fs} → ${out.target_fs} Hz (exactly 128/125), the rate
+           the models were trained at`}.
+        Preprocessing ${$("#eegioZero").checked
         ? '<b class="bad">zero-phase — the non-causal control; it cannot run online</b>'
         : "causal (sosfilt, one pass forwards)"}:
         a perturbation moved the filtered signal <b>${c.past_diff.toExponential(1)}</b>

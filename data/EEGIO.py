@@ -77,10 +77,13 @@ from torch.utils.data import Dataset, DataLoader
 #: low-frequency excursion 32% of the time against 8% at 256 Hz, which is
 #: chance by construction of that test.
 #:
-#: The trap is the *step* between timestamps: it is 1/256 for most samples,
-#: with a longer step every twentieth or so, which reads as a 256 Hz clock
-#: if only the median is looked at.  It is a 1/256-quantised timestamp on a
-#: 250 Hz acquisition, not a 256 Hz one -- the column's own span says so.
+#: The trap is the *step* between timestamps, which is 1/256 for 90% of
+#: samples and so reads as a 256 Hz clock if only the median is taken.  The
+#: real resolution is 1/1024 s: a 250 Hz sample is 4.096 of those ticks, so
+#: the column emits 4 ticks 90.4% of the time and 5 ticks 9.6% of the time,
+#: averaging 4.0960 -- which is 1024/250 to seven figures.  1/256 is simply
+#: what 4 ticks happen to equal.  The acquisition is 250 Hz; the data has
+#: not been resampled to anything.
 EEGIO_FS = 250.0
 
 #: The two frontal channels, in the column order the data file stores them.
@@ -116,7 +119,7 @@ class Recording:
     signal: np.ndarray          # (n_channels, n_samples), float32
     #: Seconds, on the ``fs`` clock: ``arange(n) / fs``. Regular by
     #: construction, unlike the file's own timestamp column, which is
-    #: quantised to 1/256 and steps unevenly (see EEGIO_FS). Everything here
+    #: quantised to 1/1024 and steps unevenly (see EEGIO_FS). Everything here
     #: -- blink_samples, corrupt_mask, duration_s -- is on this axis, so they
     #: cannot disagree with each other.
     t: np.ndarray
@@ -268,7 +271,7 @@ def read_recording(data_dir: str, subject: str) -> Recording:
     signal = np.ascontiguousarray(raw[:, 1:].T, dtype=np.float32)   # (2, N)
     n = signal.shape[1]
     # The canonical axis is the rate's, not the file's: the recorded
-    # timestamps are quantised to 1/256 and so step unevenly (see EEGIO_FS),
+    # timestamps are quantised to 1/1024 and so step unevenly (see EEGIO_FS),
     # and an axis that jitters is a poor thing to place annotations on even
     # when its average is right.  The two agree to under a millisecond over
     # a 100 s recording, so this is tidiness rather than a correction.

@@ -283,12 +283,15 @@ number from this loader:
 - **Sessions are not all the same length** (77–103 s; S06 is the short one),
   so nothing may assume a fixed one.
 - **The sampling rate is 250 Hz, and the timestamp column looks like it says
-  otherwise.** Its steps are quantised to 1/256, with a longer step every
-  twentieth or so, which reads as a 256 Hz clock if only the median is taken.
-  The column's *span* is `n/250` s (250.001 Hz measured), the file's own
-  `Sampling Rate` field says 250, and converting the annotations at 250 Hz
-  lands them on a blink 32 % of the time against 8 % at 256 Hz — chance, by
-  construction of that test. `Recording.t` is therefore `arange(n)/fs`, with
+  256.** Its step is 1/256 for 90 % of samples, so the median reads as a
+  256 Hz clock. It isn't: the real resolution is **1/1024 s**, a 250 Hz
+  sample is 4.096 of those ticks, and the column emits 4 ticks 90.4 % of the
+  time and 5 ticks 9.6 % of the time — averaging 4.0960, which is 1024/250 to
+  seven figures. 1/256 is just what 4 ticks equal. The file's own `Sampling
+  Rate` field says 250, the column spans `n/250` s, and converting the
+  annotations at 250 Hz lands them on a blink 32 % of the time against 8 % at
+  256 Hz — chance, by construction of that test. **The recordings have not
+  been resampled to anything.** `Recording.t` is therefore `arange(n)/fs`, with
   the file's column kept beside it as `t_recorded` for inspection; the two
   agree to under a millisecond over 100 s.
 
@@ -373,7 +376,36 @@ would swamp the comparison if the groups were pooled.
 ```bash
 python eegio_eval.py --data_dir data/EEG-IO \
        --runs runs/tcn_se_both runs/tcn_se_la16_both runs/tcn_se_bi_both
+python eegio_eval.py --runs runs/tcn_se_both --native     # EEG-IO's own 250 Hz
 ```
+
+**Which rate to run at.** EEG-IO is 250 Hz and every model here was trained
+at 256, so one of the two has to give, and there is no right answer short of
+retraining. Both are offered — `--target_fs` on the CLI, a **rate** selector
+in the tab — and the result says which was used:
+
+| | |
+|---|---|
+| **256 Hz** (default) | resamples 250 → 256, exactly 128/125, so the conversion is clean. The model runs at the rate it was trained at. A deployment would have to run this step too. |
+| **250 Hz** (`--native`) | no resampling; nothing touches the samples. But the model then sees time **dilated by 2.4 %** — its 125-sample receptive field covers 500 ms of recording instead of the 488 ms it was trained on, and every filter inside it sits 2.4 % low. |
+
+Neither is what a deployment should do, which is retrain at the acquisition
+rate — the first item on the review list and the one still outstanding.
+Measured on all 20 subjects, causal preprocessing, hop 64:
+
+| | 256 Hz: supp / fidel / resid | 250 Hz: supp / fidel / resid |
+|---|---|---|
+| `tcn_se_both` | 16.75 / 1.64 / 0.06 | 16.32 / 1.85 / 0.17 |
+| `tcn_se_la16_both` | 17.37 / 1.50 / 0.00 | 17.02 / 1.58 / 0.06 |
+| `tcn_se_bi_both` | 18.62 / 0.96 / 0.00 | 18.13 / 0.96 / 0.04 |
+
+**The ordering survives the choice**, which is the thing that mattered:
+suppression rises and fidelity falls with future context at both rates, in
+the same order. Running native costs about 0.4 dB of suppression and leaves
+noticeably more blinks detectable (0.17 against 0.06 for the causal model),
+and buys about 0.2 dB of background fidelity. So matching the training rate
+is the better operating point here, and resampling is not what is holding
+the models back.
 
 The first run is the baseline the rest are paired against. The tab suggests
 exactly that triple: the causal model, the rung licensed 62.5 ms of

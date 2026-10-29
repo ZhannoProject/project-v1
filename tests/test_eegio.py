@@ -413,8 +413,16 @@ class TestAgainstTheRealDownload(unittest.TestCase):
             implied = (rec.n_samples - 1) / (rec.t_recorded[-1] - rec.t_recorded[0])
             with self.subTest(subject=s):
                 self.assertAlmostEqual(implied, EEGIO_FS, delta=0.01)
+                # The trap: the median step is 1/256, which reads as a 256 Hz
+                # clock. The resolution is really 1/1024 and a 250 Hz sample
+                # is 4.096 of those, so the column emits 4 ticks about 90% of
+                # the time and 5 ticks about 10%, averaging exactly 1024/250.
                 self.assertAlmostEqual(float(np.median(np.diff(rec.t_recorded))),
-                                       1 / 256, places=8)   # the trap
+                                       1 / 256, places=8)
+                ticks = np.diff(rec.t_recorded) * 1024
+                self.assertTrue(np.all(np.isin(np.round(ticks, 3), [4.0, 5.0])),
+                                "a step that is neither 4 nor 5 ticks of 1/1024 s")
+                self.assertAlmostEqual(float(ticks.mean()), 1024 / EEGIO_FS, places=3)
 
     def test_the_canonical_axis_agrees_with_the_recorded_one(self):
         for s in list_subjects(str(REAL))[:5]:

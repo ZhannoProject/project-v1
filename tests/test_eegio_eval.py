@@ -320,6 +320,77 @@ class TestPairing(unittest.TestCase):
 
 
 # ============================================================
+# Running at the native rate instead of the training rate
+# ============================================================
+class TestTargetRate(unittest.TestCase):
+    """
+    EEG-IO is 250 Hz and the models were trained at 256, so one of the two
+    has to give. Both settings are offered and both have to work.
+    """
+
+    def _recording(self, d, dur=12.0):
+        return write_synthetic_recording(d, "S00", duration_s=dur, n_blinks=4,
+                                         n_soft=0, seed=5, amplitude=60.0, drift=0.0)
+
+    def test_the_default_resamples_to_the_training_rate(self):
+        self.assertEqual(E.EvalConfig().target_fs, E.PROJECT_FS)
+        self.assertEqual(E.PROJECT_FS, 256.0)
+        self.assertEqual(E.EEGIO_FS, 250.0)
+
+    def test_the_native_rate_skips_the_conversion(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = self._recording(d)
+            out = E.evaluate_subjects(d, "identity", ["S00"],
+                                      E.EvalConfig(target_fs=E.EEGIO_FS, hop=256),
+                                      apply_fn=lambda x: x)
+        row = out["rows"][0]
+        self.assertEqual(row["fs"], E.EEGIO_FS)
+        self.assertEqual(row["n_samples"], rec.n_samples)      # untouched
+
+    def test_none_means_the_native_rate_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = self._recording(d)
+            out = E.evaluate_subjects(d, "identity", ["S00"],
+                                      E.EvalConfig(target_fs=None, hop=256),
+                                      apply_fn=lambda x: x)
+        self.assertEqual(out["rows"][0]["n_samples"], rec.n_samples)
+
+    def test_resampling_changes_the_length_by_the_rate_ratio(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = self._recording(d)
+            out = E.evaluate_subjects(d, "identity", ["S00"],
+                                      E.EvalConfig(target_fs=E.PROJECT_FS, hop=256),
+                                      apply_fn=lambda x: x)
+        self.assertEqual(out["rows"][0]["fs"], E.PROJECT_FS)
+        self.assertEqual(out["rows"][0]["n_samples"],
+                         round(rec.n_samples * E.PROJECT_FS / E.EEGIO_FS))
+
+    def test_both_rates_find_the_same_blinks(self):
+        # The conversion must not move the annotations off the artifacts.
+        with tempfile.TemporaryDirectory() as d:
+            self._recording(d, dur=20.0)
+            kept = {}
+            for fs in (E.EEGIO_FS, E.PROJECT_FS):
+                out = E.evaluate_subjects(d, "identity", ["S00"],
+                                          E.EvalConfig(target_fs=fs, hop=256),
+                                          apply_fn=lambda x: x)
+                kept[fs] = out["rows"][0]["n_kept"]
+        self.assertGreater(kept[E.EEGIO_FS], 0)
+        self.assertEqual(kept[E.EEGIO_FS], kept[E.PROJECT_FS])
+
+    def test_the_preprocessing_is_causal_at_either_rate(self):
+        for fs in (E.EEGIO_FS, E.PROJECT_FS):
+            with self.subTest(fs=fs):
+                self.assertEqual(E.preprocess_is_causal(fs)["past_diff"], 0.0)
+
+    def test_the_tab_offers_both_and_reports_which_was_used(self):
+        from gui.eegio_tab import meta
+
+        rates = {r["value"] for r in meta()["rates"]}
+        self.assertEqual(rates, {E.EEGIO_FS, E.PROJECT_FS})
+
+
+# ============================================================
 # The tab's glue
 # ============================================================
 class TestTabGlue(unittest.TestCase):
