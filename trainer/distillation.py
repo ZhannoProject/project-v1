@@ -213,7 +213,7 @@ class FeatureTap:
     Names are dotted paths as in ``model.named_modules()``.
     """
 
-    def __init__(self, model: nn.Module, layer_names: Sequence[str]):
+    def __init__(self, model: nn.Module, layer_names: Sequence[str], role: str = "model"):
         self.features: Dict[str, torch.Tensor] = {}
         self._handles = []
         for name in layer_names:
@@ -222,8 +222,8 @@ class FeatureTap:
             except AttributeError as e:
                 available = [n for n, _ in model.named_modules() if n and "." not in n]
                 raise ValueError(
-                    f"kd_feature_layers: '{name}' is not a submodule of "
-                    f"{type(model).__name__}; top-level modules are {available}"
+                    f"kd_feature_layers: the {role} ({type(model).__name__}) has no "
+                    f"submodule '{name}'; its top-level modules are {available}"
                 ) from e
             self._handles.append(module.register_forward_hook(self._make_hook(name)))
 
@@ -322,15 +322,52 @@ class FeatureProjector(nn.Module):
 
 
 @torch.no_grad()
+def _check_tappable(student: nn.Module, teacher: nn.Module, pairs) -> None:
+    """
+    Refuse a feature tap that cannot exist, and say what to do instead.
+
+    The feature term matches a named submodule of the student against one of
+    the teacher, and ``kd_feature_layers`` defaults to ``["decoder"]`` --
+    which only the MHA/MLA sandwich variants have.  Distilling across
+    families is where this bites: a ``tcn_se`` teacher is a backbone and a
+    head, with no attention decoder for a sandwich student's ``decoder`` to
+    be matched against.  torch's own message for that is "X has no attribute
+    `decoder`", which says nothing about which model, or that three perfectly
+    good ways out exist.
+    """
+    tops = lambda m: [n for n, _ in m.named_modules() if n and "." not in n]  # noqa: E731
+    for label, s_name, t_name in pairs:
+        for role, model, name in (("student", student, s_name), ("teacher", teacher, t_name)):
+            try:
+                model.get_submodule(name)
+            except AttributeError as e:
+                other = "teacher" if role == "student" else "student"
+                other_model = teacher if role == "student" else student
+                raise ValueError(
+                    f"kd_feature_layers: the {role} ({type(model).__name__}) has no "
+                    f"submodule '{name}'.\n"
+                    f"  {role} top-level modules: {tops(model)}\n"
+                    f"  {other} ({type(other_model).__name__}): {tops(other_model)}\n"
+                    f"  The feature term matches one named module against another, so it "
+                    f"needs a module both models have. Either:\n"
+                    f"    kd_feature_weight: 0      turn the feature term off and distil on "
+                    f"the outputs alone, which needs no shared module;\n"
+                    f"    kd_feature_layers: [...]  name a module both have;\n"
+                    f"    kd_feature_layers: ['student_path:teacher_path']  pair two that "
+                    f"are named differently."
+                ) from e
+
+
 def probe_feature_shapes(student: nn.Module, teacher: nn.Module, pairs, seq_len: int) -> dict:
     """
     One dry forward of each model on a zero window → ``{label: (student_shape,
     teacher_shape)}`` for the tapped submodules (batch axis excluded).
     """
+    _check_tappable(student, teacher, pairs)
     dev = next(student.parameters()).device
     x = torch.zeros(1, 1, seq_len, device=dev)
-    s_tap = FeatureTap(student, [s for _, s, _ in pairs])
-    t_tap = FeatureTap(teacher, [t for _, _, t in pairs])
+    s_tap = FeatureTap(student, [s for _, s, _ in pairs], "student")
+    t_tap = FeatureTap(teacher, [t for _, _, t in pairs], "teacher")
     was_training = student.training
     try:
         student.eval()(x)

@@ -3957,7 +3957,10 @@
       state.kd.decomp = row.teacher_run
         ? await api("/api/kd/decompose", { teacher: row.teacher_run, students,
                                            artifact: row.artifact,
-                                           master_seed: row.master_seed })
+                                           master_seed: row.master_seed,
+                                           // the rate the run trained at: a 250 Hz
+                                           // run was validated on 500-sample epochs
+                                           target_fs: row.target_fs })
         : null;
     } catch (e) { state.kd.error = e.message; }
     state.kd.busy = false; renderKd();

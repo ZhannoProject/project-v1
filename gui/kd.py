@@ -109,6 +109,7 @@ def kd_runs() -> List[dict]:
             "control": control["name"] if control else None,
             "control_rrmse_t": control["rrmse_t"] if control else None,
             "recipe": _recorded_recipe(r["name"]),
+            "target_fs": (_history(r["name"]).get("config") or {}).get("target_fs"),
         })
     return out
 
@@ -261,7 +262,8 @@ def static_checks(student: str, teacher_run: Optional[str] = None) -> dict:
     else:
         try:
             got = _score(teacher, cfg.get("artifact") or "BOTH",
-                         int(cfg.get("master_seed") or 42), max_batches=None)
+                         int(cfg.get("master_seed") or 42), max_batches=None,
+                         target_fs=cfg.get("target_fs"))
             diffs = {k: abs(got[k] - recorded[k]) for k in ("rrmse_t", "acc") if k in recorded}
             ok = all(v < 1e-3 for v in diffs.values()) if diffs else None
             add(STATIC_CHECK_NAMES[3], ok,
@@ -311,16 +313,28 @@ def static_checks(student: str, teacher_run: Optional[str] = None) -> dict:
 # ============================================================
 # The decomposition
 # ============================================================
-def _loader(artifact: str, master_seed: int, batch_size: int = 32):
+def _loader(artifact: str, master_seed: int, batch_size: int = 32,
+            target_fs: Optional[float] = None):
+    """
+    The validation split a run was scored on.
+
+    ``target_fs`` is not optional in spirit: a run trained at 250 Hz was
+    validated on 500-sample epochs, and re-scoring its teacher on the 512-
+    sample ones would compare two different datasets. That is exactly what
+    the "teacher reproduces its recorded metrics" check would then report --
+    a mismatch, correctly, for a reason that has nothing to do with the
+    teacher. The rate comes from the run's own history.
+    """
     from data.Dataloader import build_dataloaders
     _, val, _ = build_dataloaders(str(PROJECT_ROOT / "data" / "EEGdenoisenet" / "data"),
                                   artifact_type=artifact, batch_size=batch_size,
-                                  master_seed=master_seed)
+                                  master_seed=master_seed, target_fs=target_fs)
     return val
 
 
 def _score(model, artifact: str, master_seed: int,
-           max_batches: Optional[int] = None) -> dict:
+           max_batches: Optional[int] = None,
+           target_fs: Optional[float] = None) -> dict:
     """Metrics over the validation split; ``max_batches=None`` is all of it."""
     import torch
 
@@ -328,7 +342,7 @@ def _score(model, artifact: str, master_seed: int,
 
     agg, n = {"rrmse_t": 0.0, "rrmse_s": 0.0, "acc": 0.0}, 0
     with torch.no_grad():
-        for i, b in enumerate(_loader(artifact, master_seed)):
+        for i, b in enumerate(_loader(artifact, master_seed, target_fs=target_fs)):
             if max_batches is not None and i >= max_batches:
                 break
             m = metrics.compute_all_metrics(model(b["noisy"]), b["clean"])
@@ -340,7 +354,8 @@ def _score(model, artifact: str, master_seed: int,
 
 
 def decompose(teacher_run: str, students: Sequence[str], artifact: str = "BOTH",
-              master_seed: int = 42, max_batches: int = DEFAULT_MAX_BATCHES) -> dict:
+              master_seed: int = 42, max_batches: int = DEFAULT_MAX_BATCHES,
+              target_fs: Optional[float] = None) -> dict:
     """
     ``||S-G||^2 = ||S-T||^2 + ||T-G||^2 + 2<S-T, T-G>`` for each student.
 
@@ -358,7 +373,7 @@ def decompose(teacher_run: str, students: Sequence[str], artifact: str = "BOTH",
     tg = 0.0
     acc = {s: {"st": 0.0, "cross": 0.0, "sg": 0.0} for s in students}
     with torch.no_grad():
-        for i, b in enumerate(_loader(artifact, master_seed)):
+        for i, b in enumerate(_loader(artifact, master_seed, target_fs=target_fs)):
             if i >= max_batches:
                 break
             x, g = b["noisy"], b["clean"]
@@ -384,7 +399,8 @@ def decompose(teacher_run: str, students: Sequence[str], artifact: str = "BOTH",
     rows.sort(key=lambda r: r["kd"])          # control first, KD beneath it
 
     out = {"teacher": teacher_run, "artifact": artifact, "master_seed": master_seed,
-           "max_batches": max_batches, "t_minus_g": tg / tot, "rows": rows}
+           "max_batches": max_batches, "target_fs": target_fs,
+           "t_minus_g": tg / tot, "rows": rows}
     if len(rows) == 2:
         out["delta"] = _read_off(rows[0], rows[1])
     return out

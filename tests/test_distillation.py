@@ -195,7 +195,7 @@ class DistillationLossTests(unittest.TestCase):
         tap.clear()
         model(torch.randn(2, 1, T))
         self.assertEqual(tap.features, {})
-        with self.assertRaisesRegex(ValueError, "not a submodule"):
+        with self.assertRaisesRegex(ValueError, r"has no submodule '\w+'"):
             FeatureTap(model, ["encoder"])
 
 
@@ -377,7 +377,7 @@ class FeatureLayerDefaultTests(unittest.TestCase):
 
     ``decoder`` was the default for every variant, but it is a module only the
     attention families have. Switching feature distillation on for tcn or
-    tcn_se therefore failed with "'decoder' is not a submodule of TCNWithSE" --
+    tcn_se therefore failed with "has no submodule 'decoder'" --
     so the one knob that makes KD do something other than chase the teacher's
     output was unusable on exactly the models being compared.
     """
@@ -414,10 +414,82 @@ class FeatureLayerDefaultTests(unittest.TestCase):
 
     def test_a_named_layer_is_still_used_as_given(self):
         """Only the default adapts; an explicit choice stays explicit."""
-        with self.assertRaisesRegex(ValueError, "not a submodule"):
+        with self.assertRaisesRegex(ValueError, r"has no submodule '\w+'"):
             probe_feature_shapes(build_model("tcn_se").eval(),
                                  build_model("tcn_se_bi").eval(),
                                  parse_feature_layers(["decoder"]), 512)
+
+
+# ============================================================
+# Tapping a layer the other model does not have
+# ============================================================
+class TestFeatureLayerMismatch(unittest.TestCase):
+    """
+    kd_feature_layers defaults to ["decoder"], which only the sandwich
+    variants have. Distilling across families -- a tcn_se teacher into an
+    MLA student, say -- asks for a tap that cannot exist, and torch's own
+    message for that ("X has no attribute `decoder`") names neither which
+    model nor any way out.
+    """
+
+    def student(self):
+        return build_model("tcn_mla", hidden_channels=16, n_attn_layers=1).eval()
+
+    def se_teacher(self):
+        return build_model("tcn_se_bi", hidden_channels=16).eval()
+
+    SEQ = 128
+
+    def test_a_missing_teacher_layer_names_the_teacher_and_the_remedies(self):
+        from trainer.distillation import parse_feature_layers, probe_feature_shapes
+
+        with self.assertRaises(ValueError) as cm:
+            probe_feature_shapes(self.student(), self.se_teacher(),
+                                 parse_feature_layers(["decoder"]), self.SEQ)
+        msg = str(cm.exception)
+        self.assertIn("teacher", msg)
+        self.assertIn("TCNWithSE", msg)
+        self.assertIn("decoder", msg)
+        self.assertIn("backbone", msg)          # what the teacher does have
+        self.assertIn("kd_feature_weight: 0", msg)
+        self.assertIn("student_path:teacher_path", msg)
+
+    def test_a_missing_student_layer_names_the_student(self):
+        from trainer.distillation import parse_feature_layers, probe_feature_shapes
+
+        with self.assertRaises(ValueError) as cm:
+            probe_feature_shapes(self.se_teacher(), self.student(),
+                                 parse_feature_layers(["decoder"]), self.SEQ)
+        self.assertIn("student", str(cm.exception))
+        self.assertIn("TCNWithSE", str(cm.exception))
+
+    def test_a_layer_both_have_is_accepted(self):
+        from trainer.distillation import parse_feature_layers, probe_feature_shapes
+
+        shapes = probe_feature_shapes(self.student(), self.se_teacher(),
+                                      parse_feature_layers(["head"]), self.SEQ)
+        self.assertIn("head", shapes)
+
+    def test_a_student_teacher_pair_bridges_the_two_names(self):
+        from trainer.distillation import parse_feature_layers, probe_feature_shapes
+
+        shapes = probe_feature_shapes(self.student(), self.se_teacher(),
+                                      parse_feature_layers(["decoder:backbone"]), self.SEQ)
+        self.assertEqual(len(shapes), 1)
+
+    def test_turning_the_feature_term_off_needs_no_shared_layer(self):
+        # The first remedy the message offers has to actually work.
+        from trainer.distillation import KDTrainer
+
+        loader = DataLoader(_SyntheticEEG(8), batch_size=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            trainer = KDTrainer(
+                model=self.student(), teacher=self.se_teacher(),
+                train_loader=loader, val_loader=loader, kd_alpha=0.5,
+                kd_feature_weight=0.0, kd_feature_layers=["decoder"],
+                save_dir=tmp, max_epochs=1, device=torch.device("cpu"),
+                loss_fn="mse")
+        self.assertEqual(trainer._pairs, [])
 
 
 if __name__ == "__main__":

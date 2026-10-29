@@ -235,8 +235,16 @@ def main():
                 # which is what the guard is for.
                 cfg["save_dir"] = base
     if distil and not variant_is_causal(cfg["variant"]):
-        print(f"[Warning] Student '{cfg['variant']}' is bidirectional; distillation is meant "
-              f"to teach a causal student. Continuing anyway.")
+        # Not refused: MHA -> MLA between two bidirectional twins is a real
+        # architecture experiment. But the usual reason to distil here is to
+        # give a causal student the hindsight a non-causal teacher has, and a
+        # non-causal student already has it -- so say what is being given up
+        # rather than just noting the flag.
+        print(f"[Warning] Student '{cfg['variant']}' is not causal. Distillation here "
+              f"normally transfers hindsight from a non-causal teacher to a causal "
+              f"student; a student that already sees the future has nothing to gain "
+              f"from that, and the run cannot be deployed or exported either. "
+              f"Continuing anyway.")
 
     # Checked here as well as in the Trainer, so a clash costs a second rather
     # than the time it takes to load the dataset and build the model.  It is a

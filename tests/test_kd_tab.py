@@ -212,7 +212,21 @@ class TestTheRealRun(unittest.TestCase):
         row = next(r for r in kd.kd_runs() if r["name"] == "tcn_se_both_kd_s67")
         self.assertEqual(row["teacher_run"], "tcn_se_bi_both_s67")
         self.assertEqual(row["control"], "tcn_se_both_s67_h64")
-        self.assertFalse(row["recipe"]["recorded"])     # trained before the fix
+        # Whether the recipe is recorded depends on when this directory was
+        # last trained into, so it is not asserted either way -- only that
+        # the question has an answer.
+        self.assertIsInstance(row["recipe"]["recorded"], bool)
+
+    def test_the_audit_scores_the_teacher_at_the_rate_the_run_trained_at(self):
+        # A run trained with target_fs 250 was validated on 500-sample
+        # epochs. Re-scoring its teacher on the 512-sample ones compares two
+        # different datasets, and the "reproduces its recorded metrics"
+        # check would report a mismatch for a reason that has nothing to do
+        # with the teacher.
+        row = next(r for r in kd.kd_runs() if r["name"] == "tcn_se_both_kd_s67")
+        checks = {c["name"]: c for c in kd.static_checks(row["name"])["checks"]}
+        self.assertIs(checks["teacher reproduces its recorded metrics"]["ok"], True,
+                      checks["teacher reproduces its recorded metrics"]["detail"])
 
 
 if __name__ == "__main__":

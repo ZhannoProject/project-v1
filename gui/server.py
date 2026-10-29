@@ -1207,7 +1207,8 @@ class Handler(BaseHTTPRequestHandler):
                     body["teacher"], students,
                     body.get("artifact") or "BOTH",
                     int(body.get("master_seed") or 42),
-                    int(body.get("max_batches") or kd.DEFAULT_MAX_BATCHES)))
+                    int(body.get("max_batches") or kd.DEFAULT_MAX_BATCHES),
+                    body.get("target_fs")))
             if url.path == "/api/rf/preview":
                 return self._json({"steps": pi.describe(rfsweep.build_steps(body))})
             if url.path == "/api/rf/run":
