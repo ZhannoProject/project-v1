@@ -74,6 +74,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from data import Dataloader
 from gui import config_io, eegio_tab, kd, lookahead, params, pi, rfsweep
 # The one place the "seed 42 keeps the bare name" rule is written down; the
 # run titles have to derive the same path the trainer will.
@@ -941,7 +942,12 @@ def meta() -> dict:
             "tq_train_modes": ["off", "ste"],
             "devices": _device_choices(),
         },
-        "datalists": {"checkpoints": [r["checkpoint"] for r in runs]},
+        "datalists": {"checkpoints": [r["checkpoint"] for r in runs],
+                      # The two rates that mean something: the rate the
+                      # epochs arrive at, and EEG-IO's. The field stays a
+                      # free number -- a sweep might want another -- but
+                      # these are the ones worth suggesting.
+                      "sample_rates": [f"{Dataloader.NATIVE_FS:g}", "250"]},
         "eval_modes": [{"mode": m, **spec} for m, spec in EVAL_MODES.items()],
         "eval_defaults": {
             "data_dir": config_io.FIELDS["data_dir"].default,

@@ -915,12 +915,15 @@
       input.step = f.step != null ? f.step : (f.type === "int" ? 1 : "any");
     } else {
       input = document.createElement("input"); input.type = "text";
-      if (f.datalist) {
-        const dl = document.createElement("datalist"); dl.id = "dl_" + f.key;
-        for (const v of state.meta.datalists[f.datalist] || []) dl.appendChild(new Option(v));
-        ctl.appendChild(dl); input.setAttribute("list", dl.id);
-      }
       if (f.nullable) input.placeholder = "(empty = not set)";
+    }
+    // Suggestions hang off any input, not only text ones: a number field
+    // with two values worth typing (target_fs) wants them offered just as
+    // much as a path does, and <input type="number" list> is valid.
+    if (input && f.datalist) {
+      const dl = document.createElement("datalist"); dl.id = "dl_" + f.key;
+      for (const v of state.meta.datalists[f.datalist] || []) dl.appendChild(new Option(v));
+      ctl.appendChild(dl); input.setAttribute("list", dl.id);
     }
     if (input) { input.id = "f_" + f.key; input.addEventListener("input", onChange); input.addEventListener("change", onChange); ctl.prepend(input); }
     const tag = document.createElement("span"); tag.className = "tag"; tag.title = "This key is not in the file; it is written only if you change it from the default"; tag.textContent = "default"; tag.style.display = "none";

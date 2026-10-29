@@ -97,6 +97,7 @@ SCHEMA: List[Section] = [
         Field("snr_range_db", "range2", [-7.0, 2.0],
               help="Train: uniform in [lo, hi]; val/test: 10-point grid over it"),
         Field("target_fs", "float", None, nullable=True, min=1.0, max=100000.0,
+              datalist="sample_rates",
               help="Resample the epochs to this rate before training (e.g. 250, "
                    "EEG-IO's rate: 512-sample epochs become 500). Empty leaves "
                    "them at the 256 Hz they arrive at, as every run on disk did"),
