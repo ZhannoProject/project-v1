@@ -11,8 +11,11 @@ __pycache__/
 .idea/
 runs/
 data/EEGdenoisenet/
-# EEG-IO is not redistributable either; see data/EEGIO.py
+# EEG-IO is not redistributable either; see data/EEGIO.py.  It is distributed
+# inside an EEG-EyeBlinks/ bundle, so cover both layouts: loose in data/, and
+# still in the bundle beside EEG-VV and EEG-VR.
 data/EEG-IO/
+data/EEG-EyeBlinks/
 *.pth
 *.pt
 *.ckpt
