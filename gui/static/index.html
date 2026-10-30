@@ -201,6 +201,12 @@
   #tab-eegio th { text-align: left; font-weight: 600; color: var(--muted); padding: 4px 8px 4px 0; }
   #tab-eegio td { padding: 3px 8px 3px 0; border-top: 1px solid var(--border); }
   #tab-eegio #eegioRuns { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+  /* The training rate, beside the causality badge. Dashed when it was
+     inferred from an older run recording nothing, as the loss badges are. */
+  #tab-eegio .rate { font-size: 10px; padding: 0 4px; border: 1px solid var(--border);
+                     border-radius: 3px; color: var(--muted); }
+  #tab-eegio .rate.guessed { border-style: dashed; }
+  #tab-eegio .rate.bad { color: var(--err); border-color: var(--err); }
   #tab-eegio details { width: 100%; }
   #tab-eegio summary { cursor: pointer; font-size: 11px; }
   #tab-eegio .eegio-more { display: flex; flex-wrap: wrap; gap: 4px 12px;
@@ -738,6 +744,7 @@
         <span class="grow"></span>
         <span class="muted" id="eegioNote"></span>
       </div>
+      <div class="row" style="margin-top:-4px"><span class="muted" id="eegioRateWarn"></span></div>
       <div id="eegioBody"></div>
     </div>
 
@@ -3819,10 +3826,25 @@
     const box = r => {
       const badge = r.bidirectional ? '<b class="bad">bi</b>'
         : r.lookahead ? `<b>la${r.lookahead}</b>` : "<span class='muted'>causal</span>";
+      // The rate it trained at. Solid when the run recorded it, dashed when
+      // inferred from an older run's silence -- the same distinction the
+      // Runs tab draws for a recovered loss, and it matters here because a
+      // directory name no longer implies a rate: runs/tcn_mla_both_s67 held
+      // a 256 Hz run and now holds a 250 Hz one.
+      // Only a *picked* model at the wrong rate is marked: colouring all
+      // seventy-nine of the others red says nothing and hides the three
+      // that matter.
+      const want = Number($("#eegioRate") && $("#eegioRate").value) || null;
+      const off = want && r.train_fs !== want && state.eegio.picked.includes(r.name);
+      const rate = `<span class="rate${r.train_fs_recorded ? "" : " guessed"}${off ? " bad" : ""}"
+        title="${r.train_fs_recorded
+          ? `the run recorded target_fs ${r.train_fs}`
+          : `no target_fs recorded; trained before the field existed, so 256 Hz`}${off
+          ? ` — but you are about to evaluate at ${want} Hz` : ""}">${r.train_fs}Hz</span>`;
       const on = state.eegio.picked.includes(r.name);
       return `<label class="chk" title="${r.variant} · seed ${r.master_seed}">
         <input type="checkbox" data-eegio-run="${r.name}" ${on ? "checked" : ""}>
-        ${r.name} ${badge}</label>`;
+        ${r.name} ${badge} ${rate}</label>`;
     };
     const front = runs.filter(r => r.suggested || state.eegio.picked.includes(r.name));
     const rest = runs.filter(r => !front.includes(r));
@@ -3848,6 +3870,14 @@
       sel.value = String(m.defaults.target_fs);
     }
     $("#btnEegio").disabled = state.eegio.busy || !ds || !ds.present || !state.eegio.picked.length;
+    const wrongRate = runs.filter(r => state.eegio.picked.includes(r.name)
+                                   && r.train_fs !== (Number(sel.value) || r.train_fs));
+    $("#eegioRateWarn").innerHTML = wrongRate.length
+      ? `<span class="bad">${wrongRate.length} picked model(s) were trained at a
+         different rate</span> — ${wrongRate.map(r => `${r.name} at ${r.train_fs} Hz`)
+         .join(", ")}. They will see time dilated; comparing the two is fair only
+         if that is what you meant to compare.`
+      : "";
     $("#eegioNote").textContent = state.eegio.error ? state.eegio.error
       : state.eegio.busy ? "filtering, detecting and running the models…"
       : state.eegio.picked.length ? `${state.eegio.picked[0]} is the baseline` : "pick a model";
@@ -3858,6 +3888,10 @@
     const num = v => (v == null || !isFinite(v)) ? "—" : v.toFixed(2);
 
     $("#eegioBody").innerHTML = `
+      ${!(out.rate_mismatch || []).length ? "" : `<p class="hint bad">
+         ${out.rate_mismatch.map(m => `<b>${m.run}</b> was trained at ${m.train_fs} Hz`)
+           .join(", ")}, and this was evaluated at ${out.target_fs} Hz — those models saw
+         time dilated relative to their training.</p>`}
       <p class="hint">Rate: ${out.target_fs === out.native_fs
         ? `<b>native ${out.native_fs} Hz</b>, no resampling — the model sees time dilated
            by 2.4% relative to its training rate`
@@ -3924,6 +3958,7 @@
   $("#btnEegio").addEventListener("click", runEegio);
   $("#btnEegioRefresh").addEventListener("click", () => refreshEegio(true));
   $("#eegioHop").addEventListener("input", renderEegio);
+  $("#eegioRate").addEventListener("change", renderEegio);
 
   // ---------------------------------------------------------------- KD audit
   // Two questions in order: was the distillation wired correctly, and if it

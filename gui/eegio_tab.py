@@ -79,27 +79,59 @@ def _runs_dir() -> Path:
     return config_io.RUNS_DIR
 
 
+def _trained_at(name: str) -> tuple:
+    """
+    The rate a run was trained at, and whether it said so itself.
+
+    ``target_fs`` has only been recorded since EEGdenoiseNet became
+    trainable at another rate; before that there was one rate and nothing to
+    record.  So a run with nothing recorded was trained at 256 Hz -- but it
+    is *inferred*, and the two are shown differently, because a directory
+    name no longer implies a rate: ``runs/tcn_mla_both_s67`` held a 256 Hz
+    run and now holds a 250 Hz one.
+    """
+    import json
+
+    h = _runs_dir() / name / "history.json"
+    if not h.is_file():
+        return (None, False)
+    try:
+        fs = (json.loads(h.read_text()).get("config") or {}).get("target_fs")
+    except ValueError:
+        return (None, False)
+    return (float(fs), True) if fs else (None, False)
+
+
 def available_runs() -> List[dict]:
     """
-    Finished runs that can be evaluated, with what each one may read ahead.
+    Finished runs that can be evaluated, with what each one may read ahead
+    and what rate it was trained at.
 
-    The badge is the whole point of offering a list rather than a free text
-    box: a ``_bi`` twin can be run over a recording offline and is a
-    legitimate control here, while on the Deploy tab it is refused.  Which
-    one a row is has to be visible before it is picked.
+    The badges are the whole point of offering a list rather than a free text
+    box.  A ``_bi`` twin can be run over a recording offline and is a
+    legitimate control here, while on the Deploy tab it is refused.  And a
+    model trained at 250 Hz is a different model from one trained at 256 --
+    run at the wrong one it sees time dilated by 2.4%.  Which one a row is
+    has to be visible before it is picked.
     """
+    import eegio_eval as E
     from gui import config_io
 
     out = []
     for r in config_io.list_runs():
         if r["status"] != "complete":
             continue
+        fs, recorded = _trained_at(r["name"])
         out.append({
             "name": r["name"], "variant": r["variant"], "artifact": r["artifact"],
             "master_seed": r["master_seed"], "hidden_channels": r["hidden_channels"],
             "rrmse_t": r["rrmse_t"],
             "causal": r["causal"], "lookahead": r["lookahead"],
             "bidirectional": r["bidirectional"],
+            #: The rate it trained at, and whether that is its own word for
+            #: it or this module's inference from an older run's silence.
+            "train_fs": fs if recorded else E.PROJECT_FS,
+            "train_fs_recorded": recorded,
             "suggested": r["name"] in SUGGESTED,
         })
     out.sort(key=lambda r: (not r["suggested"], r["name"]))
@@ -181,8 +213,20 @@ def evaluate(spec: dict) -> dict:
         target_fs=float(spec.get("target_fs") or E.PROJECT_FS),
     )
 
+    by_name = {r["name"]: r for r in available_runs()}
+    mismatched = [
+        {"run": r, "train_fs": by_name[r]["train_fs"],
+         "recorded": by_name[r]["train_fs_recorded"]}
+        for r in runs
+        if r in by_name and by_name[r]["train_fs"] != cfg.target_fs
+    ]
+
     results = [E.evaluate_subjects(data_dir, r, subjects, cfg) for r in runs]
     return _finite({
+        # Runs whose training rate is not the rate they were just evaluated
+        # at. Not refused -- comparing the two is a legitimate thing to want
+        # -- but it changes what every number below means, so it is said.
+        "rate_mismatch": mismatched,
         "results": results,
         "tests": E.compare(results),
         "subjects": subjects,

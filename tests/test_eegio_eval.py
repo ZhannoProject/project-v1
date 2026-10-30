@@ -389,6 +389,43 @@ class TestTargetRate(unittest.TestCase):
         rates = {r["value"] for r in meta()["rates"]}
         self.assertEqual(rates, {E.EEGIO_FS, E.PROJECT_FS})
 
+    def test_every_run_carries_the_rate_it_trained_at(self):
+        # A directory name no longer implies a rate: runs/tcn_mla_both_s67
+        # held a 256 Hz run and now holds a 250 Hz one, so the picker has to
+        # read it from the run and say whether the run said it or this is an
+        # inference from an older run recording nothing.
+        from gui.eegio_tab import available_runs
+
+        rows = available_runs()
+        self.assertTrue(rows)
+        for r in rows:
+            with self.subTest(run=r["name"]):
+                self.assertIn(r["train_fs"], (E.EEGIO_FS, E.PROJECT_FS))
+                self.assertIsInstance(r["train_fs_recorded"], bool)
+                if not r["train_fs_recorded"]:
+                    self.assertEqual(r["train_fs"], E.PROJECT_FS)
+
+    def test_a_run_that_recorded_its_rate_is_marked_as_having_done_so(self):
+        import json
+
+        from gui.eegio_tab import _trained_at, _runs_dir
+
+        for d in _runs_dir().iterdir():
+            h = d / "history.json"
+            if not h.is_file():
+                continue
+            try:
+                fs = (json.loads(h.read_text()).get("config") or {}).get("target_fs")
+            except ValueError:
+                continue
+            got, recorded = _trained_at(d.name)
+            with self.subTest(run=d.name):
+                if fs:
+                    self.assertTrue(recorded)
+                    self.assertEqual(got, float(fs))
+                else:
+                    self.assertFalse(recorded)
+
 
 # ============================================================
 # The tab's glue

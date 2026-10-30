@@ -6,7 +6,7 @@
 # ============================================================
 
 # --- Model (base, rank overridden per run) ---
-variant: "tcn_mla_bi"
+variant: "tcn_mla"
 hidden_channels: 64
 n_heads: 2
 n_attn_layers: 4
@@ -51,7 +51,7 @@ loss_fn: "mse"              # "l1_combined", "l2_combined", "mse", "l1", or "stf
 tensorboard: false
 
 # --- Knowledge distillation (added by the training GUI) ---
-teacher_ckpt: "./runs/tcn_se_bi_both_s67/best.pt"
+teacher_ckpt: null
 
 # --- Knowledge distillation (added by the training GUI) ---
 kd_feature_weight: 0.3
