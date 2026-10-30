@@ -3911,7 +3911,16 @@
     // the rate once, so the rows inside it do not repeat it. The group that
     // matches the evaluation rate comes first and opens, because those are
     // the models that can be run without a caveat.
-    const front = runs.filter(r => r.suggested || state.eegio.picked.includes(r.name));
+    // The front row is the selection, not the selection plus a standing
+    // recommendation. It used to be `suggested || picked`, so the three
+    // suggested models stayed pinned at the top unticked after you had
+    // chosen your own -- and at 250 Hz they were the wrong rate as well,
+    // which made the row read as four picks and three mistakes. The
+    // suggestion is a starting point, so it is shown only when there is
+    // nothing to start from.
+    const picked = runs.filter(r => state.eegio.picked.includes(r.name));
+    const front = picked.length ? picked : runs.filter(r => r.suggested);
+    const showingSuggestion = !picked.length && front.length;
     const rest = runs.filter(r => !front.includes(r));
     const want = Number(sel && sel.value) || null;
     const rates = [...new Set(rest.map(r => r.train_fs))]
@@ -3929,7 +3938,11 @@
         <div class="eegio-more">${rows.map(r => box(r, false)).join(" ")}</div></details>`;
     };
     $("#eegioRuns").innerHTML = (front.length
-        ? `<div class="eegio-front">${front.map(r => box(r, true)).join(" ")}</div>` : "")
+        ? `<div class="eegio-front">${showingSuggestion
+             ? '<span class="muted" title="a starting point, not a restriction: tick '
+               + 'anything below and this row becomes your selection">suggested:</span> '
+             : ""}${front.map(r => box(r, true)).join(" ")}</div>`
+        : '<span class="muted">nothing picked — tick a model below</span>')
       + rates.map(group).join("");
 
     // hop is buffering, and buffering is lookahead: at hop N every model gets
