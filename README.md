@@ -440,12 +440,26 @@ The first run is the baseline the rest are paired against. The tab suggests
 exactly that triple: the causal model, the rung licensed 62.5 ms of
 lookahead, and the unbounded twin.
 
+**Past tests are kept.** Every comparison the tab runs is written to
+`eegio_tests/eegio_<timestamp>.json` as it finishes, and the **past tests**
+dropdown lists them newest first — when, which models, the rate, the hop and
+how many subjects. Picking one reopens it, with a line above the tables
+saying what produced it: the file, the time, each model *and the rate it
+trained at*, the hop and the subject count. The reason is the Deploy tab's
+for keeping its latency traces — a measurement is a statement about a model,
+a dataset and the settings it was taken under, and a number that vanishes on
+reload cannot be compared with next week's. The newest 200 are kept; the
+directory is gitignored, since the results describe recordings that are not
+redistributable and are reproducible from the runs they name.
+
 Not yet done: the 250 Hz retraining. Every model here was trained at 256 Hz
 and is run on EEG-IO by resampling 250 → 256, which is exact in rate
 (128/125) but is not the same as training at the recording's own rate.
 
 Validation: `python -m unittest discover -s tests -p 'test_eegio_eval.py'`
-covers the filter's causality and the zero-phase control's lack of it, the
+covers saving, listing newest-first, reading one back, the refusal of a name
+pointing outside the directory, a half-written file not breaking the listing,
+the retention cap, the filter's causality and the zero-phase control's lack of it, the
 band and notch, detection and annotation filtering, each metric against a
 model whose answer is known in advance (identity, attenuator, a correction
 shifted by a known amount), the risk check, the streaming wrapper, the

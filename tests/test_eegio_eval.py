@@ -10,6 +10,7 @@ check a metric: on a model you already know the right answer for.
 Run: python -m unittest discover -s tests -p 'test_eegio_eval.py'
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -425,6 +426,99 @@ class TestTargetRate(unittest.TestCase):
                     self.assertEqual(got, float(fs))
                 else:
                     self.assertFalse(recorded)
+
+
+# ============================================================
+# Keeping the comparisons
+# ============================================================
+class TestSavedResults(unittest.TestCase):
+    """
+    A measurement that vanishes when the page reloads cannot be compared
+    with next week's, so each comparison is written to eegio_tests/ and the
+    tab can reopen it.
+    """
+
+    def setUp(self):
+        from gui import eegio_tab
+
+        self.mod = eegio_tab
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = eegio_tab.RESULTS_DIR
+        eegio_tab.RESULTS_DIR = Path(self._tmp.name)
+        self.addCleanup(lambda: setattr(eegio_tab, "RESULTS_DIR", self._old))
+
+    def _result(self, run="tcn_se_both", n=2, hop=32):
+        return {"saved": {"at": "2026-10-30T12:00:00", "hop": hop, "n_subjects": n,
+                          "models": [{"run": run, "train_fs": 256.0}]},
+                "results": [{"run": run, "summary": {"suppression_db": {"median": 1.0}}}],
+                "subjects": [f"S{i:02d}" for i in range(n)],
+                "baseline": run, "hop": hop, "target_fs": 256.0, "rate_mismatch": []}
+
+    def test_a_saved_result_carries_its_own_file_name(self):
+        # Without it the page cannot select the thing it just produced in
+        # its own history list.
+        out = self._result()
+        name = self.mod.save_result(out)
+        self.assertEqual(out["name"], name)
+        self.assertEqual(json.loads((self.mod.RESULTS_DIR / name).read_text())["name"], name)
+
+    def test_results_are_listed_newest_first(self):
+        import time
+
+        names = []
+        for i in range(3):
+            names.append(self.mod.save_result(self._result(n=i + 1)))
+            time.sleep(1.01)                 # the name is second-resolution
+        listed = [r["name"] for r in self.mod.list_results()]
+        self.assertEqual(listed, sorted(names, reverse=True))
+
+    def test_the_listing_says_enough_to_choose_between_two(self):
+        self.mod.save_result(self._result(run="tcn_se_la16_both", n=5, hop=64))
+        row = self.mod.list_results()[0]
+        self.assertEqual(row["runs"], ["tcn_se_la16_both"])
+        self.assertEqual(row["n_subjects"], 5)
+        self.assertEqual(row["hop"], 64)
+        self.assertEqual(row["target_fs"], 256.0)
+        self.assertIn("suppression_db", row["summary"]["tcn_se_la16_both"])
+
+    def test_a_result_reads_back_whole(self):
+        name = self.mod.save_result(self._result(n=4))
+        self.assertEqual(self.mod.read_result(name)["subjects"],
+                         ["S00", "S01", "S02", "S03"])
+
+    def test_a_name_outside_the_directory_is_refused(self):
+        # The GUI has no authentication; this is the only place a request
+        # gets to name a file.
+        for bad in ("../../etc/passwd", "/etc/passwd", ""):
+            with self.subTest(name=bad):
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    self.mod.read_result(bad)
+
+    def test_a_missing_result_is_a_not_found_rather_than_a_crash(self):
+        with self.assertRaises(FileNotFoundError):
+            self.mod.read_result("eegio_20000101_000000.json")
+
+    def test_an_unparseable_file_does_not_break_the_whole_listing(self):
+        self.mod.save_result(self._result())
+        (self.mod.RESULTS_DIR / "eegio_99999999_999999.json").write_text("{ not json")
+        rows = self.mod.list_results()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["error"], "could not be parsed")
+
+    def test_only_the_newest_are_kept(self):
+        import time
+
+        self.mod.MAX_RESULTS, keep = 3, self.mod.MAX_RESULTS
+        self.addCleanup(lambda: setattr(self.mod, "MAX_RESULTS", keep))
+        for i in range(5):
+            self.mod.save_result(self._result(n=i + 1))
+            time.sleep(1.01)
+        self.assertEqual(len(self.mod.list_results()), 3)
+
+    def test_meta_carries_the_history_so_the_tab_can_draw_it(self):
+        self.mod.save_result(self._result())
+        self.assertEqual(len(self.mod.meta()["history"]), 1)
 
 
 # ============================================================

@@ -41,6 +41,18 @@ def find_data_dir() -> Path:
 #: Kept for callers that want a path without searching.
 DEFAULT_DATA_DIR = DATA_DIR_CANDIDATES[0]
 
+#: Where a finished comparison is kept.  The Deploy tab's reason for saving
+#: its traces applies here word for word: a measurement is a statement about
+#: a model, a dataset and the settings it was taken under, and a number on a
+#: screen that vanishes when the page reloads cannot be compared with next
+#: week's.  Gitignored -- these reference recordings that are not
+#: redistributable, and they are reproducible from the runs.
+RESULTS_DIR = PROJECT_ROOT / "eegio_tests"
+
+#: Kept at most this many, oldest discarded.  A comparison is a few hundred
+#: kB of per-subject rows, so this is months of ordinary use.
+MAX_RESULTS = 200
+
 #: Subjects per comparison unless the page says otherwise.  Twenty subjects
 #: times three models times a forward pass over 100 s is minutes, and the
 #: page should come back before someone wonders whether it has hung.
@@ -155,12 +167,96 @@ def dataset_status(data_dir: Optional[str] = None) -> dict:
                 "searched": [str(c) for c in DATA_DIR_CANDIDATES]}
 
 
+# ============================================================
+# Keeping the comparisons
+# ============================================================
+def _result_path(name: str) -> Path:
+    """
+    Resolve a client-supplied result name inside ``eegio_tests/``, or refuse.
+
+    Resolve first and check afterwards, which is what makes ``../`` and a
+    symlink out of the tree fail rather than escape -- the same rule the
+    Deploy tab's traces and the Evaluate tab's figures use.  The GUI has no
+    authentication, so this is the only place a request gets to name a file.
+    """
+    if not name:
+        raise ValueError("no result named")
+    target = (RESULTS_DIR / name).resolve()
+    if RESULTS_DIR.resolve() not in target.parents:
+        raise ValueError(f"{name} is outside eegio_tests/")
+    if not target.is_file():
+        raise FileNotFoundError(f"no such result: {name}")
+    return target
+
+
+def save_result(out: dict) -> str:
+    """Write a finished comparison and return the file name."""
+    import json
+    from datetime import datetime
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    name = f"eegio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    # Named before it is written, so the file knows what it is called. A copy
+    # that does not is a copy the page cannot select in its own history list.
+    out["name"] = name
+    (RESULTS_DIR / name).write_text(json.dumps(out, indent=2))
+
+    # Oldest first, so the survivors are the newest MAX_RESULTS.
+    kept = sorted(RESULTS_DIR.glob("eegio_*.json"))
+    for stale in kept[:-MAX_RESULTS]:
+        stale.unlink()
+    return name
+
+
+def _describe(out: dict, name: str) -> dict:
+    """One row for the history list: enough to choose between two of them."""
+    results = out.get("results") or []
+    return {
+        "name": name,
+        "saved_at": (out.get("saved") or {}).get("at"),
+        "runs": [r.get("run") for r in results],
+        "baseline": out.get("baseline"),
+        "n_subjects": len(out.get("subjects") or []),
+        "target_fs": out.get("target_fs"),
+        "hop": out.get("hop"),
+        "zero_phase": (out.get("saved") or {}).get("zero_phase"),
+        "include_soft": (out.get("saved") or {}).get("include_soft"),
+        "n_mismatched": len(out.get("rate_mismatch") or []),
+        # The headline of each, so the list can be read without opening a row.
+        "summary": {r.get("run"): (r.get("summary") or {}) for r in results},
+    }
+
+
+def list_results() -> List[dict]:
+    """Every saved comparison, newest first."""
+    import json
+
+    out = []
+    if not RESULTS_DIR.is_dir():
+        return out
+    for f in sorted(RESULTS_DIR.glob("eegio_*.json"), reverse=True):
+        try:
+            out.append(_describe(json.loads(f.read_text()), f.name))
+        except ValueError:
+            # A half-written file is not worth failing the whole list over.
+            out.append({"name": f.name, "saved_at": None, "runs": [],
+                        "error": "could not be parsed"})
+    return out
+
+
+def read_result(name: str) -> dict:
+    import json
+
+    return json.loads(_result_path(name).read_text())
+
+
 def meta(data_dir: Optional[str] = None) -> dict:
     import eegio_eval as E
 
     return {
         "dataset": dataset_status(data_dir),
         "runs": available_runs(),
+        "history": list_results(),
         "suggested": list(SUGGESTED),
         "metrics": list(E.METRIC_PATHS),
         "defaults": {
@@ -222,7 +318,25 @@ def evaluate(spec: dict) -> dict:
     ]
 
     results = [E.evaluate_subjects(data_dir, r, subjects, cfg) for r in runs]
-    return _finite({
+    from datetime import datetime
+
+    out = _finite({
+        # What produced this, so a file found next week can be read. The
+        # settings matter as much as the numbers: the same models at another
+        # hop or another rate are a different measurement.
+        "saved": {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "data_dir": data_dir, "n_subjects": n,
+            "channel": cfg.channel, "hop": cfg.hop, "target_fs": cfg.target_fs,
+            "zero_phase": cfg.zero_phase, "notch_hz": cfg.notch_hz,
+            "include_soft": cfg.include_soft, "detect_k": cfg.detect_k,
+            "band_hz": list(cfg.band),
+            # Each model with the rate it trained at, which the run rows do
+            # not carry and which decides whether a number is comparable.
+            "models": [{"run": r, "train_fs": by_name.get(r, {}).get("train_fs"),
+                        "train_fs_recorded": by_name.get(r, {}).get("train_fs_recorded")}
+                       for r in runs],
+        },
         # Runs whose training rate is not the rate they were just evaluated
         # at. Not refused -- comparing the two is a legitimate thing to want
         # -- but it changes what every number below means, so it is said.
@@ -237,3 +351,7 @@ def evaluate(spec: dict) -> dict:
         "causality": results[0]["causality"],
         "metrics": list(E.METRIC_PATHS),
     })
+    # Saved before it is returned, so a result exists on disk even if the
+    # page that asked for it is closed before the answer arrives.
+    save_result(out)
+    return out

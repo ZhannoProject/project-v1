@@ -34,6 +34,8 @@ Local HTTP server behind the training GUI (stdlib only).
     POST /api/eegio/evaluate     {runs, n_subjects, ...} → suppression, fidelity,
                                  residual detections and onset lead per subject,
                                  paired by subject between models
+    GET  /api/eegio/results      every saved EEG-IO comparison, newest first
+    GET  /api/eegio/result?name=X    one of them, in full
     GET  /api/kd/meta            distilled runs, their teachers and their controls
     GET  /api/kd/checks?student=X    the six KD invariants, with their evidence
     POST /api/kd/decompose       {teacher, students, ...} → ||S-G||^2 split into
@@ -1088,6 +1090,13 @@ class Handler(BaseHTTPRequestHandler):
                     int(q.get("hidden_channels") or rfsweep.DEFAULT_HIDDEN))})
             if url.path == "/api/eegio/meta":
                 return self._json(eegio_tab.meta(q.get("data_dir")))
+            if url.path == "/api/eegio/results":
+                return self._json({"results": eegio_tab.list_results()})
+            if url.path == "/api/eegio/result":
+                try:
+                    return self._json(eegio_tab.read_result(q.get("name", "")))
+                except (ValueError, FileNotFoundError) as e:
+                    return self._error(str(e), 404)
             if url.path == "/api/kd/meta":
                 return self._json(kd.meta())
             if url.path == "/api/kd/checks":

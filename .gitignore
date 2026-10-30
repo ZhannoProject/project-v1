@@ -31,3 +31,8 @@ deploy/artifacts/
 # GUI evaluation output: one timestamped folder per Evaluate-tab run.
 # Figures you want to keep (the paper's) live directly in figures/.
 figures/gui_eval_*/
+
+# Saved EEG-IO comparisons, one JSON per run of the EEG-IO test tab. They
+# describe recordings that are not redistributable, and they are
+# reproducible from the runs they name.
+eegio_tests/

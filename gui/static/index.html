@@ -727,6 +727,9 @@
     <div class="tab" id="tab-eegio">
       <div class="row">
         <button id="btnEegioRefresh" title="Look again for the recordings and the runs — after unpacking the dataset, or finishing a training run, without reloading the page">Refresh</button>
+        <label class="muted" for="eegioPast">past tests</label>
+        <select id="eegioPast" title="Every comparison this tab has run, newest first. They are saved to eegio_tests/ as they finish, so a result outlives the page."></select>
+        <span class="grow"></span>
         <span class="muted" id="eegioData">…</span>
       </div>
       <div class="row">
@@ -841,7 +844,7 @@
     jobs: {}, jobId: null, jobList: [], runsView: "kind", chartRun: null, chartMetrics: [], chartMax: 0, params: { a: null, b: null, error: null }, paramCmp: "", evalRows: [], evalRun: null, pickView: null, pickFor: "eval", evalJob: { running: false, next: 0, artifacts: [] },
     la: { meta: null, data: null, error: null, artifact: "BOTH" },
     kd: { meta: null, run: null, checks: null, decomp: null, busy: false, error: null },
-    eegio: { meta: null, picked: [], out: null, busy: false, error: null },
+    eegio: { meta: null, picked: [], out: null, busy: false, error: null, viewing: "" },
     pi: { target: "host", model: null, testdata: null, running: false, next: 0,
           returncode: null, parsed: {}, steps: [], step: 0, formTouched: false, seenTraces: [],
           loaded: { latency: null, duty: null } } };
@@ -3786,9 +3789,11 @@
     if (btn) { btn.disabled = false; btn.textContent = "Refresh"; }
     const m = state.eegio.meta;
     // Only seed the picks the first time; an explicit refresh must not undo
-    // a selection someone has just made.
+    // a selection someone has just made, nor close a past test being read.
     if (m && !state.eegio.picked.length) state.eegio.picked = m.suggested.filter(
       n => m.runs.some(r => r.name === n));
+    const past = $("#eegioPast");
+    if (past) past.dataset.n = "";        // force the list to be rebuilt
     renderEegio();
   }
 
@@ -3804,6 +3809,22 @@
         target_fs: Number($("#eegioRate").value) || undefined,
         include_soft: $("#eegioSoft").checked,
       });
+      // A finished run is the newest entry in the history, and becomes the
+      // one on screen. The list ships with /api/eegio/meta, which is not
+      // re-fetched per run, so it is pulled here rather than left stale.
+      state.eegio.viewing = state.eegio.out.name || "";
+      const list = await api("/api/eegio/results").catch(() => null);
+      if (list && state.eegio.meta) state.eegio.meta.history = list.results;
+    } catch (e) { state.eegio.error = e.message; state.eegio.out = null; }
+    state.eegio.busy = false; renderEegio();
+  }
+
+  async function openPastEegio(name) {
+    if (!name) { state.eegio.viewing = ""; state.eegio.out = null; renderEegio(); return; }
+    state.eegio.busy = true; state.eegio.error = null; renderEegio();
+    try {
+      state.eegio.out = await api(`/api/eegio/result?name=${encodeURIComponent(name)}`);
+      state.eegio.viewing = name;
     } catch (e) { state.eegio.error = e.message; state.eegio.out = null; }
     state.eegio.busy = false; renderEegio();
   }
@@ -3813,6 +3834,30 @@
     // that does not match this one, so it has to know the choice before it
     // draws anything.
     const sel = $("#eegioRate");
+
+    // Past tests, newest first. Rebuilt whenever the list changes, and the
+    // label says what distinguishes two of them: when, which models, and
+    // the settings they were taken under.
+    const past = $("#eegioPast");
+    const hist = (state.eegio.meta && state.eegio.meta.history) || [];
+    if (past && past.dataset.n !== String(hist.length)) {
+      past.innerHTML = "";
+      past.appendChild(new Option(hist.length ? "— new test —" : "none yet", ""));
+      for (const h of hist) {
+        const when = (h.saved_at || h.name).replace("T", " ").slice(0, 16);
+        const what = (h.runs || []).length === 1 ? h.runs[0]
+          : `${(h.runs || []).length} models`;
+        const o = new Option(
+          `${when} · ${what} · ${h.target_fs || "?"}Hz hop${h.hop} · ${h.n_subjects} subj`,
+          h.name);
+        o.title = (h.runs || []).join(", ")
+          + (h.n_mismatched ? ` — ${h.n_mismatched} at another training rate` : "")
+          + (h.zero_phase ? " — zero-phase control" : "");
+        past.appendChild(o);
+      }
+      past.dataset.n = String(hist.length);
+    }
+    if (past) past.value = state.eegio.viewing || "";
     const m = state.eegio.meta;
     if (!$("#eegioData")) return;
     const ds = m && m.dataset;
@@ -3914,6 +3959,13 @@
     const num = v => (v == null || !isFinite(v)) ? "—" : v.toFixed(2);
 
     $("#eegioBody").innerHTML = `
+      ${!(out.saved && state.eegio.viewing) ? "" : `<p class="hint">
+         Saved as <code>eegio_tests/${state.eegio.viewing}</code> at
+         ${out.saved.at.replace("T", " ")} — ${out.saved.models.map(m =>
+           `${m.run} trained at ${m.train_fs}Hz`).join(", ")}, hop ${out.saved.hop},
+         ${out.saved.n_subjects} subject(s)${out.saved.zero_phase
+           ? ", zero-phase control" : ""}${out.saved.include_soft
+           ? ", soft blinks counted" : ""}.</p>`}
       ${!(out.rate_mismatch || []).length ? "" : `<p class="hint bad">
          ${out.rate_mismatch.map(m => `<b>${m.run}</b> was trained at ${m.train_fs} Hz`)
            .join(", ")}, and this was evaluated at ${out.target_fs} Hz — those models saw
@@ -3983,6 +4035,7 @@
   });
   $("#btnEegio").addEventListener("click", runEegio);
   $("#btnEegioRefresh").addEventListener("click", () => refreshEegio(true));
+  $("#eegioPast").addEventListener("change", e => openPastEegio(e.target.value));
   $("#eegioHop").addEventListener("input", renderEegio);
   $("#eegioRate").addEventListener("change", renderEegio);
 
