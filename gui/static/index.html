@@ -209,6 +209,9 @@
   #tab-eegio .rate.bad { color: var(--err); border-color: var(--err); }
   #tab-eegio details { width: 100%; }
   #tab-eegio summary { cursor: pointer; font-size: 11px; }
+  #tab-eegio .eegio-front { display: flex; flex-wrap: wrap; gap: 4px 12px;
+                            align-items: baseline; width: 100%; }
+  #tab-eegio .eegio-group { border-top: 1px solid var(--border); padding-top: 4px; }
   #tab-eegio .eegio-more { display: flex; flex-wrap: wrap; gap: 4px 12px;
                            max-height: 150px; overflow-y: auto; margin-top: 4px; }
   #tab-kd .hint { font-size: 11px; color: var(--muted); max-width: 72ch; line-height: 1.5; }
@@ -3806,6 +3809,10 @@
   }
 
   function renderEegio() {
+    // Looked up first: the picker below groups by rate and marks the group
+    // that does not match this one, so it has to know the choice before it
+    // draws anything.
+    const sel = $("#eegioRate");
     const m = state.eegio.meta;
     if (!$("#eegioData")) return;
     const ds = m && m.dataset;
@@ -3823,7 +3830,7 @@
     // three this tab exists to compare (and anything already ticked) are the
     // list, and the rest is one disclosure away.
     const runs = (m && m.runs) || [];
-    const box = r => {
+    const box = (r, showRate = true) => {
       const badge = r.bidirectional ? '<b class="bad">bi</b>'
         : r.lookahead ? `<b>la${r.lookahead}</b>` : "<span class='muted'>causal</span>";
       // The rate it trained at. Solid when the run recorded it, dashed when
@@ -3834,7 +3841,7 @@
       // Only a *picked* model at the wrong rate is marked: colouring all
       // seventy-nine of the others red says nothing and hides the three
       // that matter.
-      const want = Number($("#eegioRate") && $("#eegioRate").value) || null;
+      const want = Number(sel && sel.value) || null;
       const off = want && r.train_fs !== want && state.eegio.picked.includes(r.name);
       const rate = `<span class="rate${r.train_fs_recorded ? "" : " guessed"}${off ? " bad" : ""}"
         title="${r.train_fs_recorded
@@ -3842,16 +3849,43 @@
           : `no target_fs recorded; trained before the field existed, so 256 Hz`}${off
           ? ` — but you are about to evaluate at ${want} Hz` : ""}">${r.train_fs}Hz</span>`;
       const on = state.eegio.picked.includes(r.name);
-      return `<label class="chk" title="${r.variant} · seed ${r.master_seed}">
+      return `<label class="chk" title="${r.variant} · seed ${r.master_seed}${
+          showRate ? "" : ` · trained at ${r.train_fs} Hz`}">
         <input type="checkbox" data-eegio-run="${r.name}" ${on ? "checked" : ""}>
-        ${r.name} ${badge} ${rate}</label>`;
+        ${r.name} ${badge} ${showRate ? rate : ""}</label>`;
     };
+    if (m && m.rates && sel && sel.options.length !== m.rates.length) {
+      sel.innerHTML = "";
+      for (const r of m.rates) {
+        const o = new Option(r.label, r.value); o.title = r.note; sel.appendChild(o);
+      }
+      sel.value = String(m.defaults.target_fs);
+    }
+    // One disclosure per training rate. Eighty-odd rows each carrying their
+    // own rate chip was the thing that made this unreadable; the group says
+    // the rate once, so the rows inside it do not repeat it. The group that
+    // matches the evaluation rate comes first and opens, because those are
+    // the models that can be run without a caveat.
     const front = runs.filter(r => r.suggested || state.eegio.picked.includes(r.name));
     const rest = runs.filter(r => !front.includes(r));
-    $("#eegioRuns").innerHTML = front.map(box).join(" ")
-      + (rest.length ? `<details><summary class="muted">${rest.length} other finished
-         run(s)</summary><div class="eegio-more">${rest.map(box).join(" ")}</div></details>`
-         : "");
+    const want = Number(sel && sel.value) || null;
+    const rates = [...new Set(rest.map(r => r.train_fs))]
+      .sort((a, b) => (b === want) - (a === want) || b - a);
+    const group = fs => {
+      const rows = rest.filter(r => r.train_fs === fs);
+      const inferred = rows.every(r => !r.train_fs_recorded);
+      const open = want != null && fs === want;
+      return `<details class="eegio-group"${open ? " open" : ""}>
+        <summary class="muted">${rows.length} run(s) trained at <b>${fs} Hz</b>${
+          inferred ? ' <span class="muted" title="none of these recorded target_fs; '
+                   + 'they predate the field, when 256 was the only rate">(inferred)</span>' : ""}${
+          want != null && fs !== want
+            ? ' — <span class="bad">not the evaluation rate</span>' : ""}</summary>
+        <div class="eegio-more">${rows.map(r => box(r, false)).join(" ")}</div></details>`;
+    };
+    $("#eegioRuns").innerHTML = (front.length
+        ? `<div class="eegio-front">${front.map(r => box(r, true)).join(" ")}</div>` : "")
+      + rates.map(group).join("");
 
     // hop is buffering, and buffering is lookahead: at hop N every model gets
     // N-1 samples of future for free, which swamps the licence the ladder is
@@ -3861,17 +3895,9 @@
       ? `<span class="bad">onset lead is not measurable at hop ${hop}</span> —
          the buffer gives every model ${hop - 1} samples of future; use hop 1 for it`
       : "";
-    const sel = $("#eegioRate");
-    if (m && m.rates && sel.options.length !== m.rates.length) {
-      sel.innerHTML = "";
-      for (const r of m.rates) {
-        const o = new Option(r.label, r.value); o.title = r.note; sel.appendChild(o);
-      }
-      sel.value = String(m.defaults.target_fs);
-    }
     $("#btnEegio").disabled = state.eegio.busy || !ds || !ds.present || !state.eegio.picked.length;
     const wrongRate = runs.filter(r => state.eegio.picked.includes(r.name)
-                                   && r.train_fs !== (Number(sel.value) || r.train_fs));
+                                   && r.train_fs !== (Number(sel && sel.value) || r.train_fs));
     $("#eegioRateWarn").innerHTML = wrongRate.length
       ? `<span class="bad">${wrongRate.length} picked model(s) were trained at a
          different rate</span> — ${wrongRate.map(r => `${r.name} at ${r.train_fs} Hz`)
