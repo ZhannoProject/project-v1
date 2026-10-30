@@ -932,6 +932,7 @@ def meta() -> dict:
         # those runs. Cheap (a directory of small JSON files), so it rides
         # along with the training runs rather than needing its own refresh.
         "deploys": pi.list_deploy_runs(),
+        "eegio_tests": eegio_tab.list_results(),
         "deploy_logs": pi.list_deploy_logs(),
         "schema": config_io.schema_as_json(),
         "choices": {
@@ -1042,6 +1043,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "losses": config_io.runs_by_loss(runs),
                                    "optimizers": config_io.runs_by_optimizer(runs),
                                    "deploys": pi.list_deploy_runs(),
+                                   "eegio_tests": eegio_tab.list_results(),
                                    "deploy_logs": pi.list_deploy_logs()})
             if url.path == "/api/lookahead/meta":
                 return self._json(lookahead.meta())

@@ -1178,13 +1178,14 @@ class RunsTablePageTests(unittest.TestCase):
 
     def test_header_row_and_group_spans_agree_on_the_column_count(self):
         """
-        Three tables live in this page now — the training runs, the Deploy
+        Four tables live in this page now — the training runs, the Deploy
         runs view, which has its own columns because a measurement has a
-        machine and a deadline and no epochs, and the receptive-field ladder,
-        whose untrained rungs span the columns they have no numbers for. Each
-        one's colspans are checked against its own header rather than all
-        three against one number, so a column added to any of them still shows
-        up here.
+        machine and a deadline and no epochs, the EEG-IO comparisons, which
+        have a rate and several models at once and no RRMSE, and the
+        receptive-field ladder, whose untrained rungs span the columns they
+        have no numbers for. Each one's colspans are checked against its own
+        header rather than all four against one number, so a column added to
+        any of them still shows up here.
         """
         def columns(name):
             head = re.search(rf"const {name} = `(.*?)`;", self.PAGE, re.S)
@@ -1197,17 +1198,24 @@ class RunsTablePageTests(unittest.TestCase):
             end = self.PAGE.index(closing, start + len(opening))
             return self.PAGE[start:end], (start, end)
 
-        # The deploy branch of runsMarkup and the ladder's renderer, split out
-        # so each table's spans are judged against the header it uses.
-        deploy_block, deploy_at = carve('} else if (view === "deploy") {', "} else {")
+        # The deploy and EEG-IO branches of runsMarkup and the ladder's
+        # renderer, split out so each table's spans are judged against the
+        # header it uses.  The branches are carved in page order, each one
+        # ending where the next begins.
+        deploy_block, deploy_at = carve('} else if (view === "deploy") {',
+                                        '} else if (view === "eegio") {')
+        eegio_block, eegio_at = carve('} else if (view === "eegio") {', "} else {")
         rf_block, rf_at = carve("function renderRfTable() {", "\n  }")
         rest = self.PAGE
-        for start, end in sorted((deploy_at, rf_at), reverse=True):
+        for start, end in sorted((deploy_at, eegio_at, rf_at), reverse=True):
             rest = rest[:start] + rest[end:]
 
         self.assertEqual(set(re.findall(r'colspan="(\d+)"', deploy_block)),
                          {str(columns("DEPLOY_HEAD"))},
                          "the Deploy runs view's colspans do not match DEPLOY_HEAD")
+        self.assertEqual(set(re.findall(r'colspan="(\d+)"', eegio_block)),
+                         {str(columns("EEGIO_HEAD"))},
+                         "the EEG-IO runs view's colspans do not match EEGIO_HEAD")
         # The ladder's untrained rungs still print the three columns that are
         # known without training — reach, schedule, parameter cost — and span
         # only the rest, so each row is measured by its total width.
@@ -1389,9 +1397,10 @@ class RunPickerPageTests(unittest.TestCase):
         The picker and the tab share ``runsMarkup``, so every view the picker
         offers must be one the tab has.
 
-        They are no longer identical: the tab also lists Deploy runs, and a
-        measurement is not something the picker can return — it picks a
-        checkpoint to evaluate or deploy, and a latency trace is neither.
+        They are no longer identical: the tab also lists Deploy runs and
+        EEG-IO comparisons, and neither is something the picker can return —
+        it picks a checkpoint to evaluate, distil from or deploy, and a
+        latency trace and a past comparison are results, not checkpoints.
         """
         def views(container):
             block = re.search(rf'id="{container}">(.*?)</span>', self.PAGE, re.S)
@@ -1401,8 +1410,24 @@ class RunPickerPageTests(unittest.TestCase):
         pick, tab = views("pickView"), views("runsView")
         self.assertTrue(pick <= tab,
                         f"the picker offers views the tab does not: {sorted(pick - tab)}")
-        self.assertEqual(tab - pick, {"deploy"},
+        self.assertEqual(tab - pick, {"deploy", "eegio"},
                          "the tab gained a view the picker skips without a reason recorded here")
+
+    def test_the_picker_does_not_open_on_a_view_it_cannot_pick_from(self):
+        """
+        The picker starts on the Runs tab's view, and the tab has two the
+        picker does not — Deploy runs and EEG-IO comparisons. Reading the
+        tab's view unconditionally opened the dialog on a table of
+        measurements with nothing in it to return, so the view is taken only
+        when the picker offers it.
+        """
+        block = self.PAGE[self.PAGE.index("function openRunPicker("):]
+        block = block[:block.index("\n  }")]
+        self.assertNotIn("state.pickView = state.pickView || state.runsView;", block,
+                         "the picker still inherits the tab's view unchecked")
+        self.assertIn('$("#pickView").querySelectorAll("button")', block)
+        self.assertIn("offered.includes(state.runsView)", block,
+                      "the inherited view is not checked against the ones the picker offers")
 
     def test_the_picker_drops_the_actions_that_would_navigate_away(self):
         """curve and "Use as teacher" leave the tab; mid-choice that loses the

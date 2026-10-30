@@ -200,7 +200,14 @@
   #tab-eegio table { border-collapse: collapse; width: 100%; font-size: 12px; }
   #tab-eegio th { text-align: left; font-weight: 600; color: var(--muted); padding: 4px 8px 4px 0; }
   #tab-eegio td { padding: 3px 8px 3px 0; border-top: 1px solid var(--border); }
-  #tab-eegio #eegioRuns { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+  #tab-eegio #eegioRuns { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; }
+  #tab-eegio .eegio-chip { display: inline-flex; align-items: baseline; gap: 4px;
+                           border: 1px solid var(--border); border-radius: 4px;
+                           padding: 1px 4px; font-size: 12px; }
+  #tab-eegio .eegio-chip.off { border-color: var(--err); }
+  #tab-eegio .eegio-chip .x { border: none; background: none; cursor: pointer;
+                              color: var(--muted); padding: 0 2px; font-size: 13px; }
+  #tab-eegio .eegio-chip .x:hover { color: var(--err); }
   /* The training rate, beside the causality badge. Dashed when it was
      inferred from an older run recording nothing, as the loss badges are. */
   #tab-eegio .rate { font-size: 10px; padding: 0 4px; border: 1px solid var(--border);
@@ -727,13 +734,13 @@
     <div class="tab" id="tab-eegio">
       <div class="row">
         <button id="btnEegioRefresh" title="Look again for the recordings and the runs — after unpacking the dataset, or finishing a training run, without reloading the page">Refresh</button>
-        <label class="muted" for="eegioPast">past tests</label>
-        <select id="eegioPast" title="Every comparison this tab has run, newest first. They are saved to eegio_tests/ as they finish, so a result outlives the page."></select>
+        <span class="muted">past tests are listed under Runs → EEG-IO test</span>
         <span class="grow"></span>
         <span class="muted" id="eegioData">…</span>
       </div>
       <div class="row">
         <label class="muted">models</label>
+        <button id="btnEegioPick" title="Pick from the Runs table — the same groupings, params, seed and metrics as the Runs tab, so you can see what you are choosing">Choose models…</button>
         <span id="eegioRuns"></span>
       </div>
       <div class="row">
@@ -788,6 +795,7 @@
           <button data-view="time" title="Every run, newest first, grouped by the day it last wrote — including the ones that died">By time</button>
           <button data-view="all">All runs</button>
           <button data-view="deploy" title="Every Pi and host measurement: model, hop, median latency against its deadline, and whether the machine was held still while measuring">Deploy runs</button>
+          <button data-view="eegio" title="Every comparison run from the EEG-IO test tab: which models, at what rate and hop, over how many subjects, and what they scored on the real recordings">EEG-IO test</button>
         </span>
         <span class="grow"></span>
         <button id="btnRunsRefresh">Refresh</button>
@@ -817,6 +825,7 @@
   <div class="foot">
     <span class="muted" id="pickHint">Click a row to use that run. The same table as the Runs tab — unfinished and stale runs included, so you can see what you are picking.</span>
     <span class="grow"></span>
+    <button id="pickDone" class="primary" style="display:none">Done</button>
   </div>
 </dialog>
 
@@ -1343,6 +1352,17 @@
   const PICK_FOR = {
     eval: { title: "Choose a run to evaluate", get: () => state.evalRun, set: n => setEvalRun(n) },
     deploy: { title: "Choose a model to deploy", get: () => state.pi.model, set: n => setPiModel(n) },
+    // The EEG-IO test compares models against a baseline, so this one holds
+    // several and the dialog stays open while they are chosen. The first
+    // picked is the baseline, which is why order is kept.
+    eegio: { title: "Choose models to test on EEG-IO", multi: true,
+             get: () => state.eegio.picked,
+             set: n => {
+               const at = state.eegio.picked.indexOf(n);
+               if (at >= 0) state.eegio.picked.splice(at, 1);
+               else state.eegio.picked.push(n);
+               renderEegio();
+             } },
   };
 
   function renderRunPicker() {
@@ -1351,19 +1371,50 @@
     const t = $("#pickRuns");
     t.innerHTML = html;
     setNote($("#pickNote"), note);
+    const chosen = target.get();
+    const has = n => target.multi ? (chosen || []).includes(n) : n === chosen;
     t.querySelectorAll("tr[data-pick-row]").forEach(tr => {
-      if (tr.dataset.pickRow === target.get()) tr.classList.add("current");
+      const on = has(tr.dataset.pickRow);
+      if (on) tr.classList.add("current");
+      // "Select" is the whole truth when one row ends the dialog. When
+      // several are held at once the same button both adds and removes, and
+      // a row already in the set has to say which it would do.
+      const b = target.multi ? tr.querySelector("button[data-pick]") : null;
+      if (b) {
+        const at = (chosen || []).indexOf(tr.dataset.pickRow);
+        b.textContent = on ? "Remove" : "Add";
+        b.classList.toggle("primary", !on);
+        b.title = at === 0 ? "the baseline every other model is compared against"
+          : at > 0 ? `compared against ${chosen[0]}` : "";
+      }
       tr.addEventListener("click", () => {
         target.set(tr.dataset.pickRow);
-        $("#runPicker").close();
+        // One pick closes the dialog; several are chosen in one sitting, so
+        // it stays open and the rows restate what is in the set.
+        if (!target.multi) { $("#runPicker").close(); return; }
+        renderRunPicker();
       });
     });
+    $("#pickDone").style.display = target.multi ? "" : "none";
+    $("#pickHint").textContent = target.multi
+      ? `Click rows to add or remove them — ${(chosen || []).length} chosen, the first is `
+        + `the baseline. The same table as the Runs tab.`
+      : "Click a row to use that run. The same table as the Runs tab — unfinished and "
+        + "stale runs included, so you can see what you are picking.";
   }
 
   function openRunPicker(forWhat = "eval") {
     state.pickFor = PICK_FOR[forWhat] ? forWhat : "eval";
     $("#pickTitle").textContent = PICK_FOR[state.pickFor].title;
-    state.pickView = state.pickView || state.runsView;
+    // The picker starts on whatever view the Runs tab is on, but it offers
+    // fewer of them: a deploy measurement and an EEG-IO comparison are
+    // results, not checkpoints, so there is nothing in either table to
+    // return. Inheriting one of those left the dialog showing a table whose
+    // rows could not be picked. Inherit only a view the picker itself has.
+    const offered = [...$("#pickView").querySelectorAll("button")].map(b => b.dataset.view);
+    if (!offered.includes(state.pickView)) {
+      state.pickView = offered.includes(state.runsView) ? state.runsView : offered[0];
+    }
     $("#pickView").querySelectorAll("button")
       .forEach(b => b.classList.toggle("active", b.dataset.view === state.pickView));
     renderRunPicker();
@@ -3088,6 +3139,35 @@
   // The table for one view, as markup plus the caption that goes above it.
   // Shared by the Runs tab and the run picker so the two can never disagree
   // about what a run is or how it is grouped.
+  const EEGIO_HEAD = `<tr><th>when</th><th>models</th><th class="num">rate</th>
+    <th class="num">hop</th><th class="num">subj</th><th class="num">suppression dB</th>
+    <th class="num">fidelity dB</th><th></th></tr>`;
+
+  function eegioRow(r) {
+    const n2 = v => (v == null || !isFinite(v)) ? "—" : v.toFixed(2);
+    const med = (run, key) => ((r.summary || {})[run] || {})[key]?.median;
+    // The baseline first, then the rest, each with its own pair of numbers:
+    // one row per comparison, not one per model, because the comparison is
+    // the thing that was run.
+    const runs = r.runs || [];
+    const models = runs.map(n => n === r.baseline
+      ? `<b>${n}</b>` : n).join(", ");
+    const supp = runs.map(n => n2(med(n, "suppression_db"))).join(" / ");
+    const fid = runs.map(n => n2(med(n, "fidelity_db"))).join(" / ");
+    const when = (r.saved_at || r.name || "").replace("T", " ").slice(0, 16);
+    const flags = [r.zero_phase ? "zero-phase" : null,
+                   r.include_soft ? "soft blinks" : null,
+                   r.n_mismatched ? `${r.n_mismatched} at another rate` : null]
+      .filter(Boolean).join(" · ");
+    return `<tr><td>${when}</td>
+      <td>${r.error ? `<span class="bad">${r.error}</span>` : models}
+          ${flags ? `<br><span class="muted">${flags}</span>` : ""}</td>
+      <td class="num">${r.target_fs ? r.target_fs + "Hz" : "—"}</td>
+      <td class="num">${r.hop ?? "—"}</td><td class="num">${r.n_subjects ?? "—"}</td>
+      <td class="num">${supp || "—"}</td><td class="num">${fid || "—"}</td>
+      <td><button data-eegio-open="${r.name}">open</button></td></tr>`;
+  }
+
   function runsMarkup(view, mode = "tab") {
     const all = state.meta.runs || [], kinds = state.meta.kinds || [],
           losses = state.meta.losses || [], optims = state.meta.optimizers || [];
@@ -3171,6 +3251,21 @@
         + ` the state column is which of the two was actually held still` };
       html = DEPLOY_HEAD + (rows.map(deployRow).join("")
         || '<tr><td colspan="11" class="muted">no measurements yet — run one from the Deploy tab</td></tr>');
+    } else if (view === "eegio") {
+      // A third kind of row again: a comparison has a dataset, a rate, a hop
+      // and several models at once, and none of the training columns mean
+      // anything for it. Scored on real recordings, so there is no RRMSE --
+      // suppression and fidelity are what it has instead, and they are only
+      // read together.
+      const rows = state.meta.eegio_tests || [];
+      const off = rows.filter(r => r.n_mismatched).length;
+      note = { html: `${rows.length} comparison${rows.length === 1 ? "" : "s"} in eegio_tests/`
+        + ` · scored on real EEG-IO recordings, where there is no clean signal and so no RRMSE`
+        + ` · <b>suppression and fidelity are read together</b> — a model that attenuated`
+        + ` everything would score well on the first alone`
+        + (off ? ` · ${off} ran a model at a rate it was not trained at` : "") };
+      html = EEGIO_HEAD + (rows.map(eegioRow).join("")
+        || '<tr><td colspan="8" class="muted">no comparisons yet — run one from the EEG-IO test tab</td></tr>');
     } else {
       note = { text: `${all.length} checkpoint director${all.length === 1 ? "y" : "ies"} in runs/ · best epoch by val loss · “Use as teacher” fills teacher_ckpt` };
       html = HEAD + (all.map(r => runRow(r, "", mode)).join("") || '<tr><td colspan="10" class="muted">no runs/*/best.pt yet</td></tr>');
@@ -3192,6 +3287,11 @@
       $("#f_teacher_ckpt").scrollIntoView({ block: "center" });
     }));
     t.querySelectorAll("button[data-hist]").forEach(b => b.addEventListener("click", () => plotRun(b.dataset.hist)));
+    t.querySelectorAll("button[data-eegio-open]").forEach(b => b.addEventListener("click", async () => {
+      showTab("eegio");
+      if (!state.eegio.meta) await refreshEegio();
+      await openPastEegio(b.dataset.eegioOpen);
+    }));
     t.querySelectorAll("button[data-trace]").forEach(b => b.addEventListener("click", async () => {
       showTab("deploy");
       // A measurement writes up to three traces and the Deploy tab draws them
@@ -3792,8 +3892,6 @@
     // a selection someone has just made, nor close a past test being read.
     if (m && !state.eegio.picked.length) state.eegio.picked = m.suggested.filter(
       n => m.runs.some(r => r.name === n));
-    const past = $("#eegioPast");
-    if (past) past.dataset.n = "";        // force the list to be rebuilt
     renderEegio();
   }
 
@@ -3809,12 +3907,13 @@
         target_fs: Number($("#eegioRate").value) || undefined,
         include_soft: $("#eegioSoft").checked,
       });
-      // A finished run is the newest entry in the history, and becomes the
-      // one on screen. The list ships with /api/eegio/meta, which is not
-      // re-fetched per run, so it is pulled here rather than left stale.
+      // The history now lives in one place, the Runs tab's EEG-IO view, and
+      // that list ships with /api/meta, which is fetched once at boot. A
+      // finished comparison would not appear there until the next reload, so
+      // it is pulled in and the table redrawn here.
       state.eegio.viewing = state.eegio.out.name || "";
       const list = await api("/api/eegio/results").catch(() => null);
-      if (list && state.eegio.meta) state.eegio.meta.history = list.results;
+      if (list && state.meta) { state.meta.eegio_tests = list.results; renderRuns(); }
     } catch (e) { state.eegio.error = e.message; state.eegio.out = null; }
     state.eegio.busy = false; renderEegio();
   }
@@ -3835,29 +3934,6 @@
     // draws anything.
     const sel = $("#eegioRate");
 
-    // Past tests, newest first. Rebuilt whenever the list changes, and the
-    // label says what distinguishes two of them: when, which models, and
-    // the settings they were taken under.
-    const past = $("#eegioPast");
-    const hist = (state.eegio.meta && state.eegio.meta.history) || [];
-    if (past && past.dataset.n !== String(hist.length)) {
-      past.innerHTML = "";
-      past.appendChild(new Option(hist.length ? "— new test —" : "none yet", ""));
-      for (const h of hist) {
-        const when = (h.saved_at || h.name).replace("T", " ").slice(0, 16);
-        const what = (h.runs || []).length === 1 ? h.runs[0]
-          : `${(h.runs || []).length} models`;
-        const o = new Option(
-          `${when} · ${what} · ${h.target_fs || "?"}Hz hop${h.hop} · ${h.n_subjects} subj`,
-          h.name);
-        o.title = (h.runs || []).join(", ")
-          + (h.n_mismatched ? ` — ${h.n_mismatched} at another training rate` : "")
-          + (h.zero_phase ? " — zero-phase control" : "");
-        past.appendChild(o);
-      }
-      past.dataset.n = String(hist.length);
-    }
-    if (past) past.value = state.eegio.viewing || "";
     const m = state.eegio.meta;
     if (!$("#eegioData")) return;
     const ds = m && m.dataset;
@@ -3869,36 +3945,11 @@
          pairs land in any of: ${(ds.searched || [ds.dir]).map(x =>
            `<code>${x}</code>`).join(", ")} — then press Refresh.`;
 
-    // Model picker: the badge says what each run may read ahead, because a
-    // _bi twin is a legitimate offline control here and is refused on Deploy.
-    // 82 finished runs would bury the results under their own picker, so the
-    // three this tab exists to compare (and anything already ticked) are the
-    // list, and the rest is one disclosure away.
+    // The runs the tab knows about, with the rate each trained at. They are
+    // chosen from the Runs table now, so nothing is listed here; what is
+    // kept is the lookup the chips below read their badges out of.
     const runs = (m && m.runs) || [];
-    const box = (r, showRate = true) => {
-      const badge = r.bidirectional ? '<b class="bad">bi</b>'
-        : r.lookahead ? `<b>la${r.lookahead}</b>` : "<span class='muted'>causal</span>";
-      // The rate it trained at. Solid when the run recorded it, dashed when
-      // inferred from an older run's silence -- the same distinction the
-      // Runs tab draws for a recovered loss, and it matters here because a
-      // directory name no longer implies a rate: runs/tcn_mla_both_s67 held
-      // a 256 Hz run and now holds a 250 Hz one.
-      // Only a *picked* model at the wrong rate is marked: colouring all
-      // seventy-nine of the others red says nothing and hides the three
-      // that matter.
-      const want = Number(sel && sel.value) || null;
-      const off = want && r.train_fs !== want && state.eegio.picked.includes(r.name);
-      const rate = `<span class="rate${r.train_fs_recorded ? "" : " guessed"}${off ? " bad" : ""}"
-        title="${r.train_fs_recorded
-          ? `the run recorded target_fs ${r.train_fs}`
-          : `no target_fs recorded; trained before the field existed, so 256 Hz`}${off
-          ? ` — but you are about to evaluate at ${want} Hz` : ""}">${r.train_fs}Hz</span>`;
-      const on = state.eegio.picked.includes(r.name);
-      return `<label class="chk" title="${r.variant} · seed ${r.master_seed}${
-          showRate ? "" : ` · trained at ${r.train_fs} Hz`}">
-        <input type="checkbox" data-eegio-run="${r.name}" ${on ? "checked" : ""}>
-        ${r.name} ${badge} ${showRate ? rate : ""}</label>`;
-    };
+
     if (m && m.rates && sel && sel.options.length !== m.rates.length) {
       sel.innerHTML = "";
       for (const r of m.rates) {
@@ -3906,54 +3957,30 @@
       }
       sel.value = String(m.defaults.target_fs);
     }
-    // One disclosure per training rate. Eighty-odd rows each carrying their
-    // own rate chip was the thing that made this unreadable; the group says
-    // the rate once, so the rows inside it do not repeat it. The group that
-    // matches the evaluation rate comes first and opens, because those are
-    // the models that can be run without a caveat.
-    // The front row is the selection, not the selection plus a standing
-    // recommendation. It used to be `suggested || picked`, so the three
-    // suggested models stayed pinned at the top unticked after you had
-    // chosen your own -- and at 250 Hz they were the wrong rate as well,
-    // which made the row read as four picks and three mistakes. The
-    // suggestion is a starting point, so it is shown only when there is
-    // nothing to start from.
-    const picked = runs.filter(r => state.eegio.picked.includes(r.name));
-    const front = picked.length ? picked : runs.filter(r => r.suggested);
-    const showingSuggestion = !picked.length && front.length;
-    const rest = runs.filter(r => !front.includes(r));
+    // The chosen models, in the order they were picked -- the first is the
+    // baseline the rest are paired against. The eighty-odd others live in
+    // the Runs table behind "Choose models…", which is where the Deploy tab
+    // sends you for the same reason: choosing what to measure is choosing
+    // among runs, and a checkbox list of all of them is not a way to see
+    // them.
+    const picked = state.eegio.picked
+      .map(n => runs.find(r => r.name === n)).filter(Boolean);
     const want = Number(sel && sel.value) || null;
-    const rates = [...new Set(rest.map(r => r.train_fs))]
-      .sort((a, b) => (b === want) - (a === want) || b - a);
-    const group = fs => {
-      const rows = rest.filter(r => r.train_fs === fs);
-      const inferred = rows.every(r => !r.train_fs_recorded);
-      const open = want != null && fs === want;
-      return `<details class="eegio-group"${open ? " open" : ""}>
-        <summary class="muted">${rows.length} run(s) trained at <b>${fs} Hz</b>${
-          inferred ? ' <span class="muted" title="none of these recorded target_fs; '
-                   + 'they predate the field, when 256 was the only rate">(inferred)</span>' : ""}${
-          want != null && fs !== want
-            ? ' — <span class="bad">not the evaluation rate</span>' : ""}</summary>
-        <div class="eegio-more">${rows.map(r => box(r, false)).join(" ")}</div></details>`;
-    };
-    $("#eegioRuns").innerHTML = (front.length
-        ? `<div class="eegio-front">${showingSuggestion
-             ? '<span class="muted" title="a starting point, not a restriction: tick '
-               + 'anything below and this row becomes your selection">suggested:</span> '
-             : ""}${front.map(r => box(r, true)).join(" ")}</div>`
-        : '<span class="muted">nothing picked — tick a model below</span>')
-      + rates.map(group).join("");
+    $("#eegioRuns").innerHTML = picked.length
+      ? picked.map((r, i) => {
+          const badge = r.bidirectional ? '<b class="bad">bi</b>'
+            : r.lookahead ? `<b>la${r.lookahead}</b>` : "<span class='muted'>causal</span>";
+          const off = want && r.train_fs !== want;
+          return `<span class="eegio-chip${off ? " off" : ""}"
+            title="${r.variant} · seed ${r.master_seed} · trained at ${r.train_fs} Hz${
+              off ? ` — you are about to evaluate at ${want} Hz` : ""}">
+            ${i === 0 ? '<b class="muted">baseline</b> ' : ""}${r.name} ${badge}
+            <span class="rate${r.train_fs_recorded ? "" : " guessed"}${off ? " bad" : ""}"
+              >${r.train_fs}Hz</span>
+            <button class="x" data-eegio-drop="${r.name}" title="remove">×</button></span>`;
+        }).join("")
+      : '<span class="muted">none chosen — press “Choose models…”</span>';
 
-    // hop is buffering, and buffering is lookahead: at hop N every model gets
-    // N-1 samples of future for free, which swamps the licence the ladder is
-    // about. Said here rather than left in the output to be puzzled over.
-    const hop = Number($("#eegioHop").value) || 1;
-    $("#eegioHopWarn").innerHTML = hop > 1
-      ? `<span class="bad">onset lead is not measurable at hop ${hop}</span> —
-         the buffer gives every model ${hop - 1} samples of future; use hop 1 for it`
-      : "";
-    $("#btnEegio").disabled = state.eegio.busy || !ds || !ds.present || !state.eegio.picked.length;
     const wrongRate = runs.filter(r => state.eegio.picked.includes(r.name)
                                    && r.train_fs !== (Number(sel && sel.value) || r.train_fs));
     $("#eegioRateWarn").innerHTML = wrongRate.length
@@ -3973,6 +4000,7 @@
 
     $("#eegioBody").innerHTML = `
       ${!(out.saved && state.eegio.viewing) ? "" : `<p class="hint">
+         <button data-eegio-close title="Clear this result and go back to the settings above">close</button>
          Saved as <code>eegio_tests/${state.eegio.viewing}</code> at
          ${out.saved.at.replace("T", " ")} — ${out.saved.models.map(m =>
            `${m.run} trained at ${m.train_fs}Hz`).join(", ")}, hop ${out.saved.hop},
@@ -4038,17 +4066,20 @@
          only whether real blinks land anywhere near what the models were trained on.</p>`;
   }
 
-  $("#eegioRuns").addEventListener("change", e => {
-    const name = e.target.dataset && e.target.dataset.eegioRun;
-    if (!name) return;
-    state.eegio.picked = e.target.checked
-      ? [...state.eegio.picked, name]
-      : state.eegio.picked.filter(n => n !== name);
+  $("#eegioRuns").addEventListener("click", e => {
+    const drop = e.target.dataset && e.target.dataset.eegioDrop;
+    if (!drop) return;
+    state.eegio.picked = state.eegio.picked.filter(n => n !== drop);
     renderEegio();
   });
+  $("#btnEegioPick").addEventListener("click", () => openRunPicker("eegio"));
   $("#btnEegio").addEventListener("click", runEegio);
   $("#btnEegioRefresh").addEventListener("click", () => refreshEegio(true));
-  $("#eegioPast").addEventListener("change", e => openPastEegio(e.target.value));
+  // Delegated: the close button is drawn with the result, so it does not
+  // exist when this runs.
+  $("#eegioBody").addEventListener("click", e => {
+    if (e.target.closest("[data-eegio-close]")) openPastEegio("");
+  });
   $("#eegioHop").addEventListener("input", renderEegio);
   $("#eegioRate").addEventListener("change", renderEegio);
 
@@ -4227,6 +4258,7 @@
   $("#evalRunBtn").addEventListener("click", () => openRunPicker("eval"));
   $("#piModelBtn").addEventListener("click", () => openRunPicker("deploy"));
   $("#pickCancel").addEventListener("click", () => $("#runPicker").close());
+  $("#pickDone").addEventListener("click", () => $("#runPicker").close());
   $("#pickView").querySelectorAll("button").forEach(b => b.addEventListener("click", () => {
     state.pickView = b.dataset.view;
     $("#pickView").querySelectorAll("button").forEach(x => x.classList.toggle("active", x === b));
