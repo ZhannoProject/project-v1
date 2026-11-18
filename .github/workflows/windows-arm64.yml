@@ -1,0 +1,61 @@
+name: Windows ARM64 app
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install packaging tools
+        run: python -m pip install uv==0.13.7 ziglang==0.17.0
+      - name: Build the data-free portable package
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import shutil, ziglang
+          from gui.make_windows import build
+          build('dist/windows', '.build/windows/downloads', shutil.which('uv'),
+                Path(ziglang.__file__).parent/'zig')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-build
+          path: |
+            dist/windows/*.zip
+            dist/windows/*.sha256
+          retention-days: 14
+
+  check-windows:
+    needs: build
+    runs-on: windows-11-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-arm64-build
+          path: dist
+      - name: Extract and test the shipped ARM64 runtime
+        shell: pwsh
+        run: |
+          Expand-Archive -Path dist/EEGTrainingGUI-Windows-ARM64.zip -DestinationPath portable
+          $packageRoot = (Resolve-Path portable/EEGTrainingGUI-Windows-ARM64).Path
+          Push-Location "$packageRoot/app"
+          try {
+            & "$packageRoot/runtime/python.exe" -X utf8 -u -m gui.windows_start --check
+            if ($LASTEXITCODE -ne 0) { throw "Windows ARM64 self-check failed: $LASTEXITCODE" }
+          } finally { Pop-Location }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-arm64-device-logs
+          path: portable/EEGTrainingGUI-Windows-ARM64/logs/
+          retention-days: 14

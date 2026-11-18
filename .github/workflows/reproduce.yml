@@ -56,6 +56,13 @@ jobs:
       - name: Run reproduce.py
         run: python reproduce.py
 
+      - name: Run regression and methodology tests
+        env:
+          MPLBACKEND: Agg
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+        run: python -m unittest discover -s tests
+
       # ---- Upload any artifacts produced during the run ----
       - name: Upload test artifacts
         if: always()

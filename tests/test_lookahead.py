@@ -249,7 +249,7 @@ class TestLicensedAgainstMeasured(unittest.TestCase):
     def test_training_mode_is_not_measured_in(self):
         # BatchNorm's batch statistics span time, which couples every position
         # to every other; the probe must not report that as a reach.
-        model = build_model("tcn_se", hidden_channels=16)
+        model = build_model("tcn_se", hidden_channels=16, tcn_norm="batch")
         model.train()
         self.assertEqual(forward_receptive_field(model), 0)
         self.assertTrue(model.training, "the probe must leave the mode as it found it")
@@ -348,6 +348,159 @@ class TestStreamingRefusesToLookAhead(unittest.TestCase):
 class TestTheTabsNumbers(unittest.TestCase):
     """gui/lookahead.py: what the Lookahead tab is handed."""
 
+    def test_se_architecture_options_keep_rate_and_normalization_separate(self):
+        from unittest.mock import patch
+        from gui import lookahead
+        from gui.server import build_train_command, training_command_config
+        from models.causal_config import ChannelNorm
+
+        baseline = dict(name="channel250", variant="tcn_se", artifact="BOTH", status="complete",
+                        hidden_channels=8, params=1000, tcn_norm="channel", train_fs=250.0,
+                        input_normalization="epoch", master_seed=42, epochs=200, loss_fn="mse",
+                        rrmse_t=.7)
+        historical = dict(baseline, name="batch256", tcn_norm="batch", train_fs=256.)
+        plain = dict(baseline, name="without_norm", tcn_norm="none")
+
+        def checkpoint(path):
+            norm = {"channel250": "channel", "batch256": "batch", "without_norm": "none"}[path.parent.name]
+            return {"model_config": {"causal": True, "se_reduction": 8, "tcn_norm": norm},
+                    "run_config": {"normalization": "epoch"}}
+
+        with patch.object(lookahead, "list_runs", return_value=[baseline, historical, plain]), \
+             patch.object(lookahead, "_checkpoint_info", side_effect=checkpoint):
+            meta = lookahead.meta()
+            choice = meta["baselines"]["channel250"]["variant"]
+            old = meta["baselines"]["batch256"]["variant"]
+            self.assertNotEqual(choice, old)
+            self.assertIn("ChannelNorm", meta["families"][choice]["label"])
+            self.assertIn("BatchNorm", meta["families"][old]["label"])
+            self.assertEqual(meta["families"][old]["train_budgets"], [])
+            self.assertIn("No normalization", meta["families"][meta["baselines"]["without_norm"]["variant"]]["label"])
+            with patch.object(lookahead, "forward_receptive_field", return_value=0) as probe:
+                measured = lookahead.measure({"variant": choice, "hidden_channels": 8, "budgets": [4]})
+            self.assertTrue(any(isinstance(m, ChannelNorm) for m in probe.call_args.args[0].modules()))
+            self.assertEqual(measured["rows"][0]["seeds"], [42])
+            self.assertEqual(measured["rows"][0]["n_runs"], 1)
+            self.assertEqual(measured["rows"][1]["latency_ms"], 16)
+            plan = lookahead.train_spec({"variant": choice, "lookahead": 4, "hidden_channels": 8})
+        cfg, _ = training_command_config(build_train_command(plan["config"], plan["extra"]),
+                                         lookahead.PROJECT_ROOT)
+        self.assertEqual((cfg["target_fs"], cfg["tcn_norm"], cfg["normalization"]), (250, "channel", "epoch"))
+        self.assertEqual(cfg["se_reduction"], 8)
+        self.assertIn("channelnorm_250hz_epoch", plan["save_dir"])
+
+    def test_missing_training_checks_every_seed_against_the_selected_recipe(self):
+        from unittest.mock import patch
+        from gui import lookahead
+
+        baseline = dict(name="base", variant="tcn_se", artifact="BOTH", status="complete",
+                        hidden_channels=64, params=1000, tcn_norm="channel", train_fs=250.0,
+                        input_normalization="epoch", master_seed=67, epochs=200, loss_fn="mse")
+        complete = dict(baseline, name="renamed_rung", variant="tcn_se_la4", master_seed=42)
+        old_rate = dict(complete, name="at_256", variant="tcn_se_la8", train_fs=256.0)
+        interrupted = dict(complete, name="partial", variant="tcn_se_la16", epochs=20)
+
+        def checkpoint(path):
+            return {
+                "model_config": dict(causal=path.parent.name == "base", se_reduction=8,
+                                     dropout=.2, hidden_channels=64),
+                "run_config": dict(normalization="epoch", learning_rate=5e-4),
+            }
+
+        with patch.object(lookahead, "list_runs", return_value=[baseline, complete, old_rate, interrupted]), \
+             patch.object(lookahead, "_checkpoint_info", side_effect=checkpoint):
+            plan = lookahead.missing_train_plan({"baseline": "base"})
+        self.assertEqual(plan["seeds"], [42, 54, 67])
+        self.assertEqual(plan["completed"], 2)
+        pairs = {(run["lookahead"], run["master_seed"]) for run in plan["runs"]}
+        self.assertEqual(pairs, {(n, seed) for n in (0, *LOOKAHEAD_LADDER, None)
+                                 for seed in plan["seeds"]} - {(0, 67), (4, 42)})
+        for run in plan["runs"]:
+            cfg = run["config"]
+            self.assertEqual((cfg["target_fs"], cfg["tcn_norm"], cfg["normalization"]), (250, "channel", "epoch"))
+            self.assertEqual((cfg["dropout"], cfg["master_seed"]), (.2, run["master_seed"]))
+            self.assertFalse(cfg["overwrite"])
+
+    def test_channelnorm_tcn_aliases_are_discovered_and_paired_by_recipe(self):
+        from functools import partial
+        from unittest.mock import patch
+        from gui import lookahead
+        from models.variants import TCNOnly, VARIANT_REGISTRY
+
+        aliases = {
+            "custom_causal": partial(TCNOnly, dilations=[1, 2]),
+            "custom_centred": partial(TCNOnly, dilations=[1, 2], causal=False),
+        }
+        base = {"name": "reference", "variant": "custom_causal", "artifact": "BOTH",
+                "status": "complete", "hidden_channels": 8, "params": 1000, "tcn_norm": "channel",
+                "train_fs": 250.0, "input_normalization": "epoch", "master_seed": 54,
+                "epochs": 200, "loss_fn": "mse", "rrmse_t": 0.7}
+        duplicate = dict(base, name="reference_alias")
+        unmatched = dict(base, name="different_seed", master_seed=67)
+        centred = dict(base, name="centred", variant="custom_centred", rrmse_t=0.6)
+        batchnorm = dict(centred, name="historical", tcn_norm="batch")
+
+        def checkpoint(path):
+            return {"model_config": {"causal": path.parent.name not in {"centred", "historical"}}}
+
+        with patch.dict(VARIANT_REGISTRY, aliases), \
+             patch.object(lookahead, "list_runs", return_value=[base, duplicate, unmatched, centred, batchnorm]), \
+             patch.object(lookahead, "_checkpoint_info", side_effect=checkpoint):
+            choice = "tcn/250/epoch/1-2"
+            meta = lookahead.meta()
+            family = meta["families"][choice]
+            self.assertEqual(set(meta["baselines"]), {"reference", "reference_alias", "different_seed"})
+            self.assertEqual(meta["baselines"]["different_seed"],
+                             {"variant": choice, "artifact": "BOTH", "hidden_channels": 8})
+            self.assertEqual(family["train_budgets"], [])
+            measured = lookahead.measure({"variant": choice, "hidden_channels": 8})
+            self.assertEqual([row["licensed"] for row in measured["rows"]], [0, 6, 12])
+            self.assertEqual(measured["rows"][0]["n_runs"], 2)
+            self.assertEqual(measured["rows"][1]["latency_ms"], 24)
+            self.assertEqual(measured["rows"][1]["n_runs"], 1)
+            self.assertEqual(measured["rows"][1]["variant"], "custom_centred")
+            spec, pair = lookahead.eegio_spec({"variant": choice, "hidden_channels": 8,
+                                              "runs": ["reference_alias", "centred"]})
+            self.assertEqual(spec["target_fs"], 250)
+            self.assertEqual(pair["lookahead"], 6)
+            self.assertEqual(len(measured["eegio_pairs"]), 2)
+
+    def test_eegio_uses_the_matching_checkpoint_pair_and_training_rate(self):
+        from unittest.mock import patch
+        from gui.lookahead import eegio_spec
+
+        base = {"name": "causal", "variant": "tcn_se", "artifact": "BOTH", "status": "complete",
+                "hidden_channels": 64, "params": 123838, "tcn_norm": "batch", "train_fs": 256.0,
+                "input_normalization": "epoch", "master_seed": 42, "epochs": 200, "loss_fn": "mse"}
+        rung = dict(base, name="bounded", variant="tcn_se_la16", lookahead=16)
+        short = dict(base, name="short", variant="tcn_se_la1", lookahead=1)
+        unbounded = dict(base, name="offline", variant="tcn_se_bi")
+        other_rate = dict(base, name="250hz", train_fs=250.0)
+        other_seed = dict(base, name="another_seed", master_seed=67)
+        other_split = dict(base, name="another_split")
+        stale = dict(base, name="stale", status="stale")
+
+        def info(path):
+            name = path.parent.name
+            return {"model_config": {"causal": name not in {"bounded", "short", "offline"}, "se_reduction": 8},
+                    "run_config": {"split_ratios": (0.6, 0.2, 0.2)} if name == "another_split" else {}}
+
+        with patch("gui.lookahead.list_runs", return_value=[base, rung, short, unbounded, other_rate, other_seed, other_split, stale]), \
+             patch("gui.lookahead._checkpoint_info", side_effect=info):
+            spec, pair = eegio_spec({"runs": ["causal", "bounded"], "target_fs": 250, "offline": False})
+            self.assertEqual(spec, {"runs": ["causal", "bounded"], "target_fs": 256.0,
+                                    "offline": True, "zero_phase": False, "n_subjects": 20})
+            self.assertEqual((pair["master_seed"], pair["lookahead"], pair["latency_ms"]), (42, 16, 62.5))
+            case, _ = eegio_spec({"runs": pair["runs"], "n_subjects": 5, "zero_phase": True})
+            self.assertEqual((case["n_subjects"], case["zero_phase"]), (5, True))
+            sweep_runs = ["causal", "short", "bounded", "offline"]
+            sweep, plan = eegio_spec({"runs": sweep_runs})
+            self.assertEqual(sweep["runs"], sweep_runs)
+            self.assertEqual(plan["rungs"], dict(zip(sweep_runs, [0, 1, 16, None])))
+            for bad in (other_rate, other_seed, other_split, stale, rung):
+                with self.subTest(run=bad["name"]), self.assertRaises(ValueError):
+                    eegio_spec({"runs": [bad["name"], rung["name"]]})
+
     def test_a_rung_averages_only_runs_of_its_own_width(self):
         # The reason this exists: runs/tcn_se_both_s67 held a 48-channel run
         # beside two 64-channel ones, and averaging the three made a spread of
@@ -409,14 +562,44 @@ class TestTheTabsNumbers(unittest.TestCase):
         self.assertFalse(row["trainable"])
         self.assertIn("LOOKAHEAD_LADDER", row["note"])
 
+    def test_plain_tcn_ladder_uses_a_finite_centred_rung_and_channelnorm_training(self):
+        from unittest.mock import patch
+        from gui.lookahead import measure, train_spec
+        from models.lookahead import TCN_LOOKAHEAD_LADDER
+
+        historical = dict(name="tcn_bi_both", variant="tcn_bi", artifact="BOTH",
+                          status="complete", hidden_channels=8, loss_fn="mse",
+                          tcn_norm="batch", train_fs=256, input_normalization="epoch")
+        with patch("gui.lookahead.list_runs", return_value=[historical]):
+            result = measure({"variant": "tcn", "hidden_channels": 8})
+        self.assertEqual([r["licensed"] for r in result["rows"]], [0, *TCN_LOOKAHEAD_LADDER])
+        centred = next(r for r in result["rows"] if r["lookahead"] == 62)
+        self.assertEqual((centred["variant"], centred["past"], centred["ahead"]),
+                         ("tcn_la62", 62, 62))
+        self.assertEqual(centred["n_runs"], 0)
+        self.assertIn("batchnorm", centred["mismatched"][0]["why"])
+        self.assertTrue(result["rows"][-1]["one_sided"])
+        plan = train_spec({"variant": "tcn", "lookahead": 62, "master_seed": 67})
+        self.assertEqual(plan["config"], "tcn_both.yaml")
+        self.assertEqual(plan["save_dir"], "runs/tcn_la62_both_channelnorm_256hz_s67")
+        self.assertIn("--tcn_norm channel", plan["extra"])
+        self.assertIn("--target_fs 256", plan["extra"])
+        self.assertIn("--normalization fixed", plan["extra"])
+        narrow = train_spec({"variant": "tcn", "lookahead": 62, "hidden_channels": 8})
+        self.assertTrue(narrow["save_dir"].endswith("_s42_h8"))
+        self.assertIn("--hidden_channels 8", narrow["extra"])
+        with self.assertRaises(ValueError):
+            measure({"variant": "tcn", "budgets": [186]})
+
     def test_a_budget_over_capacity_is_refused_by_the_api(self):
         from gui.lookahead import measure
         with self.assertRaises(ValueError):
             measure({"budgets": [10_000]})
         with self.assertRaises(ValueError):
             measure({"budgets": ["32"]})
-        with self.assertRaises(ValueError):
-            measure({"hidden_channels": 0})
+        for width in (0, 1025, 64.5, True):
+            with self.subTest(width=width), self.assertRaises(ValueError):
+                measure({"hidden_channels": width})
 
     def test_training_a_rung_goes_to_its_own_directory(self):
         from gui.lookahead import train_spec

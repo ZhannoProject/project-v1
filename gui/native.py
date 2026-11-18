@@ -75,12 +75,10 @@ def run_native(host: str = "127.0.0.1", port: int = 0, verbose: bool = False,
     # TRAIN_JOBS is a registry rather than one job -- there can be several runs
     # going at once -- but it answers ``running`` the same way, so the guard
     # does not need to know the difference.
-    jobs = ((_server.TRAIN_JOBS, "training run"), (_server.EVAL_JOB, "evaluation"),
-            (_server.DEPLOY_JOB, "deploy run"))
 
     def on_closing():
         # Returning False keeps the window open.
-        busy = [what for job, what in jobs if job.running]
+        busy = [name for name, job in _server.TASKS.active()]
         if busy:
             ok = window.create_confirmation_dialog(
                 "Still running",
@@ -94,11 +92,12 @@ def run_native(host: str = "127.0.0.1", port: int = 0, verbose: bool = False,
 
     try:
         # private_mode=False keeps localStorage (last-opened preset) across launches
-        webview.start(private_mode=False)
+        webview.start(private_mode=False, **({'gui': 'edgechromium'} if sys.platform == 'win32' else {}))
     finally:
-        for job, what in jobs:
-            if job.running:
-                print(f"[gui] stopping the {what} ...")
-                job.stop()
-        httpd.shutdown()
-        httpd.server_close()
+        try:
+            _server.TASKS.stop_all()
+        finally:
+            try:
+                httpd.shutdown()
+            finally:
+                httpd.server_close()

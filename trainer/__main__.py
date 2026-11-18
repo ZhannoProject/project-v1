@@ -27,37 +27,48 @@ from data.Dataloader import build_dataloaders
 from models.variants import (build_model_from_config, VARIANT_REGISTRY, variant_is_causal,
                              pinned_kwargs)
 from configs import load_config, merge_cli_overrides
+from experiment.config import resolve_config, resolve_save_dir, defaults, PROFILES
 from trainer.checkpoint import ensure_writable, recorded_seed
 from trainer.distillation import default_feature_layers
 from trainer.training import Trainer
 from trainer.distillation import KDTrainer, load_teacher
 from utils.utils import seed_everything, resolve_device, DEVICE_CHOICES
 
-DEFAULT_DATA_DIR = "./data/EEGdenoisenet/data/"
+DEFAULT_DATA_DIR = defaults("cli")["data_dir"]
 
 
-#: The seed a run uses when nothing says otherwise.  Runs at this seed keep
-#: the bare ``runs/<variant>_<artifact>`` path they have always had; any other
-#: seed gets its own ``_s<seed>`` folder so the two can coexist.
-DEFAULT_MASTER_SEED = 42
+#: The default split and training seed, also used by the sweep planners.
+DEFAULT_MASTER_SEED = defaults("cli")["master_seed"]
 
 
-def main():
+def build_parser():
     # --- CLI args (all optional — YAML config provides defaults) ---
     parser = argparse.ArgumentParser(description="Train an EEG causal denoising model")
     parser.add_argument("--config", type=str, default=None,
                         help="Path to YAML config file (e.g. configs/tcn_mha_eog.yaml)")
+    parser.add_argument("--profile", choices=list(PROFILES), default=None)
+    parser.add_argument("--protocol", choices=["exploratory", "paper"], default=None)
+    parser.add_argument("--output_delay", type=int, default=None,
+                        help="Estimate clean[t] at acquisition t+ell; architecture stays unchanged")
+    parser.add_argument("--valid_history_samples", type=int, default=None)
+    parser.add_argument("--valid_future_samples", type=int, default=None)
+    parser.add_argument("--hop", type=int, default=None)
+    parser.add_argument("--tcn_norm", choices=["none", "channel"], default=None)
+    parser.add_argument("--se_window", type=int, default=None)
+    parser.add_argument("--attention_window", type=int, default=None)
+    parser.add_argument("--resampling", choices=["offline", "causal"], default=None)
+    parser.add_argument("--n_heads", type=int, default=None)
+    parser.add_argument("--sampling", choices=["legacy", "balanced"], default=None)
+    parser.add_argument("--split_ratios", type=float, nargs=3, default=None)
     parser.add_argument("--variant", default=None, choices=list(VARIANT_REGISTRY.keys()))
     parser.add_argument("--artifact", default=None, choices=["EOG", "EMG", "BOTH"])
     parser.add_argument("--data_dir", default=None)
     parser.add_argument("--save_dir", default=None,
                         help="Checkpoint directory "
-                             "(default: runs/<variant>_<artifact>[_kd][_s<seed>], "
-                             "the seed suffix appearing for any seed but the default)")
+                             "(default: runs/<variant>_<artifact>[_kd]_<rate>hz[_s<seed>])")
     parser.add_argument("--overwrite", action="store_true", default=None,
                         help="Replace the run already in save_dir. Without it, training "
-                             "refuses to start on top of a run from a different (or "
-                             "unrecorded) master_seed")
+                             "refuses to replace any existing run")
     parser.add_argument("--hidden_channels", type=int, default=None)
     parser.add_argument("--n_attn_layers", type=int, default=None,
                         help="Number of transformer layers (e.g. 2, 10, 20, 50)")
@@ -68,9 +79,9 @@ def main():
     parser.add_argument("--log_every", type=int, default=None)
     parser.add_argument("--tensorboard", action="store_true", default=None)
     parser.add_argument("--staged", action="store_true", default=None,
-                        help="Use two-phase staged training (freeze TCN → joint finetune)")
+                        help="Use two-phase staged training (freeze decoder → joint finetune)")
     parser.add_argument("--warmup_epochs", type=int, default=None,
-                        help="Phase 1 epochs (attention-only warm-up)")
+                        help="Phase 1 epochs (TCN-only warm-up)")
     parser.add_argument("--warmup_lr", type=float, default=None,
                         help="Learning rate for Phase 1")
     parser.add_argument("--finetune_lr", type=float, default=None,
@@ -103,6 +114,11 @@ def main():
     parser.add_argument("--master_seed", type=int, default=None,
                         help="Seed for data splits, SNR draws, weight init, dropout and "
                              "batch order (default 42)")
+    parser.add_argument("--normalization", choices=["fixed", "epoch"], default=None,
+                        help="fixed (default): a training-calibrated scale, suitable for online inference; "
+                             "epoch: legacy offline full-window normalization")
+    parser.add_argument("--normalization_scale", type=float, default=None,
+                        help="Fixed input scale; omitted means calibrate on the training EEG pool")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default=None,
                         help="auto (default: cuda > mps > cpu). Use cpu for bit-exact "
                              "reproducibility: MPS is not deterministic even when seeded.")
@@ -135,6 +151,11 @@ def main():
     parser.add_argument("--init_from_teacher", action="store_true", default=None,
                         help="Initialise the student from the teacher's weights before training "
                              "(a smaller student receives the leading slice of each tensor)")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     # --- Build effective config: YAML defaults -> CLI overrides ---
@@ -144,96 +165,11 @@ def main():
     else:
         cfg = {k: v for k, v in vars(args).items() if v is not None}
 
-    # Apply fallback defaults for anything still missing
-    cfg.setdefault("variant",            "tcn_mla")
-    cfg.setdefault("artifact",           "BOTH")
-    cfg.setdefault("data_dir",           DEFAULT_DATA_DIR)
-    cfg.setdefault("hidden_channels",    64)
-    cfg.setdefault("batch_size",         32)
-    cfg.setdefault("learning_rate",      5e-3)
-    cfg.setdefault("attn_lr_scale",      0.1)
-    cfg.setdefault("weight_decay",       0.0)
-    cfg.setdefault("max_epochs",         150)
-    cfg.setdefault("log_every",          20)
-    cfg.setdefault("sched_warmup_epochs", 5)
-    cfg.setdefault("eta_min",            1e-6)
-    cfg.setdefault("tensorboard",        False)
-    cfg.setdefault("staged",             False)
-    cfg.setdefault("warmup_epochs",      5)
-    cfg.setdefault("warmup_lr",          1e-3)
-    cfg.setdefault("finetune_lr",        5e-4)
-    cfg.setdefault("loss_fn",            "l1_combined")   # must match Trainer's default and the presets
-    cfg.setdefault("bottleneck_ratio",  0.5)
-    cfg.setdefault("skip_bottleneck_ratio", None)
-    cfg.setdefault("kv_lora_rank",      16)
-    cfg.setdefault("snr_range_db",      [-7.0, 2.0])
-    cfg.setdefault("master_seed",       DEFAULT_MASTER_SEED)
-    cfg.setdefault("overwrite",         False)
-    cfg.setdefault("device",            "auto")
-    cfg.setdefault("target_fs",         None)
-    cfg.setdefault("teacher_ckpt",      None)
-    cfg.setdefault("teacher_config",    None)
-    cfg.setdefault("kd_alpha",          0.5)
-    cfg.setdefault("kd_feature_weight", 0.0)
-    # Left unset here: "decoder" is only the right default for the attention
-    # variants, and tcn/tcn_se have no decoder at all -- asking for one raised
-    # "'decoder' is not a submodule of TCNWithSE". Resolved from the model
-    # below, once the variant is known, so feature distillation can be
-    # switched on for any family without also knowing its module names.
-    cfg.setdefault("kd_feature_layers", None)
-    cfg.setdefault("kd_output_loss",    None)
-    cfg.setdefault("kd_feature_loss",   "mse")
-    cfg.setdefault("init_from_teacher", False)
-
-    cfg.setdefault("n_attn_layers", 2)
-    if type(cfg["n_attn_layers"]) is not int or cfg["n_attn_layers"] < 1:
-        parser.error("n_attn_layers must be a positive integer")
-
-    # A rank alias (tcn_mla_r8 → kv_lora_rank=8) outranks the generic
-    # kv_lora_rank that the YAML / the default above carry for tcn_mla, so the
-    # printed config, the checkpoint and the model built from it all agree.
-    for key, value in pinned_kwargs(cfg["variant"]).items():
-        if cfg.get(key) not in (None, value):
-            print(f"[Config] variant '{cfg['variant']}' fixes {key}={value}; "
-                  f"overriding {key}={cfg[key]}")
-        cfg[key] = value
-
+    try:
+        cfg = resolve_save_dir(resolve_config(cfg))
+    except (ValueError, TypeError) as exc:
+        parser.error(str(exc))
     distil = cfg["teacher_ckpt"] is not None
-    if cfg.get("save_dir") is None:
-        # The seed is part of the identity of a run, so it has to be part of
-        # the path: without it, two seeds of the same model land in the same
-        # folder and the second overwrites the first.  The default seed keeps
-        # the bare name, so every directory already in runs/ (and every path in
-        # the README and the deploy scripts) still means what it did.
-        base = (f"./runs/{cfg['variant']}_{cfg['artifact'].lower()}"
-                + ("_kd" if distil else ""))
-        seeded = f"{base}_s{cfg['master_seed']}"
-
-        if cfg["master_seed"] != DEFAULT_MASTER_SEED:
-            cfg["save_dir"] = seeded
-        else:
-            # ...but "the bare name belongs to the default seed" is only true
-            # while nothing else has taken it. runs/tcn_both holds a seed-67
-            # run -- trained before this convention, or with save_dir named
-            # outright -- so the default seed derived a path it was not
-            # allowed to write and the run was refused. Changing the seed and
-            # pressing Train is the whole point of a multi-seed trial, and it
-            # should not depend on which seed happened to get there first.
-            held, files = recorded_seed(Path(base))
-            if files and held is not None and held != cfg["master_seed"]:
-                # Known to be a different seed, so this is certainly a clash
-                # and the seeded folder is certainly free of it. Diverting
-                # beats refusing: nothing is destroyed and the run proceeds.
-                cfg["save_dir"] = seeded
-                print(f"[Config] {base} already holds a run at master_seed={held}; this one "
-                      f"is seed {cfg['master_seed']}, so it goes to {seeded} instead.")
-            else:
-                # Free, ours, or a run whose seed was never recorded. The last
-                # of those is left to ensure_writable: it cannot be shown to
-                # be a different run, and inventing a second folder for what
-                # may be the same one is a guess. Refusing asks the operator,
-                # which is what the guard is for.
-                cfg["save_dir"] = base
     if distil and not variant_is_causal(cfg["variant"]):
         # Not refused: MHA -> MLA between two bidirectional twins is a real
         # architecture experiment. But the usual reason to distil here is to
@@ -270,9 +206,14 @@ def main():
         data_dir=cfg["data_dir"],
         artifact_type=cfg["artifact"],
         batch_size=cfg["batch_size"],
+        split_ratios=tuple(cfg["split_ratios"]),
+        sampling=cfg["sampling"],
         snr_range_db=tuple(cfg["snr_range_db"]),
         master_seed=cfg["master_seed"],
         target_fs=cfg["target_fs"],
+        normalization=cfg["normalization"],
+        normalization_scale=cfg["normalization_scale"],
+        resampling=cfg["resampling"],
     )
 
     # Model settings, including optional quantization, are saved in checkpoints.

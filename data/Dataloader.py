@@ -20,6 +20,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+if __package__:
+    from .protocol import normalization_config
+else:  # preserve the standalone ``python data/Dataloader.py`` smoke test
+    from protocol import normalization_config
+
 
 #: How a split draws its SNRs and how much of each pool it uses.
 #:
@@ -45,7 +50,7 @@ SAMPLING_MODES = ("legacy", "balanced")
 NATIVE_FS = 256.0
 
 
-def resample_epochs(epochs: np.ndarray, fs_in: float, fs_out: float) -> np.ndarray:
+def resample_epochs(epochs: np.ndarray, fs_in: float, fs_out: float, method: str = "offline") -> np.ndarray:
     """
     Resample ``(n_epochs, n_samples)`` from one rate to another.
 
@@ -55,6 +60,11 @@ def resample_epochs(epochs: np.ndarray, fs_in: float, fs_out: float) -> np.ndarr
     change). 256 -> 250 is exactly 125/128, so a 512-sample epoch becomes
     500 samples and no sample lands between two others.
     """
+    if method not in ("offline", "causal"):
+        raise ValueError("resampling must be offline or causal")
+    if method == "causal":
+        from data.resampling import causal_resample
+        return causal_resample(epochs, fs_in, fs_out)
     if fs_in == fs_out:
         return np.ascontiguousarray(epochs, dtype=np.float32)
     from fractions import Fraction
@@ -221,6 +231,9 @@ class EEGDenoiseDataset(Dataset):
         master_seed: int = 42,
         sampling: str = "legacy",
         target_fs: Optional[float] = None,
+        normalization: str = "epoch",
+        normalization_scale: Optional[float] = None,
+        resampling: str = "offline",
     ):
         assert split in self.SPLIT_OFFSET, f"split must be one of {list(self.SPLIT_OFFSET)}"
         assert artifact_type in ("EOG", "EMG", "BOTH"), \
@@ -234,6 +247,7 @@ class EEGDenoiseDataset(Dataset):
         self.fixed_snr_db = fixed_snr_db
         self.sampling = sampling
         self.master_seed = int(master_seed)
+        self.split_ratios = tuple(split_ratios)
         # None means "leave it alone", which is what every run on disk did
         # and what keeps them reproducible; a number resamples the pools.
         self.fs = float(target_fs) if target_fs else NATIVE_FS
@@ -242,7 +256,7 @@ class EEGDenoiseDataset(Dataset):
         # ---- 1. Load raw numpy arrays ----
         clean_all = _load_epochs(data_dir, "EEG")
         seq_len = clean_all.shape[1]
-        rs = (lambda a: resample_epochs(a, NATIVE_FS, self.fs)) if target_fs else (lambda a: a)
+        rs = (lambda a: resample_epochs(a, NATIVE_FS, self.fs, resampling)) if target_fs else (lambda a: a)
         clean_all = rs(clean_all)
 
         # Build disjoint clean indices for this split
@@ -286,6 +300,18 @@ class EEGDenoiseDataset(Dataset):
                   f"{'' if n_clean == n else f' (artifacts resampled from {n})'}"
                   f"{'' if sampling == 'legacy' else ' | sampling=balanced'}"
                   f"{'' if not target_fs else f' | {self.fs:g} Hz, {clean_all.shape[1]} samples'}")
+
+        # A fixed scale is fitted once on training EEG only, never on a
+        # validation/test epoch or the future of the signal being denoised.
+        if normalization == "fixed" and normalization_scale is None:
+            if split != "train":
+                raise ValueError("fixed normalization on val/test needs the training normalization_scale")
+            normalization_scale = float(np.sqrt(np.mean(self.clean.astype(np.float64) ** 2)))
+        norm = normalization_config(dict(normalization=normalization,
+                                        normalization_scale=normalization_scale))
+        self.normalization = norm["normalization"]
+        self.normalization_scale = norm["normalization_scale"]
+        self.resampling = resampling
 
         # ---- Per-sample RNG (only used for random SNR in training) ----
         # Kept as an attribute, which is why ``worker_init_fn`` below exists:
@@ -431,9 +457,10 @@ class EEGDenoiseDataset(Dataset):
             snr_db = self._pick_snr(idx)
             noisy = mix_at_snr(clean, artifact, snr_db)
 
-        # Normalize both signals by sigma of the noisy input.
-        # This keeps the model's input scale stable across samples.
-        sigma = max(noisy.std(), 1e-8)
+        # Fixed normalization uses only prior training calibration. Epoch
+        # normalization is retained solely for historical offline protocols.
+        sigma = (self.normalization_scale if self.normalization == "fixed"
+                 else max(noisy.std(), 1e-8))
 
         return {
             "noisy":  torch.tensor(noisy / sigma).unsqueeze(0),   # (1, T)
@@ -555,6 +582,10 @@ class ArtifactSwitchDataset(Dataset):
         order: str = "both",
         n_epochs: Optional[int] = None,
         control: bool = False,
+        target_fs: Optional[float] = None,
+        normalization: str = "epoch",
+        normalization_scale: Optional[float] = None,
+        resampling: str = "offline",
     ):
         assert split in self.SPLIT_OFFSET, f"split must be one of {list(self.SPLIT_OFFSET)}"
         assert order in ("both", "eog_first", "emg_first"), \
@@ -569,11 +600,20 @@ class ArtifactSwitchDataset(Dataset):
         self.ramp_samples = int(ramp_samples)
         self.order = order
         self.control = bool(control)
+        norm = normalization_config(dict(normalization=normalization,
+                                        normalization_scale=normalization_scale))
+        self.normalization = norm["normalization"]
+        self.normalization_scale = norm["normalization_scale"]
+        self.resampling = resampling
 
         # ---- 1. Same leak-free pools as EEGDenoiseDataset(BOTH) ----
         clean_all = _load_epochs(data_dir, "EEG")
         eog_all = _load_epochs(data_dir, "EOG", clean_all.shape[1])
         emg_all = _load_epochs(data_dir, "EMG", clean_all.shape[1])
+        if target_fs:
+            clean_all, eog_all, emg_all = (
+                resample_epochs(a, NATIVE_FS, float(target_fs), resampling)
+                for a in (clean_all, eog_all, emg_all))
 
         split_fn = EEGDenoiseDataset._split_indices
         clean_idx = split_fn(len(clean_all), split_ratios, split, master_seed)
@@ -734,7 +774,8 @@ class ArtifactSwitchDataset(Dataset):
         # difference there is exactly zero.  A non-causal model's is not, and
         # how far it departs from zero is how far the switch leaks backwards.
         sigma_src = (clean + artifact_switch) if self.control else noisy
-        sigma = max(float(np.asarray(sigma_src).std()), 1e-8)
+        sigma = (self.normalization_scale if self.normalization == "fixed"
+                 else max(float(np.asarray(sigma_src).std()), 1e-8))
 
         return {
             "noisy":      torch.tensor(noisy / sigma).unsqueeze(0),   # (1, T)
@@ -796,6 +837,9 @@ def build_dataloaders(
     sampling: str = "legacy",
     num_workers: int = 0,
     target_fs: Optional[float] = None,
+    normalization: str = "epoch",
+    normalization_scale: Optional[float] = None,
+    resampling: str = "offline",
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build train, val, and test DataLoaders that share the same master seed
@@ -829,6 +873,9 @@ def build_dataloaders(
             master_seed=master_seed,
             sampling=sampling,
             target_fs=target_fs,
+            normalization=normalization,
+            normalization_scale=normalization_scale,
+            resampling=resampling,
         )
         train = split == "train"
         return DataLoader(
@@ -842,6 +889,7 @@ def build_dataloaders(
         )
 
     train_loader = make("train")
+    normalization_scale = train_loader.dataset.normalization_scale
     val_loader = make("val")
     test_loader = make("test")
 

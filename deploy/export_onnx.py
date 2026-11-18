@@ -64,7 +64,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.variants import build_model, variant_is_causal, base_variant, pinned_kwargs  # noqa: E402
 from models.AttentionBlocks.attention import CausalMHA, CausalMLA  # noqa: E402
 
 INPUT_NAME = "noisy_eeg"
@@ -77,135 +76,13 @@ SAMPLE_RATE_HZ = 256          # EEGdenoiseNet: 512-sample epochs = 2 s
 # ============================================================
 # 1. Rebuild the model from a checkpoint
 # ============================================================
-def infer_arch_from_state_dict(sd: dict) -> dict:
-    """
-    Recover every shape-determined constructor argument from the weights.
-
-    Returns a dict accepted by build_model(**cfg) minus ``n_heads``, which
-    is not recoverable (all head counts give identical tensor shapes).
-    """
-    cfg = {}
-
-    # First conv of the first TCN block: (hidden_channels, in_channels=1, k)
-    first_conv = next(
-        (k for k in ("tcn_pt1.network.0.conv_block.0.conv.weight",
-                     "backbone.network.0.conv_block.0.conv.weight") if k in sd),
-        None,
-    )
-    if first_conv is None:
-        raise ValueError("Unrecognised state dict: no TCN first-layer weight found")
-    hidden = sd[first_conv].shape[0]
-    cfg["hidden_channels"] = int(hidden)
-
-    # The SE gate is visible in the weights: a tcn_se checkpoint carries
-    # se.fc1/se.fc2 that a plain tcn does not. Without this it would be read
-    # back as "tcn", and the strict load would fail on the extra keys -- or
-    # worse, a future non-strict path would quietly drop the gate.
-    se_key = next((k for k in sd if k.endswith("se.fc1.weight")), None)
-    if se_key is not None:
-        # (C/r, C, 1): the squeeze ratio is the shape, not a stored number.
-        hidden_se, chans = sd[se_key].shape[0], sd[se_key].shape[1]
-        cfg["se_reduction"] = max(1, int(round(chans / hidden_se)))
-
-    block_ids = {int(k.split(".")[2]) for k in sd if k.startswith("decoder.blocks.")}
-    if not block_ids:
-        cfg["variant"] = "tcn_se" if se_key is not None else "tcn"
-        return cfg
-    cfg["n_attn_layers"] = max(block_ids) + 1
-
-    attn = "decoder.blocks.0.attn."
-    is_mla = attn + "kv_down_proj.weight" in sd
-    is_par = "squeeze.conv.weight" not in sd
-    cfg["variant"] = {(False, False): "tcn_mha", (True, False): "tcn_mla",
-                      (False, True): "tcn_mha_par", (True, True): "tcn_mla_par"}[(is_mla, is_par)]
-
-    if not is_par:
-        attn_dim = sd["squeeze.conv.weight"].shape[0]
-        # The model computes int(hidden * ratio); (attn_dim + 0.5) / hidden
-        # guarantees that truncation lands exactly on attn_dim even when the
-        # ratio is not representable in binary floating point.
-        cfg["bottleneck_ratio"] = (attn_dim + 0.5) / hidden
-    if is_mla:
-        cfg["kv_lora_rank"] = int(sd[attn + "kv_down_proj.weight"].shape[0])
-    skip_w = "decoder.blocks.0.attn_skip.net.0.weight"        # (bottleneck_dim, d_model)
-    if skip_w in sd:                                          # optional BottleneckSkip
-        skip_dim, d_model = sd[skip_w].shape
-        cfg["skip_bottleneck_ratio"] = (skip_dim + 0.5) / d_model   # same truncation trick
-    cfg["max_seq_len"] = int(sd[attn + "causal_mask"].shape[-1])
-    return cfg
+# Public compatibility imports; reconstruction lives outside deployment.
+from experiment.checkpoints import infer_arch_from_state_dict, load_model
 
 
-def load_checkpoint_model(ckpt_path: str | Path, config_path: str | Path | None = None,
-                          n_heads: int | None = None) -> tuple[torch.nn.Module, dict, dict]:
-    """
-    Build the model whose shapes match the checkpoint and load its weights.
-
-    Returns (model in eval mode, resolved architecture dict, raw checkpoint).
-    """
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    sd = ckpt["model_state"]
-    stored = dict(ckpt.get("model_config", {}))
-
-    # Bidirectional teachers (tcn_*_bi) have the same weights as their causal
-    # twins, so only model_config can tell them apart.  They need future
-    # samples and must never be deployed for streaming.
-    if not variant_is_causal(stored.get("variant", "")):
-        raise ValueError(
-            f"{ckpt_path} is a bidirectional teacher ({stored['variant']}); it attends to "
-            f"future samples and cannot run online. Export the distilled causal student instead."
-        )
-
-    arch = infer_arch_from_state_dict(sd)
-
-    yaml_cfg = {}
-    if config_path:
-        from configs import load_config
-        yaml_cfg = load_config(config_path)
-
-    # n_heads priority: CLI > checkpoint model_config > YAML > default
-    arch["n_heads"] = int(
-        n_heads if n_heads is not None
-        else stored.get("n_heads", yaml_cfg.get("n_heads", DEFAULT_N_HEADS))
-    )
-    # Attention-free variants take no head count. Keyed on whether the weights
-    # showed an attention decoder, not on the name being exactly "tcn": tcn_se
-    # is also attention-free and would otherwise be handed an argument its
-    # constructor does not accept.
-    if "n_attn_layers" not in arch:
-        arch.pop("n_heads", None)
-
-    # Sanity: anything the checkpoint claims about itself must agree with the weights.
-    # The weights can only reveal the base architecture, so a rank alias such as
-    # tcn_mla_r4 is compared as tcn_mla — and what its name promises (rank 4) is
-    # then checked against the weights explicitly.
-    label = stored.get("variant")
-    if label is not None and base_variant(label) != arch["variant"]:
-        raise ValueError(
-            f"Checkpoint model_config says variant={label} but the weights imply "
-            f"{arch['variant']}; refusing to guess."
-        )
-    for key, value in (pinned_kwargs(label) if label is not None else {}).items():
-        if key in arch and arch[key] != value:
-            raise ValueError(
-                f"Checkpoint is labelled '{label}', which fixes {key}={value}, but the weights "
-                f"imply {key}={arch[key]}; refusing to export a model under a name that misdescribes it."
-            )
-    for key in ("hidden_channels", "n_attn_layers", "kv_lora_rank", "max_seq_len"):
-        if key in stored and key in arch and stored[key] != arch[key]:
-            raise ValueError(
-                f"Checkpoint model_config says {key}={stored[key]} but the weights imply "
-                f"{key}={arch[key]}; refusing to guess."
-            )
-    if label is not None:
-        arch["variant"] = label          # keep the run's own name in the sidecar
-    if stored.get("turboquant"):
-        print("[export] Checkpoint was trained with TurboQuant enabled; exporting the "
-              "full-precision network (TurboQuant is a fake-quant experiment only).")
-
-    model = build_model(**arch, turboquant=False)
-    model.load_state_dict(sd, strict=True)
-    model.eval()
-    return model, arch, ckpt
+def load_checkpoint_model(ckpt_path, config_path=None, n_heads=None):
+    return load_model(ckpt_path, config=config_path, overrides={"n_heads": n_heads},
+                      for_export=True)
 
 
 # ============================================================
@@ -380,7 +257,7 @@ def _torch_forward(model: torch.nn.Module, x: np.ndarray) -> np.ndarray:
 
 def verify_onnx(model: torch.nn.Module, onnx_path: str | Path, seq_len: int = 512,
                 dynamic_batch: bool = True, atol: float = 1e-4, data_dir: str | None = None,
-                master_seed: int = 42,
+                master_seed: int = None,
                 artifact: str = "EOG", max_batches: int | None = None, seed: int = 0) -> dict:
     """
     Check the ONNX graph against the PyTorch model.
@@ -433,17 +310,21 @@ def verify_onnx(model: torch.nn.Module, onnx_path: str | Path, seq_len: int = 51
 
     # ---- benchmark metrics on the real test split ----
     if data_dir:
-        report["master_seed"] = master_seed
+        from data.protocol import evaluation_data
+        data_options = evaluation_data(model, master_seed, artifact)
+        report["master_seed"] = data_options["master_seed"]
         report["test_metrics"] = evaluate_backends(
             {"torch": lambda x: _torch_forward(model, x), Path(onnx_path).name: run},
-            data_dir, artifact, master_seed, max_batches,
+            data_dir, max_batches=max_batches, data_options=data_options,
+            score_config=getattr(model, "run_config", {}),
         )
     return report
 
 
 def evaluate_backends(backends: dict, data_dir: str, artifact: str = "EOG",
                       master_seed: int = 42,
-                      max_batches: int | None = None, batch_size: int = 32) -> dict:
+                      max_batches: int | None = None, batch_size: int = 32,
+                      data_options: dict | None = None, score_config: dict | None = None) -> dict:
     """
     Run each ``name -> f(np.ndarray) -> np.ndarray`` backend over the test
     split and return {name: {rrmse_t, rrmse_s, acc}} averaged over batches.
@@ -451,12 +332,13 @@ def evaluate_backends(backends: dict, data_dir: str, artifact: str = "EOG",
     """
     from data.Dataloader import build_dataloaders
     from metrics import compute_all_metrics
+    from experiment.methodology import aligned
 
     # The split is a function of the seed, so it has to be the seed the
     # checkpoint was trained with -- otherwise these "test" metrics are
     # measured on epochs the model was trained on.
-    _, _, test_loader = build_dataloaders(data_dir, artifact_type=artifact,
-                                          batch_size=batch_size, master_seed=master_seed)
+    options = data_options or dict(artifact_type=artifact, master_seed=master_seed)
+    _, _, test_loader = build_dataloaders(data_dir, batch_size=batch_size, **options)
     sums = {name: {"rrmse_t": 0.0, "rrmse_s": 0.0, "acc": 0.0} for name in backends}
     n = 0
     for i, batch in enumerate(test_loader):
@@ -464,17 +346,37 @@ def evaluate_backends(backends: dict, data_dir: str, artifact: str = "EOG",
             break
         noisy = batch["noisy"].numpy().astype(np.float32)
         clean = batch["clean"]
+        size = clean.shape[0]
         for name, fn in backends.items():
-            m = compute_all_metrics(torch.from_numpy(fn(noisy)), clean)
+            pred, target = aligned(torch.from_numpy(fn(noisy)), clean, score_config or {})
+            m = compute_all_metrics(pred, target)
             for k in sums[name]:
-                sums[name][k] += m[k]
-        n += 1
+                sums[name][k] += m[k] * size
+        n += size
     return {name: {k: round(v / n, 4) for k, v in s.items()} for name, s in sums.items()}
 
 
 # ============================================================
 # 4. One-call pipeline + CLI
 # ============================================================
+def _preprocessing(raw, window, artifact, streaming):
+    from data.protocol import normalization_config
+    cfg = raw.get("run_config") or {}
+    norm = normalization_config(cfg)
+    fixed = norm["normalization"] == "fixed"
+    from experiment.methodology import latency
+    return dict(sample_rate_hz=cfg.get("target_fs") or SAMPLE_RATE_HZ,
+                window_samples=window, artifact_trained_on=artifact, **norm,
+                normalise=("x_in = x / normalization_scale; x_out = model(x_in) * normalization_scale"
+                           if fixed else "offline only: x_in = x / max(std(x), 1e-8) per epoch; restore scale"),
+                causal=fixed, model_causal=True, streaming=streaming,
+                output_delay_samples=cfg.get("output_delay", 0),
+                output_semantics="output at acquisition t estimates target t-output_delay_samples",
+                valid_history_samples=cfg.get("valid_history_samples"),
+                valid_future_samples=cfg.get("valid_future_samples", 0),
+                latency_budget=latency(cfg, cfg.get("target_fs") or SAMPLE_RATE_HZ))
+
+
 def _export_step_checkpoint(model, arch, raw, ckpt, out_dir, name, artifact, opset,
                             trained_artifact):
     """
@@ -499,7 +401,10 @@ def _export_step_checkpoint(model, arch, raw, ckpt, out_dir, name, artifact, ops
 
     print("[verify] onnxruntime step loop vs models/incremental.py ...")
     torch.manual_seed(0)
-    probe = torch.randn(int(info["window"]) + 128 if info["window"] else 400)
+    cfg = raw.get("run_config") or {}
+    probe_n = max(int(info["window"]) + 128 if info["window"] else 400,
+                  (cfg.get("valid_history_samples") or 1) + cfg.get("valid_future_samples", 0) + 128)
+    probe = torch.randn(probe_n)
     reference = IncrementalModel(model).run(probe).numpy()
 
     sess = onnxruntime.InferenceSession(str(path), providers=["CPUExecutionProvider"])
@@ -511,8 +416,14 @@ def _export_step_checkpoint(model, arch, raw, ckpt, out_dir, name, artifact, ops
         got[t] = out[0].reshape(())
         state = dict(zip(in_names[1:], out[1:]))
     max_diff = float(np.abs(reference - got).max())
+    if cfg.get("protocol") == "paper":
+        from experiment.methodology import target_interval
+        start, stop = target_interval(len(probe), cfg)
+        delay = cfg.get("output_delay", 0)
+        max_diff = float(np.abs(reference[start+delay:stop+delay] - got[start+delay:stop+delay]).max()
+                         * cfg["normalization_scale"])
     print(f"         max|onnx-incremental| = {max_diff:.2e} over {len(probe)} steps")
-    if max_diff > 1e-3:
+    if max_diff >= 1e-4:
         raise ValueError(
             f"the exported step graph does not reproduce models/incremental.py "
             f"(max|diff| = {max_diff:.2e}); refusing to ship a graph that computes "
@@ -523,6 +434,7 @@ def _export_step_checkpoint(model, arch, raw, ckpt, out_dir, name, artifact, ops
                   "val_loss": raw.get("val_loss"), **arch,
                   "n_params": sum(p.numel() for p in model.parameters())},
         "export": {**info, "torch": torch.__version__},
+        "data_protocol": dict(raw.get("run_config") or {}),
         "io": {"input": {"name": "x_t", "shape": [1, 1, 1], "dtype": "float32"},
                "output": {"name": "y_t", "shape": [1, 1, 1], "dtype": "float32"},
                "state": info["state"]},
@@ -530,16 +442,10 @@ def _export_step_checkpoint(model, arch, raw, ckpt, out_dir, name, artifact, ops
             "trained_master_seed": (raw.get("run_config") or {}).get("master_seed"),
             "trained_artifact": trained_artifact or artifact,
         },
-        "preprocessing": {
-            "sample_rate_hz": SAMPLE_RATE_HZ,
-            "window_samples": info["window"],
-            "artifact_trained_on": artifact,
-            "normalise": "x_in = x / sigma; x_out = y * sigma, with sigma per epoch for "
-                         "scoring and a running or calibrated value for a live stream",
-            "causal": True,
-            "streaming": "feed one sample and the state; keep the output and the new state",
-        },
-        "verification": {"max_abs_diff_vs_incremental": max_diff, "n_steps": len(probe)},
+        "preprocessing": _preprocessing(raw, info["window"], artifact,
+                                        "feed one sample and the state; keep the output and new state"),
+        "verification": {"max_abs_diff_vs_incremental": max_diff, "n_steps": len(probe),
+                         "domain": "raw_amplitude" if cfg.get("protocol") == "paper" else "model_input"},
     }
     json_path = out_dir / f"{name}_step.json"
     json_path.write_text(json.dumps(sidecar, indent=2))
@@ -547,13 +453,49 @@ def _export_step_checkpoint(model, arch, raw, ckpt, out_dir, name, artifact, ops
     return sidecar
 
 
+def _export_replay_tail(model, full_path, seq_len, hop, opset):
+    """Export a shorter graph and verify the retained outputs against the full graph."""
+    from deploy.eegio_replay import FAST_WINDOW_BATCH
+    from experiment.methodology import context
+
+    try:
+        past, future = context(model)
+    except ValueError:
+        return None
+    tail_len = past + hop
+    if future or tail_len >= seq_len:
+        return None
+
+    tail_path = full_path.with_name(f"{full_path.stem}_tail.onnx")
+    try:
+        export_to_onnx(model, tail_path, seq_len=tail_len, opset=opset)
+        full_session, tail_session = _session(full_path), _session(tail_path)
+        probe = np.random.default_rng(0).standard_normal((FAST_WINDOW_BATCH, 1, seq_len), dtype=np.float32)
+        reference = np.concatenate([
+            full_session.run([OUTPUT_NAME], {INPUT_NAME: window[None]})[0][..., -hop:]
+            for window in probe
+        ])
+        suffixes = np.ascontiguousarray(probe[..., -tail_len:])
+        actual = tail_session.run([OUTPUT_NAME], {INPUT_NAME: suffixes})[0][..., -hop:]
+        error = float(np.max(np.abs(actual - reference)))
+        if not np.isfinite(error) or error >= 1e-4:
+            raise ValueError(f"retained outputs differ by {error:.3g}")
+    except Exception as exc:
+        print(f"[export] Fast replay will use full windows: {exc}")
+        return None
+
+    print(f"[export] Fast replay uses {tail_len} inference samples; max normalized difference {error:.2e}")
+    return {"file": tail_path.name, "input_samples": tail_len,
+            "batch_windows": FAST_WINDOW_BATCH, "max_abs_diff": error}
+
+
 def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "deploy" / "artifacts",
                       name: str | None = None, config: str | None = None, n_heads: int | None = None,
                       seq_len: int | None = None, opset: int = DEFAULT_OPSET, dynamic_batch: bool = True,
                       data_dir: str | None = None, artifact: str = "EOG",
-                      master_seed: int = 42,
+                      master_seed: int = None,
                       max_batches: int | None = None,
-                      incremental: bool = False) -> dict:
+                      incremental: bool = False, *, fast_replay_hop: int | None = None) -> dict:
     """
     Checkpoint -> verified ONNX -> sidecar JSON.
     Returns the sidecar dict.  This is the function to call from other code.
@@ -565,7 +507,9 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
     out_dir = Path(out_dir)
     name = name or ckpt.parent.name or ckpt.stem
     model, arch, raw = load_checkpoint_model(ckpt, config, n_heads)
-    seq_len = seq_len or arch.get("max_seq_len", 512)
+    cfg = getattr(model, "run_config", {})
+    seq_len = seq_len or (round(512 * cfg["target_fs"] / SAMPLE_RATE_HZ)
+                          if cfg.get("target_fs") else arch.get("max_seq_len", 512))
 
     # What the model was actually trained on beats what the command line said.
     # --artifact only ever chose the verification batch, but its value was
@@ -603,6 +547,7 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
                   **arch, "n_params": sum(p.numel() for p in model.parameters())},
         "export": {**export_info,
                    "torch": torch.__version__, "onnx": onnx.__version__, "onnxruntime": onnxruntime.__version__},
+        "data_protocol": dict(raw.get("run_config") or {}),
         "io": {"input": {"name": INPUT_NAME, "shape": ["batch" if dynamic_batch else 1, 1, seq_len], "dtype": "float32"},
                "output": {"name": OUTPUT_NAME, "shape": ["batch" if dynamic_batch else 1, 1, seq_len], "dtype": "float32"}},
         # What split this model was fitted on. The scorer compares it against the
@@ -617,16 +562,15 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
             "note": "null means the run predates run_config; a test set cannot be "
                     "checked against it and is scored with a warning",
         },
-        "preprocessing": {
-            "sample_rate_hz": SAMPLE_RATE_HZ,
-            "window_samples": seq_len,
-            "artifact_trained_on": artifact,
-            "normalise": "x_in = x / max(std(x), 1e-8) per window; x_out = model(x_in) * std(x)",
-            "causal": True,
-            "streaming": "feed the latest window_samples samples, keep the newest `hop` outputs",
-        },
+        "preprocessing": _preprocessing(raw, seq_len, artifact,
+                                        "feed the latest window_samples samples, keep the newest hop outputs"),
         "verification": fp32_report,
     }
+
+    if fast_replay_hop is not None:
+        tail = _export_replay_tail(model, fp32_path, seq_len, fast_replay_hop, opset)
+        if tail is not None:
+            sidecar["fast_replay"] = tail
 
     json_path = out_dir / f"{name}.json"
     json_path.write_text(json.dumps(sidecar, indent=2))
@@ -660,7 +604,7 @@ def main(argv=None):
                         "a real KV cache. Runs on the Pi with onnxruntime alone, and is the "
                         "only exported form whose cache size is a property of the graph.")
     p.add_argument("--max_batches", type=int, default=None, help="limit test batches for a quick check")
-    p.add_argument("--master_seed", type=int, default=42,
+    p.add_argument("--master_seed", type=int, default=None,
                    help="the split the test metrics are measured on; it must be the seed "
                         "the checkpoint was trained with, or they are measured on epochs "
                         "the model was trained on")

@@ -95,10 +95,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from models.variants import build_model_from_config, variant_is_causal
+from models.variants import variant_is_causal
 from trainer.training import Trainer
 from trainer.losses import build_loss
 from utils.utils import get_device
+from data.protocol import validate_distillation_data
 
 
 # ============================================================
@@ -120,32 +121,8 @@ def load_teacher(
     ckpt_path = Path(ckpt_path)
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"Teacher checkpoint not found: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    sd = ckpt["model_state"]
-
-    cfg: dict = {}
-    if config_path:
-        from configs import load_config
-        cfg.update(load_config(str(config_path)))
-    cfg.update(ckpt.get("model_config") or {})      # what the checkpoint recorded wins
-    if "variant" not in cfg:
-        # Legacy checkpoint without model_config and no YAML: the weights are
-        # the ground truth for every shape-determined hyperparameter.
-        from deploy.export_onnx import infer_arch_from_state_dict
-        cfg.update(infer_arch_from_state_dict(sd))
-
-    teacher = build_model_from_config(cfg)
-    try:
-        teacher.load_state_dict(sd, strict=True)
-    except RuntimeError as e:
-        raise RuntimeError(
-            f"Teacher weights in {ckpt_path} do not fit the architecture {cfg}. "
-            f"Pass --teacher_config with the YAML the teacher was trained with."
-        ) from e
-
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
+    from experiment.checkpoints import load_model
+    teacher, _, ckpt = load_model(ckpt_path, config=config_path, device=device, freeze=True)
 
     variant = teacher.model_config.get("variant", "?")
     n_params = sum(p.numel() for p in teacher.parameters())
@@ -485,6 +462,8 @@ class KDTrainer(Trainer):
         loss_fn: str = "l1_combined",
         **trainer_kwargs,
     ):
+        validate_distillation_data(teacher, train_loader, val_loader,
+                                   trainer_kwargs.get("run_config"))
         if init_from_teacher:
             init_student_from_teacher(model, teacher)
 
@@ -508,6 +487,11 @@ class KDTrainer(Trainer):
                          loss_fn=loss_fn, **trainer_kwargs)
 
         self.teacher = teacher.to(self.device).eval()
+        if self.history["config"].get("protocol") == "paper":
+            from experiment.methodology import validate_model
+            teacher_cfg = {**self.history["config"],
+                           "output_delay": getattr(teacher, "run_config", {}).get("output_delay", 0)}
+            validate_model(teacher, teacher_cfg, train_loader.dataset.clean.shape[-1])
         for p in self.teacher.parameters():
             p.requires_grad_(False)
 
@@ -523,6 +507,11 @@ class KDTrainer(Trainer):
             task_loss=self.criterion, output_loss=output_loss,
             alpha=kd_alpha, feature_weight=kd_feature_weight, feature_loss=kd_feature_loss,
         ).to(self.device)
+        self.history["config"].update(
+            teacher_ckpt=teacher_ckpt, kd_alpha=kd_alpha,
+            kd_feature_weight=kd_feature_weight, kd_feature_layers=list(kd_feature_layers or []),
+            kd_output_loss=kd_output_loss or loss_fn, kd_feature_loss=kd_feature_loss,
+            init_from_teacher=init_from_teacher)
 
         pairs = self._pairs
         self._student_tap = FeatureTap(self.model, [s for _, s, _ in pairs]) if pairs else None
@@ -588,6 +577,30 @@ class KDTrainer(Trainer):
             pred = self.model(noisy)
             student_feats = self._student_features()
 
+            from experiment.methodology import aligned, target_interval
+            cfg = self.history["config"]
+            full_length = clean.shape[-1]
+            start, stop = target_interval(clean.shape[-1], cfg)
+            sd = cfg.get("output_delay", 0)
+            td = getattr(self.teacher, "run_config", {}).get("output_delay", 0)
+            pred, clean = aligned(pred, clean, cfg)
+            teacher_out = teacher_out[..., start + td:stop + td]
+            if student_feats:
+                def crop_feature(value, path, delay):
+                    if start == 0 and stop == full_length and delay == 0:
+                        return value
+                    axes = [i for i in range(1, value.ndim) if value.shape[i] == full_length]
+                    if len(axes) != 1:
+                        raise ValueError(f"Cannot identify the time axis of feature {path}: {tuple(value.shape)}")
+                    axis = axes[0]
+                    index = [slice(None)] * value.ndim
+                    index[axis] = slice(start + delay, stop + delay)
+                    return value[tuple(index)]
+                student_feats = {label: crop_feature(student_feats[label], s, sd)
+                                 for label, s, _ in self._pairs}
+                teacher_feats = {label: crop_feature(teacher_feats[label], t, td)
+                                 for label, _, t in self._pairs}
+
             loss, parts = self.kd_criterion(pred, teacher_out, clean, student_feats, teacher_feats)
 
             self.optimizer.zero_grad()
@@ -633,3 +646,9 @@ class KDTrainer(Trainer):
         if t:
             print(f"Teacher reference: val_loss={t['val_loss']:.4f}  "
                   f"RRMSE_t={t['rrmse_t']:.3f}  RRMSE_f={t['rrmse_s']:.3f}  CC={t['acc']:.3f}")
+
+    def _cleanup_training(self):
+        if self._student_tap:
+            self._student_tap.remove()
+            self._teacher_tap.remove()
+        super()._cleanup_training()

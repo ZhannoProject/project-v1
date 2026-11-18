@@ -49,8 +49,10 @@ from data.Dataloader import (EEGDenoiseDataset, ArtifactSwitchDataset,
                             build_switch_probes, SWITCH_PROBE_SEEDS)
 from torch.utils.data import DataLoader
 from metrics import compute_all_metrics
-from models.variants import build_model, build_model_from_config, VARIANT_REGISTRY
+from models.variants import VARIANT_REGISTRY
 from utils.utils import get_device
+from data.protocol import evaluation_data
+from experiment.methodology import aligned, target_interval, aligned_output
 
 
 # ====================================================================
@@ -61,10 +63,10 @@ from utils.utils import get_device
 def evaluate_per_snr(
     model,
     data_dir: str,
-    artifact_type: str = "EOG",
+    artifact_type: str = None,
     snr_list: list = None,
     batch_size: int = 64,
-    seed: int = 42,
+    seed: int = None,
     device: Optional[torch.device] = None,
 ) -> tuple:
     """
@@ -82,6 +84,8 @@ def evaluate_per_snr(
     device = device or get_device()
     model.eval().to(device)
     results = {}
+    data_kwargs = evaluation_data(model, seed, artifact_type)
+    artifact_type = data_kwargs["artifact_type"]
 
     print(f"\n{'='*60}")
     print(f"Evaluation graded by SNR ({artifact_type})")
@@ -92,10 +96,9 @@ def evaluate_per_snr(
     for snr in snr_list:
         ds = EEGDenoiseDataset(
             data_dir=data_dir,
-            artifact_type=artifact_type,
             split="test",
             fixed_snr_db=float(snr),
-            master_seed=seed,
+            **data_kwargs,
         )
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
@@ -106,7 +109,7 @@ def evaluate_per_snr(
             noisy = batch["noisy"].to(device)
             clean = batch["clean"].to(device)
             pred = model(noisy)
-
+            pred, clean = aligned(pred, clean, model)
             metrics = compute_all_metrics(pred, clean)
             bs = noisy.size(0)
             for k, v in metrics.items():
@@ -210,11 +213,12 @@ def plot_training_curves(
 def visualize_samples(
     model,
     data_dir: str,
-    artifact_type: str = "EOG",
+    artifact_type: str = None,
     snr: float = -3.0,
     n_samples: int = 4,
     save_path: Optional[str] = None,
     device: Optional[torch.device] = None,
+    seed: int = None,
 ):
     """
     Plots noisy, clean (ground-truth), and denoised signals side by side
@@ -222,15 +226,16 @@ def visualize_samples(
     """
     device = device or get_device()
     model.eval().to(device)
-    fs = 256  # Sampling frequency
+    data_kwargs = evaluation_data(model, seed, artifact_type)
+    artifact_type = data_kwargs["artifact_type"]
 
     ds = EEGDenoiseDataset(
         data_dir=data_dir,
-        artifact_type=artifact_type,
         split="test",
         fixed_snr_db=float(snr),
-        master_seed=123,
+        **data_kwargs,
     )
+    fs = ds.fs
 
     fig, axes = plt.subplots(2, n_samples, figsize=(4 * n_samples, 6))
     fig.suptitle(
@@ -246,13 +251,17 @@ def visualize_samples(
 
         pred = model(noisy).squeeze().cpu().numpy()
         noisy_np = sample["noisy"].squeeze().cpu().numpy()
+        start, stop = target_interval(len(clean), getattr(model, "run_config", {}))
+        delay = getattr(model, "run_config", {}).get("output_delay", 0)
+        pred = pred[start + delay:stop + delay]
+        clean, noisy_np = clean[start:stop], noisy_np[start:stop]
 
         # Restore original amplitude
         clean_real = clean * sigma
         noisy_real = noisy_np * sigma
         pred_real = pred * sigma
 
-        t = np.arange(len(clean)) / fs
+        t = (np.arange(len(clean)) + start) / fs
 
         # --- Row 1: Time domain ---
         ax = axes[0, i]
@@ -315,11 +324,12 @@ def _get_attn_modules(model) -> List:
 def plot_attention_heatmaps(
     model,
     data_dir: str,
-    artifact_type: str = "EOG",
+    artifact_type: str = None,
     snr: float = -3.0,
     sample_idx: int = 0,
     save_path: Optional[str] = None,
     device: Optional[torch.device] = None,
+    seed: int = None,
 ):
     """
     Extract attention weights from every layer / head and plot heatmaps.
@@ -354,6 +364,8 @@ def plot_attention_heatmaps(
     device = device or get_device()
     model.eval().to(device)
 
+    data_kwargs = evaluation_data(model, seed, artifact_type)
+
     # Enable weight capture on all attention layers
     for _, attn in attn_modules:
         attn.capture_weights(True)
@@ -361,10 +373,9 @@ def plot_attention_heatmaps(
     # Run a single forward pass to populate the attention weights
     ds = EEGDenoiseDataset(
         data_dir=data_dir,
-        artifact_type=artifact_type,
         split="test",
         fixed_snr_db=float(snr),
-        master_seed=123,
+        **data_kwargs,
     )
     sample = ds[sample_idx]
     noisy = sample["noisy"].unsqueeze(0).to(device)  # (1, 1, T)
@@ -606,37 +617,9 @@ def load_run_model(run_dir: str, device: Optional[torch.device] = None):
         print(f"[Warning] best.pt not found in {run_dir} — skipping")
         return None, None
 
-    run_cfg = {}
-    config_path = Path(run_dir) / "config.json"
-    if config_path.exists():
-        with open(config_path, "r") as f:
-            run_cfg = json.load(f)
-        variant = run_cfg.get("variant", "tcn")
-        hidden_channels = run_cfg.get("hidden_channels", 64)
-        kv_lora_rank = run_cfg.get("kv_lora_rank", None)
-    else:
-        # Infer variant from directory name
-        dirname = Path(run_dir).name
-        variant = "tcn"
-        for v in sorted(VARIANT_REGISTRY.keys(), key=len, reverse=True):
-            if v.replace("_", "") in dirname.replace("_", ""):
-                variant = v
-                break
-        hidden_channels = 64
-        kv_lora_rank = None
-
-    # Prefer architecture metadata stored with the weights.
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model_cfg = dict(variant=variant, hidden_channels=hidden_channels)
-    if kv_lora_rank is not None:
-        model_cfg["kv_lora_rank"] = kv_lora_rank
-    model_cfg.update(run_cfg)
-    model_cfg.update(ckpt.get("model_config", {}))
-    variant = model_cfg.get("variant", variant)
-    model = build_model_from_config(model_cfg)
-    model.load_state_dict(ckpt["model_state"])
-    model.eval().to(device or get_device())
-    return model, variant
+    from experiment.checkpoints import load_model
+    model, arch, _ = load_model(ckpt_path, device=device or get_device())
+    return model, arch["variant"]
 
 
 # ====================================================================
@@ -647,11 +630,11 @@ def load_run_model(run_dir: str, device: Optional[torch.device] = None):
 def compare_snr_curves(
     run_dirs: List[str],
     data_dir: str,
-    artifact_type: str = "EOG",
+    artifact_type: str = None,
     labels: Optional[List[str]] = None,
     snr_list: list = None,
     batch_size: int = 64,
-    master_seed: int = 42,
+    master_seed: int = None,
     save_path: Optional[str] = None,
     device: Optional[torch.device] = None,
 ):
@@ -897,7 +880,7 @@ def _response_curves(model, dataset, half_width: int, batch_size: int,
     for batch in DataLoader(dataset, batch_size=batch_size, shuffle=False):
         noisy = batch["noisy"].to(device)
         clean = batch["clean"].to(device).squeeze(1)              # (B, T)
-        pred = model(noisy).squeeze(1)                            # (B, T)
+        pred = aligned_output(model(noisy), model).squeeze(1)     # (B, T), target aligned
 
         rms_clean = torch.sqrt(torch.mean(clean ** 2, dim=-1) + 1e-12)
         resid = (pred - clean) / rms_clean.unsqueeze(1)
@@ -905,6 +888,8 @@ def _response_curves(model, dataset, half_width: int, batch_size: int,
         k = batch["switch_idx"].to(device)                        # (B,)
         idx = k.unsqueeze(1) + off_t.unsqueeze(0)                 # (B, L)
         vals = resid.gather(1, idx) ** 2
+        if not torch.isfinite(vals).all():
+            raise ValueError("Switch probe reaches excluded warm-up/tail; narrow the probe interval")
 
         eog_first = batch["eog_first"].to(device)
         for name, mask in (("all", None),
@@ -927,8 +912,8 @@ def evaluate_switch_response(
     probe_seeds=SWITCH_PROBE_SEEDS,
     window: Optional[int] = None,
     batch_size: int = 64,
-    master_seed: int = 42,
-    fs: int = 256,
+    master_seed: int = None,
+    fs: int = None,
     recovery_tol: float = 0.10,
     control: bool = True,
     device: Optional[torch.device] = None,
@@ -974,7 +959,16 @@ def evaluate_switch_response(
     offsets = None
     n_epochs_total = 0
 
-    probe_kwargs = dict(master_seed=master_seed, **probe_kwargs)
+    data_kwargs = evaluation_data(model, master_seed, "BOTH")
+    fs_actual = data_kwargs["target_fs"] or 256.
+    if fs is not None and fs != fs_actual:
+        raise ValueError(f"fs={fs} differs from the model data rate {fs_actual}")
+    fs = fs_actual
+    for key in ("master_seed", "split_ratios", "snr_range_db", "target_fs",
+                "normalization", "normalization_scale", "resampling"):
+        if key in probe_kwargs and probe_kwargs[key] != data_kwargs[key]:
+            raise ValueError(f"Switch probe {key} differs from the checkpoint data protocol")
+        probe_kwargs[key] = data_kwargs[key]
     for probe_seed, ds in build_switch_probes(data_dir, probe_seeds=probe_seeds,
                                               **probe_kwargs):
         lo, hi = ds.switch_bounds
@@ -1222,7 +1216,7 @@ def compare_switch_response(
     probe_seeds=SWITCH_PROBE_SEEDS,
     window: Optional[int] = None,
     batch_size: int = 64,
-    master_seed: int = 42,
+    master_seed: int = None,
     control: bool = True,
     save_path: Optional[str] = None,
     json_path: Optional[str] = None,
@@ -1233,8 +1227,8 @@ def compare_switch_response(
     Run the switch probe on several checkpoints and overlay their response
     curves — the TCN-only vs. attention comparison the experiment exists for.
 
-    Every model sees byte-identical probe data (same ``master_seed`` and the
-    same ``probe_seeds``), so the curves differ only by the model.
+    Each checkpoint uses its own held-out split and recorded preprocessing.
+    A supplied ``master_seed`` must match every checkpoint being compared.
     """
     if labels is None:
         labels = [Path(d).name for d in run_dirs]
@@ -1299,7 +1293,7 @@ def main():
                         help="Path to EEGdenoisenet data directory")
     parser.add_argument("--variant", default=None, choices=list(VARIANT_REGISTRY.keys()),
                         help="Model variant (must match the checkpoint)")
-    parser.add_argument("--artifact", default="EOG", choices=["EOG", "EMG", "BOTH"],
+    parser.add_argument("--artifact", default=None, choices=["EOG", "EMG", "BOTH"],
                         help="Artifact type of the test set. BOTH mixes EOG and EMG "
                              "into every epoch, as the *_both runs were trained")
 
@@ -1327,7 +1321,7 @@ def main():
                              "Format: path[:label] (e.g. runs/tcn_eog:TCN)")
 
     # --- Seeds ---
-    parser.add_argument("--master_seed", type=int, default=42,
+    parser.add_argument("--master_seed", type=int, default=None,
                         help="The run's data seed: it selects the train/val/test split. "
                              "Must match the --master_seed the checkpoint was trained "
                              "with, or the model is scored on the wrong split")
@@ -1392,19 +1386,10 @@ def main():
         if args.data_dir is None:
             parser.error(f"--data_dir is required for mode '{args.mode}'")
 
-        ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-        model_cfg = {"variant": "tcn", "hidden_channels": 64}
-        model_cfg.update(ckpt.get("model_config", {}))
-        if args.config:
-            from configs import load_config
-            model_cfg.update(load_config(args.config))
-        for key in ("variant", "turboquant", "turboquant_bits",
-                    "turboquant_key_mode", "turboquant_seed"):
-            value = getattr(args, key)
-            if value is not None:
-                model_cfg[key] = value
-        model = build_model_from_config(model_cfg)
-        model.load_state_dict(ckpt["model_state"])
+        from experiment.checkpoints import load_model
+        overrides = {key: getattr(args, key) for key in (
+            "variant", "turboquant", "turboquant_bits", "turboquant_key_mode", "turboquant_seed")}
+        model, model_cfg, ckpt = load_model(args.ckpt, config=args.config, overrides=overrides)
         print(f"[Eval] Loaded checkpoint: {args.ckpt}  (epoch={ckpt['epoch']})")
 
     run_all = args.mode == "all"
@@ -1438,6 +1423,7 @@ def main():
             snr=args.vis_snr,
             n_samples=args.n_samples,
             save_path=str(save_dir / "waveforms.png") if save_dir else None,
+            seed=args.master_seed,
         )
 
     # ---- 4. Attention heatmaps ----
@@ -1448,6 +1434,7 @@ def main():
             snr=args.vis_snr,
             sample_idx=args.attn_sample,
             save_path=str(save_dir / "attention_heatmaps.png") if save_dir else None,
+            seed=args.master_seed,
         )
 
     # ---- 5. Per-SNR metric line chart ----
@@ -1479,7 +1466,11 @@ def main():
         switch_range=tuple(args.switch_range),
         n_epochs=args.switch_epochs,
     )
-    if run_all or args.mode == "switch":
+    switch_artifact = (evaluation_data(model, args.master_seed, args.artifact)["artifact_type"]
+                       if run_all else None)
+    if run_all and switch_artifact != "BOTH":
+        print("[Switch] Skipping: the switch probe requires a BOTH-trained checkpoint")
+    if args.mode == "switch" or (run_all and switch_artifact == "BOTH"):
         if args.data_dir is None:
             parser.error("--data_dir is required for switch mode")
         res = evaluate_switch_response(model, args.data_dir, **switch_kwargs)

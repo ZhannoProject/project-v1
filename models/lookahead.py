@@ -105,7 +105,8 @@ import torch.nn as nn
 #: non-causal baseline while keeping a bounded horizon; 186 is full capacity.
 #: 0 and "unbounded" are not in here because they are not lookahead variants
 #: at all -- they are ``tcn_se`` and ``tcn_se_bi``, already trained.
-LOOKAHEAD_LADDER = (1, 2, 4, 8, 16, 32, 62, 124, 186)
+TCN_LOOKAHEAD_LADDER = (1, 2, 4, 8, 16, 32, 62, 124)
+LOOKAHEAD_LADDER = (*TCN_LOOKAHEAD_LADDER, 186)
 
 #: Sample rate the ladder is quoted in milliseconds against (EEGdenoiseNet).
 SAMPLE_RATE_HZ = 256.0

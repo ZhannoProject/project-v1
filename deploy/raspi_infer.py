@@ -82,6 +82,30 @@ EPS = 1e-8
 SAMPLE_RATE_HZ = 256
 
 
+def normalization_scale(meta, signal=None, sigma=None, online=False):
+    """No signal-dependent scale is ever inferred by an online entry point."""
+    cfg = meta.get("preprocessing") or {}
+    mode = cfg.get("normalization", "epoch")
+    if mode not in ("epoch", "fixed"):
+        raise ValueError(f"Unknown normalization: {mode!r}")
+    if mode == "fixed":
+        recorded = cfg.get("normalization_scale")
+        if recorded is None:
+            raise ValueError("Fixed normalization metadata has no normalization_scale")
+        if sigma is not None and not np.isclose(float(sigma), float(recorded), rtol=1e-7, atol=0):
+            raise ValueError("sigma differs from the checkpoint normalization_scale")
+        sigma = recorded
+    if sigma is not None:
+        sigma = float(sigma)
+        if not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError("sigma must be finite and positive")
+        return sigma
+    if online:
+        raise ValueError("Legacy epoch normalization is offline only. Online inference requires "
+                         "a fixed sigma calibrated before this signal, or a fixed-normalization checkpoint.")
+    return np.maximum(np.asarray(signal).std(axis=-1, keepdims=True), EPS)
+
+
 class EEGDenoiser:
     """
     One exported model, with its threading pinned rather than defaulted.
@@ -158,39 +182,40 @@ class EEGDenoiser:
         self.last_run_s = time.perf_counter() - t0
         return y
 
-    def denoise_epochs(self, x: np.ndarray) -> np.ndarray:
+    def denoise_epochs(self, x: np.ndarray, sigma: float | None = None) -> np.ndarray:
         """(T,) or (N, T) raw-scale windows -> same shape, denoised, raw scale."""
         x = np.asarray(x, dtype=np.float32)
         squeeze = x.ndim == 1
         x = x.reshape(-1, self.window)
-        sigma = np.maximum(x.std(axis=1, keepdims=True), EPS)
+        sigma = normalization_scale(self.meta, x, sigma)
         y = self._run((x / sigma)[:, None, :])[:, 0, :] * sigma
         return y[0] if squeeze else y
 
     def denoise_stream(self, signal: np.ndarray, hop: int = 32,
-                       monitor: "LatencyMonitor | None" = None) -> np.ndarray:
+                       monitor: "LatencyMonitor | None" = None,
+                       sigma: float | None = None) -> np.ndarray:
         """
         Causally denoise a long 1-D signal; output is sample-aligned with the input.
         ``monitor`` (a LatencyMonitor) records the cost of every hop.
         """
         signal = np.asarray(signal, dtype=np.float32)
+        sigma = normalization_scale(self.meta, sigma=sigma, online=True)
         T = self.window
         if len(signal) < T:
             # Right-pad with zeros: causality guarantees the padding cannot
             # influence the real samples, but normalise on real samples only.
-            sigma = max(float(signal.std()), EPS)
             xn = np.zeros((1, 1, T), dtype=np.float32)
             xn[0, 0, : len(signal)] = signal / sigma
             return self._run(xn)[0, 0, : len(signal)] * sigma
         out = np.empty_like(signal)
         t0 = time.perf_counter()
-        out[:T] = self.denoise_epochs(signal[:T])
+        out[:T] = self.denoise_epochs(signal[:T], sigma=sigma)
         if monitor is not None:
             monitor.record_first_window(time.perf_counter() - t0)
         for end in range(T + hop, len(signal) + hop, hop):
             end = min(end, len(signal))
             t0 = time.perf_counter()
-            out[end - hop:end] = self.denoise_epochs(signal[end - T:end])[-hop:]
+            out[end - hop:end] = self.denoise_epochs(signal[end - T:end], sigma=sigma)[-hop:]
             if monitor is not None:
                 monitor.record_hop(self.last_run_s, time.perf_counter() - t0)
         return out
@@ -304,7 +329,7 @@ class IncrementalDenoiser:
         x = x.reshape(1, -1) if single else x
         out = np.empty_like(x)
         for e in range(x.shape[0]):
-            sigma = max(float(x[e].std()), EPS)
+            sigma = float(np.asarray(normalization_scale(self.meta, x[e])).reshape(()))
             state = self.initial_state()
             for t in range(x.shape[1]):
                 t0 = time.perf_counter()
@@ -319,14 +344,11 @@ class IncrementalDenoiser:
         """
         A continuous 1-D signal, one sample at a time.
 
-        ``sigma`` is the caller's: a live stream has no future to take a
-        standard deviation over, so it has to carry a running or calibrated
-        one. Defaulting to the whole signal's is an offline convenience and
-        is not what a deployed system could do.
+        Use the checkpoint's fixed scale, or an explicitly pre-calibrated
+        ``sigma`` for legacy models. Never estimate it from this signal.
         """
         signal = np.asarray(signal, dtype=np.float32).reshape(-1)
-        if sigma is None:
-            sigma = max(float(signal.std()), EPS)
+        sigma = normalization_scale(self.meta, sigma=sigma, online=True)
         state = self.initial_state()
         out = np.empty_like(signal)
         for t in range(signal.shape[0]):
@@ -574,8 +596,10 @@ class StreamingDenoiser:
     not what the network saw in training (attention would attend to padding).
     """
 
-    def __init__(self, denoiser: EEGDenoiser, hop: int = 32, monitor: LatencyMonitor | None = None):
+    def __init__(self, denoiser: EEGDenoiser, hop: int = 32, monitor: LatencyMonitor | None = None,
+                 sigma: float | None = None):
         self.d, self.hop, self.monitor = denoiser, hop, monitor
+        self.sigma = normalization_scale(denoiser.meta, sigma=sigma, online=True)
         self.buf = np.zeros(denoiser.window, dtype=np.float32)
         self.filled = 0                                   # real samples in buf
         self.pending = np.zeros(0, dtype=np.float32)      # not yet processed
@@ -592,7 +616,7 @@ class StreamingDenoiser:
             if self.filled < W:
                 return np.zeros(0, dtype=np.float32)
             t0 = time.perf_counter()
-            out.append(self.d.denoise_epochs(self.buf))
+            out.append(self.d.denoise_epochs(self.buf, sigma=self.sigma))
             if self.monitor is not None:
                 self.monitor.record_first_window(time.perf_counter() - t0)
 
@@ -600,14 +624,15 @@ class StreamingDenoiser:
             t0 = time.perf_counter()
             self.buf = np.roll(self.buf, -self.hop)
             self.buf[-self.hop:], self.pending = self.pending[:self.hop], self.pending[self.hop:]
-            out.append(self.d.denoise_epochs(self.buf)[-self.hop:])
+            out.append(self.d.denoise_epochs(self.buf, sigma=self.sigma)[-self.hop:])
             if self.monitor is not None:
                 self.monitor.record_hop(self.d.last_run_s, time.perf_counter() - t0)
         return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
 
 
 def stream_realtime(d: EEGDenoiser, signal: np.ndarray, hop: int = 32,
-                    monitor: LatencyMonitor | None = None, chunk: int | None = None) -> np.ndarray:
+                    monitor: LatencyMonitor | None = None, chunk: int | None = None,
+                    sigma: float | None = None) -> np.ndarray:
     """
     Replay ``signal`` through a StreamingDenoiser at the sample rate, the way
     an acquisition loop would deliver it: a chunk of ``chunk`` samples
@@ -619,7 +644,7 @@ def stream_realtime(d: EEGDenoiser, signal: np.ndarray, hop: int = 32,
     """
     signal = np.asarray(signal, dtype=np.float32)
     chunk = chunk or hop
-    s = StreamingDenoiser(d, hop, monitor)
+    s = StreamingDenoiser(d, hop, monitor, sigma=sigma)
     out = []
     t0 = time.perf_counter()
     for i in range(0, len(signal), chunk):
@@ -634,7 +659,8 @@ def stream_realtime(d: EEGDenoiser, signal: np.ndarray, hop: int = 32,
 
 
 def duty_cycle_check(d: EEGDenoiser, signal: np.ndarray, hops=(64, 32, 16, 8, 4), seconds: float = 20.0,
-                     report_every: int = 0, environment: dict | None = None) -> list[dict]:
+                     report_every: int = 0, environment: dict | None = None,
+                     sigma: float | None = None) -> list[dict]:
     """
     Real-time applicability sweep.  For each hop size the first ``seconds`` of
     ``signal`` are replayed at the sample rate (stream_realtime), so every row
@@ -667,7 +693,7 @@ def duty_cycle_check(d: EEGDenoiser, signal: np.ndarray, hops=(64, 32, 16, 8, 4)
     for hop in hops:
         m = LatencyMonitor(hop, d.sample_rate, report_every, label=f"duty/hop{hop}",
                            environment=environment)
-        stream_realtime(d, signal, hop, m)
+        stream_realtime(d, signal, hop, m, sigma=sigma)
         s = m.summary()
         if not s["n_hops"]:
             continue
@@ -773,7 +799,10 @@ def testdata_provenance(npz_path: str | Path, data=None) -> dict:
         return {"source": "recorded",
                 "master_seed": int(data["master_seed"]),
                 "artifact": str(data["artifact"]) if "artifact" in keys else None,
-                "split": str(data["split"]) if "split" in keys else "test"}
+                "split": str(data["split"]) if "split" in keys else "test",
+                "split_ratios": data["split_ratios"].tolist() if "split_ratios" in keys else None,
+                "sampling": str(data["sampling"]) if "sampling" in keys else None,
+                "resampling": str(data["resampling"]) if "resampling" in keys else None}
 
     m = _TESTDATA_NAME.match(path.name)
     if m:
@@ -802,6 +831,17 @@ def check_split(meta: dict, prov: dict, *, strict: bool = True) -> list[str]:
     """
     problems, warnings = [], []
     model = (meta or {}).get("provenance") or {}
+    cfg = (meta or {}).get("data_protocol") or {}
+    if cfg.get("protocol") == "paper":
+        if not strict or prov.get("source") != "recorded":
+            raise ValueError("Paper scoring requires recorded provenance and strict split checks")
+        for key in ("sampling", "resampling", "split_ratios"):
+            if prov.get(key) is None:
+                raise ValueError(f"Test data lacks {key}; regenerate with --ckpt")
+            expected = cfg.get(key, [0.7, 0.15, 0.15] if key == "split_ratios" else None)
+            match = np.allclose(prov[key], expected) if key == "split_ratios" else prov[key] == expected
+            if not match:
+                raise ValueError(f"Test data {key} differs from checkpoint protocol")
     trained_seed = model.get("trained_master_seed")
     trained_artifact = (model.get("trained_artifact")
                         or ((meta or {}).get("preprocessing") or {}).get("artifact_trained_on"))
@@ -850,8 +890,14 @@ def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_s
     prov = testdata_provenance(npz_path, data)
     prov["path"] = str(npz_path)
     check_split(d.meta, prov, strict=strict_split)
+    if "fs" in data and not np.isclose(float(data["fs"]), d.sample_rate):
+        raise ValueError(f"test data rate {float(data['fs']):g} Hz differs from model rate {d.sample_rate:g} Hz")
     noisy, clean, snr = data["noisy"], data["clean"], data["snr_db"]
     n, T = noisy.shape
+    cfg = d.meta.get("data_protocol") or {}
+    paper = cfg.get("protocol") == "paper"
+    if paper and hop != 4:
+        raise ValueError("Paper evaluation requires H=4")
     stepping = isinstance(d, IncrementalDenoiser)
     if not stepping and T != d.window:
         # The windowed graph's input is a fixed 512 wide, so an epoch of any
@@ -880,13 +926,25 @@ def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_s
         # suffix is there so the mechanism is not read off the label wrongly.
         t_stream = 0.0
         modes = {"noisy input (no model)": noisy, "epoch mode (stepped)": y_epoch}
-    else:
+    elif (d.meta.get("preprocessing") or {}).get("normalization", "epoch") == "fixed":
         t0 = time.perf_counter()
-        y_stream = d.denoise_stream(noisy.reshape(-1), hop, monitor).reshape(n, T)
+        y_stream = (np.stack([d.denoise_stream(row, hop, monitor) for row in noisy]) if paper
+                    else d.denoise_stream(noisy.reshape(-1), hop, monitor).reshape(n, T))
         t_stream = time.perf_counter() - t0
         modes = {"noisy input (no model)": noisy, "epoch mode": y_epoch,
                  f"stream mode (hop {hop})": y_stream}
-    results = {name: metrics(y, clean) for name, y in modes.items()}
+    else:
+        t_stream = 0.0
+        modes = {"noisy input (no model)": noisy, "epoch mode (offline)": y_epoch}
+        print("[test] legacy epoch normalization: reporting offline metrics only")
+    start = (cfg.get("valid_history_samples") or 1) - 1
+    delay = cfg.get("output_delay", 0)
+    stop = T - max(cfg.get("valid_future_samples", 0), delay)
+    if start >= stop:
+        raise ValueError("No common complete target interval in test data")
+    results = {name: metrics(y[..., start + (0 if name.startswith('noisy') else delay):
+                                  stop + (0 if name.startswith('noisy') else delay)], clean[..., start:stop])
+               for name, y in modes.items()}
 
     print(f"[test] {Path(npz_path).name}: {n} epochs x {T} samples, SNR {snr.min():+.1f}..{snr.max():+.1f} dB"
           + (f", {prov['artifact']} test split at master_seed {prov['master_seed']}"
@@ -898,7 +956,7 @@ def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_s
         print(f"       stepped {n * T:,} samples in {t_epoch:.2f} s "
               f"({1e3 * t_epoch / (n * T):.3f} ms/sample, "
               f"{n * T / d.sample_rate:.0f} s of signal); state reset per epoch")
-    else:
+    elif any(k.startswith("stream mode") for k in modes):
         print(f"       epoch mode: {1e3 * t_epoch / n:.2f} ms/epoch (batched)   "
               f"stream mode: {1e3 * t_stream / (n * T / hop):.2f} ms/hop, {t_stream:.2f} s for {n * T / d.sample_rate:.0f} s of signal")
         print("       note: the stream row concatenates independent epochs, so every window straddles two unrelated "
@@ -979,6 +1037,8 @@ def main(argv=None):
     p.add_argument("--input", help=".npy: (T,) / (N, T) epochs, or a long 1-D signal with --stream")
     p.add_argument("--output", help=".npy to write the denoised result to")
     p.add_argument("--stream", action="store_true", help="treat --input as one continuous signal")
+    p.add_argument("--sigma", type=float, default=None,
+                   help="Fixed scale calibrated before the input stream (required for legacy online models)")
     p.add_argument("--hop", type=int, default=32, help="stream hop in samples (latency = hop / fs)")
     p.add_argument("--threads", type=int, default=2, help="onnxruntime intra-op threads (2 is best on a Pi 5)")
     p.add_argument("--benchmark", action="store_true")
@@ -1127,7 +1187,7 @@ def main(argv=None):
         else:
             p.error("--duty_cycle needs --input (1-D .npy) or --testdata (.npz) as the signal")
         hops = [int(h) for h in a.duty_cycle.split(",")]
-        rows = duty_cycle_check(d, sig, hops, a.duty_seconds, a.latency_every, environment=env)
+        rows = duty_cycle_check(d, sig, hops, a.duty_seconds, a.latency_every, environment=env, sigma=a.sigma)
         if a.latency_out and rows:
             js, csv = save_duty_rows(rows, a.latency_out + "_duty", environment=env)
             print(f"[duty] wrote {js} and {csv}")
@@ -1153,9 +1213,12 @@ def main(argv=None):
             m = new_monitor("latency/realtime" if a.realtime else "latency/stream")
             if a.realtime:
                 print(f"[raspi] replaying {x.size / d.sample_rate:.1f} s of signal at {d.sample_rate} Hz ...")
-                y = stream_realtime(d, x.reshape(-1), a.hop, m)
+                y = stream_realtime(d, x.reshape(-1), a.hop, m, sigma=a.sigma)
             else:
-                y = d.denoise_stream(x.reshape(-1), a.hop, m)
+                if isinstance(d, IncrementalDenoiser):
+                    y = d.denoise_stream(x.reshape(-1), sigma=a.sigma, monitor=m)
+                else:
+                    y = d.denoise_stream(x.reshape(-1), a.hop, m, sigma=a.sigma)
             finish_monitor(m, "_stream" if a.testdata else "")
         else:
             y = d.denoise_epochs(x)

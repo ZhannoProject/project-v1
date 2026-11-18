@@ -94,6 +94,7 @@ def _notes(cfg: Dict[str, Any]) -> List[str]:
         raise ValueError(f"Unknown variant {variant!r}. "
                          f"Available: {', '.join(VARIANT_REGISTRY)}")
     accepted = set(inspect.signature(VARIANT_REGISTRY[variant]).parameters)
+    accepted.update(("tcn_norm", "se_window", "attention_window"))
     pinned = pinned_kwargs(variant)
     defaults = model_defaults()
     notes = []
@@ -459,8 +460,8 @@ def report_for_run(name: str) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"no checkpoint at runs/{name}/best.pt")
     import torch
-    cfg = dict((torch.load(path, map_location="cpu",
-                           weights_only=False).get("model_config") or {}))
+    from experiment.checkpoints import read_checkpoint
+    cfg = dict(read_checkpoint(path).get("model_config") or {})
     if not cfg.get("variant"):
         raise ValueError(f"runs/{name} predates model_config; its architecture "
                          f"is not recorded in the checkpoint")

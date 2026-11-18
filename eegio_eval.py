@@ -13,24 +13,19 @@ energy inside the intervals and leaves the background alone, and those are
 two separate measurements that have to be reported together -- a model that
 scores well on the first alone has simply learned to attenuate everything.
 
-So four numbers, all of them relative to the **preprocessed signal that was
-fed to the model**, never to the raw recording:
+The EEG-IO v2 standard reports blink amplitude ratio, background RMSE, and
+blink count reduction. Batch/step parity and causality are model checks. The
+legacy metrics are saved alongside:
 
     suppression S      how much blink-interval power the model removed
     fidelity D_b       how much of the background survived it
     residual detect.   blinks the detector still finds in the output
-    onset leakage      how far before a blink the model's correction starts
-
-The fourth is the one this project cares about most.  A strictly causal model
-cannot begin correcting before the artifact begins; a model licensed to read
-16 samples ahead can, by up to 62.5 ms.  Measured on real blinks, that is the
-lookahead ladder's claim meeting a recording it was not trained on.
 
 **Preprocessing is causal and that is not free.** EEGdenoiseNet's own
 pipeline bandpasses 1-80 Hz and notches 60 Hz with a zero-phase filter
 (``code/preprocessing/EEG/IC_label_artifact_removal.m``), which no online
 system can run: zero-phase filtering is two passes, one of them backwards.
-Everything here uses ``scipy.signal.sosfilt`` -- one pass, forwards -- so the
+Default preprocessing uses ``scipy.signal.sosfilt`` -- one pass, forwards -- so the
 band matches training and the phase does not.  That mismatch is a cost of
 being deployable and it is measurable, which is why the zero-phase filter is
 kept as a control rather than deleted.
@@ -44,9 +39,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
-from dataclasses import dataclass, field
+from time import monotonic
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -85,6 +82,17 @@ MIN_BLINK_S = 0.06
 
 #: Candidate detections closer than this are one event.
 MERGE_GAP_S = 0.10
+
+METRIC_PROTOCOL = "eegio_v2"
+SCORE_WARMUP_S = 3.0
+OFFLINE_WINDOW_S = 2.0
+BAR_EPOCH_S = 2.0
+BAR_BASELINE_START_S = 1.5
+BAR_CENTER_S = 0.5
+BLINK_MATCH_S = 0.25
+BLINK_PEAK_DISTANCE_S = 0.25
+BLINK_THRESHOLD_MULTIPLIER = 6.0
+ADJUSTED_BLINK_COUNT = "blink_count_reduction_adjusted_pct"
 
 
 # ============================================================
@@ -305,6 +313,101 @@ def fidelity_db(x: np.ndarray, y: np.ndarray, background: np.ndarray) -> float:
     return _db(_power(x, background), _power(np.asarray(y) - np.asarray(x), background))
 
 
+def _blink_amplitude_ratio(signal, centers, fs):
+    """Robbins et al. blink amplitude ratio on a subject's averaged waveform."""
+    if not len(centers):
+        return float("nan")
+    half = round(BAR_EPOCH_S * fs)
+    side = round(BAR_BASELINE_START_S * fs)
+    center = round(BAR_CENTER_S * fs)
+    offsets = np.arange(-half, half + 1)
+    wave = signal[centers[:, None] + offsets].mean(axis=0)
+    baseline = np.abs(offsets) >= side
+    wave -= wave[baseline].mean()
+    den = np.abs(wave[baseline]).mean()
+    return float(np.abs(wave[np.abs(offsets) <= center]).mean() / den) if den > 0 else float("nan")
+
+
+def _blink_peak_threshold(amplitude, valid):
+    return float(BLINK_THRESHOLD_MULTIPLIER * amplitude[valid].mean()) if valid.any() else float("nan")
+
+
+def _annotated_peak_count(signal, valid, centers, fs, *, threshold_uv=None):
+    """E-ASR amplitude threshold with one-to-one matching to EEG-IO labels."""
+    from scipy.signal import find_peaks
+
+    if not len(centers):
+        return 0
+    amplitude = np.abs(signal)
+    threshold = _blink_peak_threshold(amplitude, valid) if threshold_uv is None else threshold_uv
+    peaks, _ = find_peaks(np.where(valid, amplitude, -np.inf), height=np.nextafter(threshold, np.inf),
+                          distance=max(1, math.ceil(BLINK_PEAK_DISTANCE_S * fs)))
+    tolerance = round(BLINK_MATCH_S * fs)
+    hits = index = 0
+    for center in centers:
+        while index < len(peaks) and peaks[index] < center - tolerance:
+            index += 1
+        if index < len(peaks) and peaks[index] <= center + tolerance:
+            hits += 1
+            index += 1
+    return hits
+
+
+def standard_metrics(x, y, fs, annotated, all_blinks, valid, guard_s, *,
+                     adjusted_blink_count=False, reference_threshold_uv=None):
+    """EEG-IO adaptation of the three literature-based metrics."""
+    x, y = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+    valid = valid & np.isfinite(x) & np.isfinite(y)
+    # All labels, including soft and detector-missed blinks, protect the
+    # background estimate. Scored events follow the chosen soft-blink policy.
+    background = background_mask(len(x), [(t, t + 1) for t in all_blinks],
+                                 fs, max(guard_s, BAR_CENTER_S), exclude=~valid)
+    invalid_prefix = np.r_[0, np.cumsum(~valid)]
+
+    def complete_windows(centers, half):
+        centers = centers[(centers >= half) & (centers + half < len(x))]
+        return centers[invalid_prefix[centers + half + 1] == invalid_prefix[centers - half]]
+
+    bar_centers = complete_windows(annotated, round(BAR_EPOCH_S * fs))
+    # Neighboring annotations can contaminate the blink-locked reference.
+    clearance = round((BAR_EPOCH_S + BAR_CENTER_S) * fs)
+    left = np.searchsorted(all_blinks, bar_centers - clearance, side="left")
+    right = np.searchsorted(all_blinks, bar_centers + clearance, side="right")
+    bar_centers = bar_centers[right - left == 1]
+
+    count_centers = complete_windows(annotated, round(BLINK_MATCH_S * fs))
+    before = _annotated_peak_count(x, valid, count_centers, fs)
+    after = _annotated_peak_count(y, valid, count_centers, fs)
+    metrics = {
+        "blink_amplitude_ratio": _blink_amplitude_ratio(y, bar_centers, fs),
+        "background_rmse_uv": float(np.sqrt(_power(y - x, background))),
+        "blink_count_reduction_pct": 100.0 * (before - after) / before if before else float("nan"),
+        "metric_support": {
+            "bar_epochs": len(bar_centers),
+            "input_blink_amplitude_ratio": _blink_amplitude_ratio(x, bar_centers, fs),
+            "background_samples": int(background.sum()),
+            "eligible_blinks": len(count_centers),
+            "input_blink_count": before, "output_blink_count": after,
+        },
+    }
+    if adjusted_blink_count:
+        # The first (causal) run supplies one threshold per subject. Apply
+        # that same cutoff to both the input and every model's output.
+        threshold = (_blink_peak_threshold(np.abs(y), valid)
+                     if reference_threshold_uv is None else reference_threshold_uv)
+        fixed_before = _annotated_peak_count(x, valid, count_centers, fs, threshold_uv=threshold)
+        fixed_after = (after if reference_threshold_uv is None else
+                       _annotated_peak_count(y, valid, count_centers, fs, threshold_uv=threshold))
+        metrics[ADJUSTED_BLINK_COUNT] = (
+            100.0 * (fixed_before - fixed_after) / fixed_before if fixed_before else float("nan")
+        )
+        metrics["metric_support"]["adjusted_blink_count"] = {
+            "threshold_uv": threshold, "input_blink_count": fixed_before,
+            "output_blink_count": fixed_after,
+        }
+    return metrics
+
+
 def residual_detectable(y: np.ndarray, fs: float,
                         kept: Sequence[Tuple[int, int]], **detect_kw) -> dict:
     """
@@ -453,14 +556,15 @@ def blink_snr_estimate(x: np.ndarray, kept: Sequence[Tuple[int, int]],
 # ============================================================
 # 5. Running a model over a recording
 # ============================================================
-def stream_apply(model, x: np.ndarray, win: int = 512, hop: int = 32) -> np.ndarray:
+def stream_apply(model, x: np.ndarray, win: int = 512, hop: int = 32, *,
+                 on_progress: Optional[Callable[[int, int], None]] = None) -> np.ndarray:
     """
     Apply a windowed model along a recording, keeping only what a streaming
     deployment would have emitted.
 
-    Each window is normalised by its own standard deviation and rescaled
-    afterwards, exactly as ``data/Dataloader.py`` does and as the ONNX
-    sidecar's preprocessing rule states; only the last ``hop`` outputs of
+    Fixed-normalized runs use their saved training scale. Legacy runs retain
+    offline per-window normalization, so their raw-signal warm-up outputs are
+    not a strict online causality measurement. Only the last ``hop`` outputs of
     each window are kept, because those are the samples a live loop would
     have had full context for.  The first window fills the head, which has
     the warm-up every causal model has at the start of a recording.
@@ -478,29 +582,81 @@ def stream_apply(model, x: np.ndarray, win: int = 512, hop: int = 32) -> np.ndar
     """
     import torch
 
-    x = np.asarray(x, dtype=np.float32)
     n = len(x)
+    last_update = 0.0
+
+    def report(done):
+        nonlocal last_update
+        if on_progress is not None:
+            now = monotonic()
+            if done in (0, n) or now - last_update >= 0.5:
+                on_progress(done, n)
+                last_update = now
+
+    report(0)
+    protocol = getattr(model, "run_config", {})
+    if protocol.get("protocol") == "paper":
+        from models.incremental import IncrementalModel
+        from experiment.methodology import aligned_output
+        from models.variants import variant_is_causal
+        if hop != 4:
+            raise ValueError("Paper EEG-IO replay requires hop H=4")
+        scale = protocol["normalization_scale"]
+        signal = torch.as_tensor(np.asarray(x, dtype=np.float32)) / scale
+        if variant_is_causal(model.model_config["variant"]):
+            stream = IncrementalModel(model)
+            stream.reset()
+            values = []
+            with torch.no_grad():
+                for start in range(0, len(signal), hop):
+                    for sample in signal[start:start + hop]:
+                        values.append(stream.step(sample.reshape(1, 1)).reshape(()))
+                    report(len(values))
+            result = torch.stack(values)
+        else:  # finite-window offline reference, explicitly non-deployable
+            from experiment.methodology import context
+            past, future = context(model)
+            result = torch.empty_like(signal)
+            with torch.no_grad():
+                for start in range(0, len(signal), 2048):
+                    end = min(start + 2048, len(signal))
+                    left, right = max(0, start-past), min(len(signal), end+future)
+                    values = model.eval()(signal[None, None, left:right])[0, 0]
+                    result[start:end] = values[start-left:end-left]
+                    report(end)
+        return aligned_output(result * scale, protocol).cpu().numpy()
+
+    from data.protocol import normalization_config
+    norm = normalization_config(getattr(model, "run_config", {}))
+    def input_scale(chunk):
+        return (norm["normalization_scale"] if norm["normalization"] == "fixed"
+                else max(float(chunk.std()), 1e-8))
+
+    x = np.asarray(x, dtype=np.float32)
     out = np.zeros(n, dtype=np.float32)
     if n < win:
         pad = np.zeros(win, dtype=np.float32)
         pad[-n:] = x
         with torch.no_grad():
-            sigma = max(float(pad.std()), 1e-8)
+            sigma = input_scale(pad)
             y = model(torch.from_numpy(pad / sigma)[None, None]).numpy()[0, 0] * sigma
+        report(n)
         return y[-n:]
 
     with torch.no_grad():
         first = x[:win]
-        sigma = max(float(first.std()), 1e-8)
+        sigma = input_scale(first)
         out[:win] = model(torch.from_numpy(first / sigma)[None, None]).numpy()[0, 0] * sigma
+        report(win)
         for end in range(win + hop, n + hop, hop):
             end = min(end, n)
             chunk = x[end - win:end]
-            sigma = max(float(chunk.std()), 1e-8)
+            sigma = input_scale(chunk)
             y = model(torch.from_numpy(chunk / sigma)[None, None]).numpy()[0, 0] * sigma
             keep = end - max(end - hop, win)
             if keep > 0:
                 out[end - keep:end] = y[-keep:]
+            report(end)
     return out
 
 
@@ -508,13 +664,77 @@ def load_run(run: str):
     """Build a model from a run directory's own checkpoint."""
     import torch
 
-    from models.variants import build_model_from_config
 
     d = PROJECT_ROOT / "runs" / run if not os.path.isabs(run) else Path(run)
-    ck = torch.load(d / "best.pt", map_location="cpu", weights_only=False)
-    model = build_model_from_config(dict(ck["model_config"]))
-    model.load_state_dict(ck["model_state"])
-    return model.eval(), dict(ck["model_config"])
+    from experiment.checkpoints import load_model
+    model, arch, _ = load_model(d / "best.pt")
+    return model, arch
+
+
+@dataclass(frozen=True)
+class OfflineWindow:
+    samples: int
+    left: int
+    right: int
+
+
+def prepare_offline(runs, cfg):
+    """Choose one window and crop for every checkpoint in the comparison."""
+    from experiment.methodology import context
+
+    checkpoints = {run: load_run(run) for run in dict.fromkeys(runs)}
+    win = round(OFFLINE_WINDOW_S * (cfg.target_fs or EEGIO_FS))
+    # Retain the middle half unless a checkpoint needs wider margins.
+    left = right = win // 4
+    for run, (model, arch) in checkpoints.items():
+        if win > (arch.get("max_seq_len") or win):
+            raise ValueError(f"{run} cannot accept a {win}-sample offline window")
+        protocol = getattr(model, "run_config", {})
+        past, future = context(model, windowed=True)
+        delay = protocol.get("output_delay", 0)
+        left = max(left, past - delay, (protocol.get("valid_history_samples") or 1) - 1)
+        right = max(right, future + delay, protocol.get("valid_future_samples", 0))
+    if left + right >= win:
+        raise ValueError(f"Selected checkpoints need more context than the {win}-sample offline window permits")
+    return replace(cfg, offline_window=OfflineWindow(win, left, right)), checkpoints
+
+
+def offline_apply(model, x: np.ndarray, window: OfflineWindow, *, on_progress=None) -> np.ndarray:
+    """Run overlapping full epochs and retain their interior, target-aligned outputs."""
+    import torch
+    from data.protocol import normalization_config
+
+    win, left, right = window.samples, window.left, window.right
+    x = np.asarray(x, dtype=np.float32)
+    if len(x) < win:
+        raise ValueError(f"Offline comparison requires at least {win} samples per recording")
+    stride = win - left - right
+    starts = np.minimum(np.arange(0, len(x) - win + stride, stride), len(x) - win)
+    windows = np.lib.stride_tricks.sliding_window_view(x, win)
+    y = np.full_like(x, np.nan)
+    protocol = getattr(model, "run_config", {})
+    norm = normalization_config(protocol)
+    delay = protocol.get("output_delay", 0)
+    last_update = monotonic()
+    stop = left
+    if on_progress:
+        on_progress(0, len(x))
+    with torch.no_grad():
+        for first in range(0, len(starts), 16):
+            offsets = starts[first:first + 16]
+            batch = windows[offsets]
+            scale = (norm["normalization_scale"] if norm["normalization"] == "fixed"
+                     else np.maximum(batch.std(axis=1, keepdims=True), 1e-8))
+            preds = model(torch.from_numpy(batch / scale)[:, None, :]).numpy()[:, 0] * scale
+            for offset, pred in zip(offsets, preds):
+                start, stop = stop, offset + win - right
+                y[start:stop] = pred[start - offset + delay:stop - offset + delay]
+            if on_progress and monotonic() - last_update >= 0.5:
+                on_progress(int(stop), len(x))
+                last_update = monotonic()
+    if on_progress:
+        on_progress(len(x), len(x))
+    return y
 
 
 # ============================================================
@@ -549,27 +769,51 @@ class EvalConfig:
     target_fs: Optional[float] = PROJECT_FS
     channel: int = 0
     win: int = 512
-    hop: int = 32
+    hop: int = 4
+    resampling: str = "causal"
     detect_k: float = 4.0
     guard_s: float = 0.25
     include_soft: bool = False
     drop_corrupt: bool = True
+    offline_window: Optional[OfflineWindow] = None
+    adjusted_blink_count: bool = False
 
 
 def evaluate_recording(rec: Recording, apply_fn: Callable[[np.ndarray], np.ndarray],
-                       cfg: EvalConfig = EvalConfig()) -> dict:
+                       cfg: EvalConfig = EvalConfig(), *, replay_result=None,
+                       reference_threshold_uv: Optional[float] = None) -> dict:
     """
-    The four metrics and the risk check, for one subject and one model.
+    Standard and legacy metrics for one subject and one model.
 
     Order matters and is the PI's: resample, preprocess causally, detect,
     keep only the annotated detections, drop the corrupt stretches, and
     measure everything against the preprocessed signal -- never the raw one.
     """
+    if cfg.offline_window and replay_result is not None:
+        raise ValueError("Offline comparison requires local inference")
     fs = float(cfg.target_fs or rec.fs)
     raw = rec.signal[cfg.channel]
-    sig = resample_to(raw[None, :], rec.fs, fs)[0] if fs != rec.fs else raw
+    resample_delay_s = 0.0
+    resample_history = 0
+    if replay_result is not None:
+        if fs != rec.fs or cfg.zero_phase:
+            raise ValueError("Pi replay scores require the native rate and causal filters")
+        x, y, hardware = replay_result
+        if x.shape != raw.shape or y.shape != raw.shape:
+            raise ValueError("Pi replay signals must match the source recording length")
+        if not np.isfinite(x).all() or not np.isfinite(y).all():
+            raise ValueError("Pi replay signals must be finite before target alignment")
+    elif fs != rec.fs and cfg.resampling == "causal":
+        from data.resampling import causal_resample, resampling_info
+        sig = causal_resample(raw[None, :], rec.fs, fs)[0]
+        info = resampling_info(rec.fs, fs)
+        resample_delay_s = info["delay_ms"] / 1000
+        resample_history = info["warmup_samples"]
+    else:
+        sig = resample_to(raw[None, :], rec.fs, fs)[0] if fs != rec.fs else raw
 
-    x = preprocess(sig, fs, cfg.band, cfg.notch_hz, zero_phase=cfg.zero_phase)
+    if replay_result is None:
+        x = preprocess(sig, fs, cfg.band, cfg.notch_hz, zero_phase=cfg.zero_phase)
     n = len(x)
 
     corrupt = rec.corrupt_mask()
@@ -595,39 +839,122 @@ def evaluate_recording(rec: Recording, apply_fn: Callable[[np.ndarray], np.ndarr
     matched = float(len(kept) / len(ann)) if len(ann) else float("nan")
     bg = background_mask(n, kept, fs, cfg.guard_s, exclude=corrupt)
 
-    y = apply_fn(x)
+    if replay_result is None:
+        y = apply_fn(x)
+    start, stop = 0, n
+    protocol = getattr(apply_fn, "run_config", {})
+    paper = protocol.get("protocol") == "paper"
+    if cfg.offline_window:
+        start, stop = cfg.offline_window.left, n - cfg.offline_window.right
+        if n < cfg.offline_window.samples or not np.isfinite(y[start:stop]).all():
+            raise ValueError("Offline comparison requires finite predictions for complete windows")
+    elif paper:
+        from experiment.methodology import aligned_output, target_interval
+        if replay_result is not None:
+            import torch
+            y = aligned_output(torch.from_numpy(y), protocol).numpy()
+        start, stop = target_interval(n, protocol)
+        if not np.isfinite(y[start:stop]).all():
+            raise ValueError("Nonfinite prediction inside the common valid interval")
+
+    scoring_corrupt = corrupt
+    if resample_history and corrupt.any():
+        # The causal FIR can carry bad input into later output samples.
+        prefix = np.r_[0, np.cumsum(corrupt)]
+        scoring_corrupt = prefix[1:] > prefix[np.maximum(np.arange(n) - resample_history, 0)]
+    score_start = max(start, math.ceil(SCORE_WARMUP_S * fs))
+    indices = np.arange(n)
+    valid = (indices >= score_start) & (indices < stop) & ~scoring_corrupt
+    centers = np.unique(np.rint((rec.blink_times(cfg.include_soft) + resample_delay_s) * fs).astype(int))
+    all_centers = np.unique(np.rint((rec.blink_times(True) + resample_delay_s) * fs).astype(int))
+    standard = standard_metrics(
+        x, y, fs, centers, all_centers, valid, cfg.guard_s,
+        adjusted_blink_count=cfg.adjusted_blink_count, reference_threshold_uv=reference_threshold_uv,
+    )
+
+    if paper or cfg.offline_window:
+        x, y, bg = x[start:stop], y[start:stop], bg[start:stop]
+        kept = [(a-start, b-start) for a, b in kept if a >= start and b <= stop]
     return {
         "subject": rec.subject, "fs": fs, "n_samples": n,
         "n_annotated": int(len(ann)), "n_detected": len(found), "n_kept": len(kept),
         "annotations_matched": matched,
         "corrupt_fraction": float(corrupt.mean()) if corrupt.size else 0.0,
         "background_fraction": float(bg.mean()),
+        "valid_target_interval": [start, stop],
+        "n_scored_events": len(kept),
         "suppression_db": suppression_db(x, y, kept),
         "fidelity_db": fidelity_db(x, y, bg),
         "residual": residual_detectable(y, fs, kept, k=cfg.detect_k),
-        "onset_leakage": onset_leakage(x, y, fs, kept, bg),
         "risk": blink_snr_estimate(x, kept, bg),
+        **({"pi_replay": hardware} if replay_result is not None else {}),
+        **standard,
     }
 
 
 def evaluate_subjects(data_dir: str, run: str, subjects: Optional[Sequence[str]] = None,
                       cfg: EvalConfig = EvalConfig(),
-                      apply_fn: Optional[Callable] = None) -> dict:
+                      apply_fn: Optional[Callable] = None, *,
+                      on_progress: Optional[Callable[[dict], None]] = None,
+                      replay_fn: Optional[Callable] = None, checkpoint=None,
+                      reference_thresholds_uv: Optional[Dict[str, float]] = None) -> dict:
     """One row per subject for one model, plus what it was run with."""
+    offline = cfg.offline_window
+    if offline and replay_fn is not None:
+        raise ValueError("Offline comparison requires local inference")
     subs = list(subjects) if subjects is not None else list_subjects(data_dir)
     arch = {}
-    if apply_fn is None:
-        model, arch = load_run(run)
-        apply_fn = lambda x: stream_apply(model, x, cfg.win, cfg.hop)   # noqa: E731
+    checks = None
 
-    rows = [evaluate_recording(read_recording(data_dir, s), apply_fn, cfg) for s in subs]
+    def inference_progress(done, total):
+        on_progress({"phase": "inference", "subject": subject,
+                     "completed_subjects": index, "samples": done, "total_samples": total})
+
+    if apply_fn is None:
+        from experiment.methodology import model_stream_checks
+
+        model, arch = checkpoint if checkpoint is not None else load_run(run)
+        protocol = getattr(model, "run_config", {})
+        if protocol.get("protocol") == "paper":
+            if not offline and (cfg.zero_phase or cfg.resampling != "causal" or cfg.hop != 4):
+                raise ValueError("Paper real-data evaluation requires causal preprocessing and H=4")
+            if float(cfg.target_fs or EEGIO_FS) != float(protocol.get("target_fs") or 256.):
+                raise ValueError("Real-data replay rate differs from the checkpoint training rate")
+        checks = model_stream_checks(model, offline.samples if offline else cfg.win)
+        def apply_fn(x):
+            if offline:
+                return offline_apply(model, x, offline, on_progress=inference_progress if on_progress else None)
+            return stream_apply(model, x, cfg.win, cfg.hop,
+                                on_progress=inference_progress if on_progress else None)
+
+        apply_fn.run_config = protocol
+
+    rows = []
+    for index, subject in enumerate(subs):
+        if on_progress:
+            on_progress({"phase": "subject", "subject": subject, "completed_subjects": index})
+        rec = read_recording(data_dir, subject)
+        replay_result = None
+        if replay_fn is not None:
+            if on_progress:
+                inference_progress(0, rec.n_samples)
+            replay_result = replay_fn(rec)
+        rows.append(evaluate_recording(
+            rec, apply_fn, cfg, replay_result=replay_result,
+            reference_threshold_uv=None if reference_thresholds_uv is None else reference_thresholds_uv[subject],
+        ))
     return {
         "run": run, "arch": arch, "subjects": subs, "rows": rows,
+        "metric_protocol": METRIC_PROTOCOL,
+        "inference_checks": checks,
         "config": {"band_hz": list(cfg.band), "notch_hz": cfg.notch_hz,
                    "zero_phase": cfg.zero_phase, "target_fs": cfg.target_fs,
-                   "win": cfg.win, "hop": cfg.hop, "detect_k": cfg.detect_k,
+                   "win": offline.samples if offline else cfg.win,
+                   "hop": None if offline else cfg.hop, "detect_k": cfg.detect_k,
+                   **({"offline_window": asdict(offline)} if offline else {}),
                    "guard_s": cfg.guard_s, "include_soft": cfg.include_soft,
-                   "drop_corrupt": cfg.drop_corrupt},
+                   "drop_corrupt": cfg.drop_corrupt, "score_warmup_s": SCORE_WARMUP_S},
+        "independent_unit": "subject",
         "causality": preprocess_is_causal(float(cfg.target_fs or EEGIO_FS),
                                           band=cfg.band, notch_hz=cfg.notch_hz,
                                           zero_phase=cfg.zero_phase),
@@ -636,24 +963,36 @@ def evaluate_subjects(data_dir: str, run: str, subjects: Optional[Sequence[str]]
 
 
 METRIC_PATHS = {
+    "blink_amplitude_ratio": ("blink_amplitude_ratio",),
+    "background_rmse_uv": ("background_rmse_uv",),
+    "blink_count_reduction_pct": ("blink_count_reduction_pct",),
+}
+LEGACY_METRIC_PATHS = {
     "suppression_db": ("suppression_db",),
     "fidelity_db": ("fidelity_db",),
     "residual_rate": ("residual", "rate"),
-    "onset_leakage_ms": ("onset_leakage", "median_ms"),
 }
+ALL_METRIC_PATHS = {**METRIC_PATHS, **LEGACY_METRIC_PATHS}
 
 
 def pluck(row: dict, metric: str) -> float:
+    return _pluck(row, ALL_METRIC_PATHS[metric])
+
+
+def _pluck(row: dict, path: Tuple[str, ...]) -> float:
     v = row
-    for key in METRIC_PATHS[metric]:
+    for key in path:
         v = v.get(key, {}) if isinstance(v, dict) else float("nan")
     return float(v) if isinstance(v, (int, float)) else float("nan")
 
 
 def summarise(rows: Sequence[dict]) -> dict:
     out = {}
-    for metric in METRIC_PATHS:
-        vals = np.asarray([pluck(r, metric) for r in rows], dtype=float)
+    metrics = ALL_METRIC_PATHS
+    if any(ADJUSTED_BLINK_COUNT in row for row in rows):
+        metrics = {**metrics, ADJUSTED_BLINK_COUNT: (ADJUSTED_BLINK_COUNT,)}
+    for metric, path in metrics.items():
+        vals = np.asarray([_pluck(r, path) for r in rows], dtype=float)
         vals = vals[np.isfinite(vals)]
         out[metric] = {"n": int(vals.size),
                        "median": float(np.median(vals)) if vals.size else float("nan"),
@@ -679,12 +1018,18 @@ def paired_wilcoxon(a: dict, b: dict, metric: str) -> dict:
 
     av = {r["subject"]: pluck(r, metric) for r in a["rows"]}
     bv = {r["subject"]: pluck(r, metric) for r in b["rows"]}
+    if metric == "blink_amplitude_ratio":
+        av = {subject: abs(value - 1) for subject, value in av.items()}
+        bv = {subject: abs(value - 1) for subject, value in bv.items()}
     shared = [s for s in av if s in bv and np.isfinite(av[s]) and np.isfinite(bv[s])]
     diffs = [bv[s] - av[s] for s in shared]
     out = {"metric": metric, "a": a["run"], "b": b["run"], "n_pairs": len(shared),
            "median_diff": float(np.median(diffs)) if diffs else float("nan"),
-           "b_better_on": int(sum(d > 0 for d in diffs)),
+           "b_better_on": sum(d < 0 for d in diffs) if metric in (
+               "blink_amplitude_ratio", "background_rmse_uv", "residual_rate") else sum(d > 0 for d in diffs),
            "subjects": shared}
+    if metric == "blink_amplitude_ratio":
+        out["tested_quantity"] = "distance_to_one"
     if len(shared) < 3 or not np.any(np.asarray(diffs) != 0):
         out.update(statistic=float("nan"), p_value=float("nan"),
                    note="too few paired subjects, or no difference at all, to test")
@@ -694,7 +1039,7 @@ def paired_wilcoxon(a: dict, b: dict, metric: str) -> dict:
     return out
 
 
-def compare(results: Sequence[dict], metrics: Sequence[str] = tuple(METRIC_PATHS)) -> List[dict]:
+def compare(results: Sequence[dict], metrics: Sequence[str] = tuple(ALL_METRIC_PATHS)) -> List[dict]:
     """Every result against the first, on every metric."""
     if len(results) < 2:
         return []
@@ -707,7 +1052,7 @@ def compare(results: Sequence[dict], metrics: Sequence[str] = tuple(METRIC_PATHS
 # ============================================================
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Evaluate denoisers on real EEG-IO recordings")
-    from gui.eegio_tab import find_data_dir
+    from gui.eegio_tab import _finite, find_data_dir
     ap.add_argument("--data_dir", default=str(find_data_dir()),
                     help="EEG-IO recordings; data/EEG-IO and "
                          "data/EEG-EyeBlinks/EEG-IO are both found automatically")
@@ -715,7 +1060,9 @@ def main(argv=None):
                     help="run directories; the first is the baseline the rest are tested against")
     ap.add_argument("--subjects", nargs="*", default=None)
     ap.add_argument("--channel", type=int, default=0)
-    ap.add_argument("--hop", type=int, default=32)
+    ap.add_argument("--hop", type=int, default=4)
+    ap.add_argument("--offline", action="store_true",
+                    help="compare interior predictions from shared overlapping 2-second windows")
     ap.add_argument("--target_fs", type=float, default=PROJECT_FS,
                     help=f"rate to run the model at: {PROJECT_FS:g} (default) resamples "
                          f"to the training rate, {EEGIO_FS:g} keeps EEG-IO's native one "
@@ -726,6 +1073,7 @@ def main(argv=None):
                     help="control: the non-causal filter EEGdenoiseNet itself used")
     ap.add_argument("--no_notch", action="store_true")
     ap.add_argument("--include_soft", action="store_true")
+    ap.add_argument("--legacy", action="store_true", help="Print legacy scores. JSON keeps both metric sets.")
     ap.add_argument("--json", default=None, help="write the full result here")
     a = ap.parse_args(argv)
 
@@ -733,28 +1081,50 @@ def main(argv=None):
                      notch_hz=None if a.no_notch else POWERLINE_HZ,
                      target_fs=EEGIO_FS if a.native else a.target_fs,
                      include_soft=a.include_soft)
-    results = [evaluate_subjects(a.data_dir, Path(r).name, a.subjects, cfg) for r in a.runs]
+    runs = [Path(r).name for r in a.runs]
+    checkpoints = {}
+    if a.offline:
+        cfg, checkpoints = prepare_offline(runs, cfg)
+    results = [evaluate_subjects(a.data_dir, run, a.subjects, cfg, checkpoint=checkpoints.get(run))
+               for run in runs]
 
     c = results[0]["causality"]
     rate = (f"native {EEGIO_FS:g} Hz, no resampling" if cfg.target_fs in (None, EEGIO_FS)
             else f"resampled {EEGIO_FS:g} -> {cfg.target_fs:g} Hz")
     print(f"\n  preprocessing: {'zero-phase (NON-CAUSAL control)' if cfg.zero_phase else 'causal, sosfilt'}"
           f"  past_diff={c['past_diff']:.2e}   rate: {rate}")
-    print(f"  {'run':<26}{'supp dB':>9}{'fidel dB':>10}{'resid':>8}{'lead ms':>9}{'subj':>6}")
+    if cfg.offline_window:
+        window = cfg.offline_window
+        print(f"  Offline comparison · {window.samples} samples per window · "
+              f"shared margins {window.left} left / {window.right} right")
+    columns = (("suppression_db", "supp dB"), ("fidelity_db", "fidel dB"), ("residual_rate", "resid")) if a.legacy else (
+        ("blink_amplitude_ratio", "blink ratio"), ("background_rmse_uv", "RMSE uV"),
+        ("blink_count_reduction_pct", "reduction %"))
+    print(f"  {'run':<26}" + "".join(f"{label:>13}" for _, label in columns) + f"{'subj':>6}")
     for r in results:
         s = r["summary"]
-        print(f"  {r['run']:<26}{s['suppression_db']['median']:>9.2f}"
-              f"{s['fidelity_db']['median']:>10.2f}{s['residual_rate']['median']:>8.2f}"
-              f"{s['onset_leakage_ms']['median']:>9.1f}{len(r['rows']):>6}")
+        print(f"  {r['run']:<26}" + "".join(f"{s[key]['median']:>13.2f}" for key, _ in columns)
+              + f"{len(r['rows']):>6}")
 
-    for t in compare(results):
+    for r in results:
+        for key, test in (("parity", "Batch/step parity"), ("causality", "Model causality")):
+            check = r["inference_checks"][key]
+            state = {True: "PASS", False: "FAIL", None: "N/A"}[check["passed"]]
+            delta = check.get("max_abs_delta")
+            detail = f"max Δ={delta:.2e}" if delta is not None else check.get("reason", "")
+            print(f"  {r['run']} · {test} · {state}  {detail}")
+
+    for t in compare(results, [key for key, _ in columns]):
         if t["n_pairs"]:
-            print(f"  {t['b']} vs {t['a']} · {t['metric']:<18} "
+            metric = "blink ratio distance to 1" if t.get("tested_quantity") == "distance_to_one" else t["metric"]
+            print(f"  {t['b']} vs {t['a']} · {metric} "
                   f"median Δ {t['median_diff']:+.3f}  p={t['p_value']:.4f}  n={t['n_pairs']}")
 
     if a.json:
-        Path(a.json).write_text(json.dumps(
-            {"results": results, "tests": compare(results)}, indent=2))
+        payload = {"metric_protocol": METRIC_PROTOCOL, "metrics": list(METRIC_PATHS),
+                   "legacy_metrics": list(LEGACY_METRIC_PATHS),
+                   "results": results, "tests": compare(results)}
+        Path(a.json).write_text(json.dumps(_finite(payload), indent=2, allow_nan=False))
         print(f"\n  wrote {a.json}")
     return results
 

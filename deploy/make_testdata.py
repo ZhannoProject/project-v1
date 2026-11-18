@@ -56,9 +56,19 @@ SAMPLE_RATE_HZ = 256
 def make_testdata(data_dir: str, artifact: str = "EOG", n: int = 100,
                   out_dir: str | Path = PROJECT_ROOT / "deploy" / "testdata",
                   master_seed: int = 42,
-                  split_ratios: tuple = (0.7, 0.15, 0.15)) -> Path:
+                  split_ratios: tuple = (0.7, 0.15, 0.15),
+                  target_fs: float | None = None, checkpoint: str | None = None) -> Path:
+    options = dict(artifact_type=artifact, split_ratios=split_ratios,
+                   master_seed=master_seed, target_fs=target_fs)
+    if checkpoint:
+        from experiment.checkpoints import load_model
+        from data.protocol import evaluation_data
+        model, _, _ = load_model(checkpoint)
+        options = evaluation_data(model)
+        artifact, master_seed = options["artifact_type"], options["master_seed"]
+        split_ratios, target_fs = options["split_ratios"], options["target_fs"]
     ds = EEGDenoiseDataset(data_dir=data_dir, artifact_type=artifact, split="test",
-                           split_ratios=split_ratios, master_seed=master_seed)
+                           **{k:v for k,v in options.items() if k != "artifact_type"})
     n = min(n, len(ds))
     if n % len(ds.snr_grid):
         print(f"[testdata] note: n={n} is not a multiple of the {len(ds.snr_grid)}-point SNR grid, "
@@ -78,15 +88,19 @@ def make_testdata(data_dir: str, artifact: str = "EOG", n: int = 100,
     # A set cut at one seed is training data for a run trained at another, and
     # scoring against it would be measuring the model on what it learned from.
     stem = f"{artifact}_test{n}" + ("" if master_seed == 42 else f"_s{master_seed}")
+    if target_fs and target_fs != SAMPLE_RATE_HZ:
+        stem += f"_{target_fs:g}hz"
     path = out_dir / f"{stem}.npz"
     # Provenance travels inside the file, not in its name: the name is a
     # convention and a rename breaks it silently, while this is read back by
     # the scorer and checked against the model it is about to grade.
     np.savez_compressed(path, noisy=np.stack(noisy).astype(np.float32),
                         clean=np.stack(clean).astype(np.float32),
-                        snr_db=np.asarray(snr, dtype=np.float32), fs=SAMPLE_RATE_HZ,
+                        snr_db=np.asarray(snr, dtype=np.float32), fs=ds.fs,
                         master_seed=int(master_seed), artifact=str(artifact),
                         split="test",
+                        resampling=getattr(ds, "resampling", "offline"),
+                        sampling=ds.sampling,
                         split_ratios=np.asarray(split_ratios, dtype=np.float32))
     levels = sorted(set(np.round(snr, 2)))
     print(f"[testdata] wrote {path}  ({path.stat().st_size / 1024:.0f} KB): {n} epochs x 512 samples, "
@@ -101,13 +115,15 @@ def main(argv=None):
     p.add_argument("--data_dir", default="data/EEGdenoisenet/data")
     p.add_argument("--artifact", default="EOG", choices=["EOG", "EMG", "BOTH"])
     p.add_argument("--n", type=int, default=100, help="epochs to cut (multiple of 10 recommended)")
+    p.add_argument("--target_fs", type=float, default=None, help="Match the checkpoint's training sample rate")
+    p.add_argument("--ckpt", default=None, help="Restore the complete data protocol from this checkpoint")
     p.add_argument("--out_dir", default=str(PROJECT_ROOT / "deploy" / "testdata"))
     p.add_argument("--master_seed", type=int, default=42,
                    help="the split to cut from — it must be the seed the model being "
                         "scored was trained with, or the 'test' set is that model's "
                         "training data")
     a = p.parse_args(argv)
-    make_testdata(a.data_dir, a.artifact, a.n, a.out_dir, a.master_seed)
+    make_testdata(a.data_dir, a.artifact, a.n, a.out_dir, a.master_seed, target_fs=a.target_fs, checkpoint=a.ckpt)
 
 
 if __name__ == "__main__":

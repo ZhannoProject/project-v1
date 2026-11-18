@@ -31,7 +31,9 @@ def _checkpoint(tmp, variant, **kwargs):
     run_dir = Path(tmp) / f"{variant}_test"
     run_dir.mkdir()
     with contextlib.redirect_stdout(io.StringIO()):
-        save_checkpoint(run_dir, 0, model, opt, sched, 0.0, {}, is_best=True)
+        save_checkpoint(run_dir, 0, model, opt, sched, 0.0,
+                        {"config": dict(master_seed=42, artifact="EOG",
+                                        normalization="fixed", normalization_scale=25.)}, is_best=True)
     return model, run_dir / "best.pt"
 
 
@@ -103,10 +105,14 @@ class ExportOnnxTests(unittest.TestCase):
             # Pi-side runtime: raw-scale contract and streaming equivalence
             d = EEGDenoiser(onnx_path, n_threads=1)
             raw = 25.0 * np.random.default_rng(0).standard_normal((3, 512)).astype(np.float32)
-            sigma = raw.std(axis=1, keepdims=True)
+            sigma = 25.
             with torch.no_grad():
                 ref = model.eval()(torch.from_numpy(raw / sigma)[:, None, :]).numpy()[:, 0, :] * sigma
             np.testing.assert_allclose(d.denoise_epochs(raw), ref, atol=1e-3)
+            changed = raw.copy()
+            changed[:, 256:] *= 100
+            np.testing.assert_array_equal(d.denoise_epochs(raw)[:, :256],
+                                          d.denoise_epochs(changed)[:, :256])
 
             sig = raw.reshape(-1)
             offline = d.denoise_stream(sig, hop=32)

@@ -33,8 +33,10 @@ import contextlib
 import csv
 import io
 import json
+import os
 import re
 import shlex
+import shutil
 import sys
 from pathlib import Path
 from typing import Optional
@@ -47,6 +49,21 @@ from gui.config_io import PROJECT_ROOT, RUNS_DIR
 #: checker, not here, so the form's default and the thing that judges it
 #: cannot disagree.  (preflight is stdlib-only, like the rest of the GUI.)
 WANTED_GOVERNOR = preflight.WANTED_GOVERNOR
+
+
+def _bash_executable():
+    if sys.platform != 'win32':
+        return 'bash'
+    for variable in ('ProgramW6432','ProgramFiles','ProgramFiles(x86)','LOCALAPPDATA'):
+        base=os.environ.get(variable)
+        if base:
+            for suffix in ('Git/bin/bash.exe','Programs/Git/bin/bash.exe'):
+                candidate=Path(base)/suffix
+                if candidate.is_file():return str(candidate)
+    found=shutil.which('bash')
+    if found and 'system32' not in found.lower():return found
+    raise ValueError('The Deploy Pi script requires Git for Windows (Git Bash). '
+                     'Install it, or use EEG channels with native Windows OpenSSH.')
 
 DEPLOY_DIR = PROJECT_ROOT / "deploy"
 ARTIFACTS_DIR = DEPLOY_DIR / "artifacts"
@@ -983,7 +1000,7 @@ def build_steps(spec: dict) -> list[dict]:
         steps.append({
             "label": (f"copy to {ssh} and read the board's state there" if check_only
                       else f"copy to {ssh} and run the test there"),
-            "command": ["bash", str(RUNNER.relative_to(PROJECT_ROOT)), ssh, name],
+            "command": [_bash_executable(), RUNNER.relative_to(PROJECT_ROOT).as_posix(), ssh, name],
             "env": env,
             # run_on_pi.sh always benchmarks and scores the test set; the sweep
             # and the paced replay are the parts it switches on.

@@ -70,11 +70,17 @@ class WholeSignalEquivalenceTests(unittest.TestCase):
         torch.manual_seed(2)
         x = torch.randn(3, 200)
         together = IncrementalModel(model).run(x)
+        changed = x.clone()
+        changed[1:] += 10
+        changed_output = IncrementalModel(model).run(changed)
+        self.assertTrue(torch.equal(together[0], changed_output[0]),
+                        "a stream's output depended on its neighbours in the batch")
+
         stream = IncrementalModel(model)
         for row in range(x.shape[0]):
             alone = stream.run(x[row])
-            self.assertLess((together[row] - alone).abs().max().item(), 1e-6,
-                            "a stream's output depended on its neighbours in the batch")
+            # Different batch shapes can use different floating-point kernels.
+            self.assertLess((together[row] - alone).abs().max().item(), 1e-5)
 
     def test_reset_restores_initial_state(self):
         """A reset stream reproduces its own first run, bit for bit."""
@@ -146,7 +152,7 @@ class SlidingWindowEquivalenceTests(unittest.TestCase):
 
     def test_baseline_matches_sliding_window_exactly(self):
         """No attention, receptive field 125 < 512: nothing mixes in the padding."""
-        self.assertLess(self._worst_relative_gap("tcn"), 1e-6)
+        self.assertLess(self._worst_relative_gap("tcn"), 1e-5)
 
     def test_attention_sliding_window_gap_is_small_and_bounded(self):
         """

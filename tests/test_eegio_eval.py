@@ -12,10 +12,15 @@ Run: python -m unittest discover -s tests -p 'test_eegio_eval.py'
 
 import json
 import os
+import socket
 import sys
 import tempfile
+import threading
 import unittest
+from itertools import count
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -182,6 +187,74 @@ class TestMetrics(unittest.TestCase):
         self.assertTrue(np.isnan(E.residual_detectable(self.x, FS, [])["rate"]))
 
 
+class TestStandardMetrics(unittest.TestCase):
+    def test_adjusted_counts_use_the_reference_output_threshold_for_both_signals(self):
+        fs = 100
+        x = np.ones(1000)
+        centers = np.array([300, 600])
+        x[centers] = [12, 100]
+        valid = np.ones(len(x), dtype=bool)
+        baseline = E.standard_metrics(
+            x, x * 0.5, fs, centers, centers, valid, .25, adjusted_blink_count=True,
+        )
+        reference = baseline["metric_support"]["adjusted_blink_count"]
+        self.assertAlmostEqual(reference["threshold_uv"], 3.33)
+        result = E.standard_metrics(
+            x, x * 0.02, fs, centers, centers, valid, .25,
+            adjusted_blink_count=True, reference_threshold_uv=reference["threshold_uv"],
+        )
+        self.assertEqual(result["blink_count_reduction_pct"], 0)
+        self.assertEqual(result[E.ADJUSTED_BLINK_COUNT], 100)
+        self.assertEqual(result["metric_support"]["adjusted_blink_count"],
+                         {**reference, "output_blink_count": 0})
+        self.assertEqual(reference["input_blink_count"], 2)
+        self.assertEqual(E.summarise([result])[E.ADJUSTED_BLINK_COUNT]["median"], 100)
+
+    def test_known_blinks_and_background_gain(self):
+        fs = 100
+        background = np.tile([-1., 1.], 450)
+        centers = np.array([300, 620])
+        x = background.copy()
+        x[centers] = 100
+        y = background * 0.5
+        valid = np.ones(len(x), dtype=bool)
+        result = E.standard_metrics(x, y, fs, centers, centers, valid, .25)
+
+        self.assertAlmostEqual(result["blink_amplitude_ratio"], 1, places=3)
+        self.assertEqual(result["background_rmse_uv"], 0.5)
+        self.assertEqual(result["blink_count_reduction_pct"], 100)
+        support = result["metric_support"]
+        self.assertEqual((support["bar_epochs"], support["input_blink_count"],
+                          support["output_blink_count"]), (2, 2, 0))
+        self.assertGreater(support["input_blink_amplitude_ratio"], result["blink_amplitude_ratio"])
+
+    def test_background_excludes_unscored_labels_and_invalid_samples(self):
+        fs = 100
+        x = np.ones(1000)
+        y = x.copy()
+        y[:300] = 100
+        y[450:551] = 100
+        valid = np.arange(len(x)) >= 300
+        annotated = np.array([], dtype=int)
+        result = E.standard_metrics(x, y, fs, annotated, np.array([500]), valid, .25)
+
+        self.assertEqual(result["background_rmse_uv"], 0)
+        self.assertEqual(result["metric_support"]["background_samples"], 599)
+        self.assertTrue(np.isnan(result["blink_amplitude_ratio"]))
+        self.assertTrue(np.isnan(result["blink_count_reduction_pct"]))
+
+    def test_pairing_uses_distance_to_one_for_blink_amplitude_ratio(self):
+        def comparison(run, values):
+            return {"run": run, "rows": [{"subject": str(i), "blink_amplitude_ratio": value}
+                                         for i, value in enumerate(values)]}
+        baseline = comparison("baseline", [2., .4, 1.8])
+        candidate = comparison("candidate", [.5, .8, 1.2])
+        result = E.paired_wilcoxon(baseline, candidate, "blink_amplitude_ratio")
+        self.assertEqual(result["tested_quantity"], "distance_to_one")
+        self.assertEqual(result["b_better_on"], 3)
+        self.assertAlmostEqual(result["median_diff"], -.5)
+
+
 class TestOnsetLeakage(unittest.TestCase):
     """
     The measurement the tab exists for, given models whose lead is known
@@ -277,6 +350,22 @@ class TestStreamApply(unittest.TestCase):
         x = _blinky(n=1500)[0]
         for hop in (1, 32, 64, 512):
             self.assertEqual(len(E.stream_apply(_Identity(), x, 512, hop)), 1500, f"hop={hop}")
+
+    def test_offline_apply_uses_full_windows_and_aligns_delayed_interior_outputs(self):
+        class Probe:
+            run_config = {"output_delay": 1}
+
+            def __call__(self, x):
+                self.inputs = x.clone()
+                return x.roll(-2, dims=-1)
+
+        x = np.random.default_rng(0).normal(size=29).astype(np.float32)
+        probe = Probe()
+        y = E.offline_apply(probe, x, E.OfflineWindow(12, 3, 4))
+        windows = np.stack([x[start:start + 12] for start in (0, 5, 10, 15, 17)])
+        np.testing.assert_allclose(probe.inputs[:, 0], windows / windows.std(axis=1, keepdims=True))
+        np.testing.assert_allclose(y[3:-4], x[6:-1], atol=1e-6)
+        self.assertTrue(np.isnan(y[np.r_[:3, -4:0]]).all())
 
 
 # ============================================================
@@ -387,8 +476,11 @@ class TestTargetRate(unittest.TestCase):
     def test_the_tab_offers_both_and_reports_which_was_used(self):
         from gui.eegio_tab import meta
 
-        rates = {r["value"] for r in meta()["rates"]}
+        settings = meta()
+        rates = {r["value"] for r in settings["rates"]}
         self.assertEqual(rates, {E.EEGIO_FS, E.PROJECT_FS})
+        self.assertEqual(settings["defaults"]["n_subjects"], 20)
+        self.assertEqual(settings["defaults"]["hop"], 4)
 
     def test_every_run_carries_the_rate_it_trained_at(self):
         # A directory name no longer implies a rate: runs/tcn_mla_both_s67
@@ -401,31 +493,46 @@ class TestTargetRate(unittest.TestCase):
         self.assertTrue(rows)
         for r in rows:
             with self.subTest(run=r["name"]):
-                self.assertIn(r["train_fs"], (E.EEGIO_FS, E.PROJECT_FS))
+                self.assertTrue(np.isfinite(r["train_fs"]) and r["train_fs"] > 0)
                 self.assertIsInstance(r["train_fs_recorded"], bool)
                 if not r["train_fs_recorded"]:
                     self.assertEqual(r["train_fs"], E.PROJECT_FS)
 
-    def test_a_run_that_recorded_its_rate_is_marked_as_having_done_so(self):
-        import json
+    def test_picker_and_eegio_use_the_same_checkpoint_first_training_rates(self):
+        from gui import config_io, eegio_tab
 
-        from gui.eegio_tab import _trained_at, _runs_dir
+        cases = {
+            "tcn_256hz": (250, 256, (250, True)),
+            "history_only": (None, 250, (250, True)),
+            "legacy": (None, None, (256, False)),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, (_, history_rate, _) in cases.items():
+                run = root / name
+                run.mkdir()
+                (run / "best.pt").touch()
+                (run / "history.json").write_text(json.dumps({
+                    "config": {"target_fs": history_rate}, "val_loss": [1.0],
+                    "rrmse_t": [0.7], "rrmse_s": [0.6], "acc": [0.8],
+                }))
 
-        for d in _runs_dir().iterdir():
-            h = d / "history.json"
-            if not h.is_file():
-                continue
-            try:
-                fs = (json.loads(h.read_text()).get("config") or {}).get("target_fs")
-            except ValueError:
-                continue
-            got, recorded = _trained_at(d.name)
-            with self.subTest(run=d.name):
-                if fs:
-                    self.assertTrue(recorded)
-                    self.assertEqual(got, float(fs))
-                else:
-                    self.assertFalse(recorded)
+            def checkpoint_info(path):
+                if not path.is_file():
+                    return {}
+                rate = cases[path.parent.name][0]
+                return {"epoch": 1, "run_config": {} if rate is None else {"target_fs": rate}}
+
+            with patch.object(config_io, "RUNS_DIR", root), patch.object(
+                config_io, "_checkpoint_info", side_effect=checkpoint_info
+            ):
+                picker_rows = config_io.list_runs()
+                eegio_rows = eegio_tab.available_runs()
+
+        expected = {name: case[2] for name, case in cases.items()}
+        for rows in (picker_rows, eegio_rows):
+            self.assertEqual({r["name"]: (r["train_fs"], r["train_fs_recorded"])
+                              for r in rows}, expected)
 
 
 # ============================================================
@@ -577,6 +684,107 @@ class TestTabGlue(unittest.TestCase):
 # ============================================================
 class TestEndToEnd(unittest.TestCase):
 
+    def test_offline_mode_shares_filter_and_scores_the_same_interval(self):
+        from gui import eegio_tab
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = write_synthetic_recording(tmp, "S00", duration_s=6, n_blinks=1)
+            delayed = _Identity()
+            delayed.run_config = {"valid_history_samples": 150}
+            pair = {"lookahead": 16, "master_seed": 42, "runs": ["a", "b"]}
+            progress = []
+            with patch.object(eegio_tab, "RESULTS_DIR", Path(tmp) / "results"), \
+                 patch.object(eegio_tab, "available_runs", return_value=[]), \
+                 patch.object(E, "load_run", side_effect=[(_Identity(), {}), (delayed, {})]), \
+                 patch.object(E, "monotonic", side_effect=count()), \
+                 patch("experiment.methodology.context", return_value=(0, 0)), \
+                 patch("experiment.methodology.model_stream_checks", return_value={}):
+                out = eegio_tab.evaluate({"runs": pair["runs"], "data_dir": tmp, "target_fs": 250,
+                                          "offline": True, "zero_phase": True},
+                                         lookahead_comparison=pair,
+                                         on_progress=lambda update: progress.append(json.dumps(update)))
+                entry = eegio_tab.list_results()[0]
+                self.assertEqual(eegio_tab.read_result(out["name"])["saved"]["lookahead_comparison"], pair)
+            self.assertTrue(any(json.loads(message)["phase"] == "inference" for message in progress))
+            self.assertEqual(entry["lookahead_comparison"], pair)
+            self.assertEqual(entry["offline_window"], {"samples": 500, "left": 149, "right": 125})
+            self.assertIsNone(entry["hop"])
+            self.assertEqual(out["saved"]["blink_count_adjustment"]["reference_run"], "a")
+            reference = out["results"][0]["rows"][0]["metric_support"]["adjusted_blink_count"]
+            for r in out["results"]:
+                self.assertTrue(r["config"]["zero_phase"])
+                self.assertEqual(r["config"]["offline_window"], entry["offline_window"])
+                self.assertEqual(r["rows"][0]["valid_target_interval"], [149, rec.n_samples - 125])
+                self.assertLess(r["rows"][0]["background_rmse_uv"], 1e-5)
+                self.assertEqual(r["rows"][0]["metric_support"]["adjusted_blink_count"], reference)
+                self.assertIn(E.ADJUSTED_BLINK_COUNT, entry["summary"][r["run"]])
+
+    def test_gui_stream_reports_progress_before_returning_the_saved_result(self):
+        from gui import eegio_tab
+        from gui.server import Handler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for subject in ("S00", "S01"):
+                write_synthetic_recording(tmp, subject, duration_s=4, n_blinks=1)
+            results_dir = Path(tmp) / "results"
+            body = json.dumps({"runs": ["first", "second"], "data_dir": tmp}).encode()
+            request = (f"POST /api/eegio/evaluate?progress=1 HTTP/1.0\r\n"
+                       f"Content-Length: {len(body)}\r\n\r\n").encode() + body
+            proceed = threading.Event()
+            original_read = E.read_recording
+
+            def read_recording(*args):
+                if not proceed.wait(10):
+                    raise TimeoutError("No progress arrived before reading the recording")
+                return original_read(*args)
+
+            client, server = socket.socketpair()
+            checks = {"parity": {"passed": True}, "causality": {"passed": True}}
+            with client, server, patch.object(eegio_tab, "RESULTS_DIR", results_dir), \
+                 patch.object(eegio_tab, "available_runs", return_value=[]), \
+                 patch.object(E, "load_run", return_value=(_Identity(), {})), \
+                 patch("experiment.methodology.model_stream_checks", return_value=checks), \
+                 patch.object(E, "monotonic", side_effect=count()), \
+                 patch.object(E, "read_recording", side_effect=read_recording):
+                def handle():
+                    with server:
+                        Handler(server, ("local", 0), SimpleNamespace(verbose=False))
+
+                thread = threading.Thread(target=handle, daemon=True)
+                thread.start()
+                client.settimeout(15)
+                try:
+                    client.sendall(request)
+                    with client.makefile("rb") as stream:
+                        self.assertIn(b"200 OK", stream.readline())
+                        while stream.readline() not in (b"\r\n", b""):
+                            pass
+                        self.assertEqual(json.loads(stream.readline())["progress"]["phase"], "loading_model")
+                        first = json.loads(stream.readline())["progress"]
+                        self.assertEqual((first["subject"], first["completed"], first["total"]), ("S00", 0, 4))
+                        proceed.set()
+                        events = [json.loads(line) for line in stream]
+                finally:
+                    proceed.set()
+                    client.close()
+                    thread.join(15)
+
+            progress = [event["progress"] for event in events[:-1]]
+            self.assertTrue(any(0 < p.get("samples", 0) < p.get("total_samples", 0) for p in progress))
+            subjects = [p for p in progress if p["phase"] == "subject"]
+            self.assertEqual([(p["model"], p["subject"], p["completed"]) for p in subjects],
+                             [("first", "S01", 1), ("second", "S00", 2), ("second", "S01", 3)])
+            self.assertEqual(progress[-1], {"phase": "saving", "completed": 4, "total": 4})
+            out = events[-1]["result"]
+            self.assertEqual((out["hop"], out["saved"]["n_subjects"]), (4, 2))
+            self.assertEqual(out["metric_protocol"], E.METRIC_PROTOCOL)
+            self.assertEqual(set(out["metrics"]), set(E.METRIC_PATHS))
+            self.assertEqual(set(out["legacy_metrics"]), set(E.LEGACY_METRIC_PATHS))
+            self.assertEqual({t["metric"] for t in out["tests"]}, set(E.ALL_METRIC_PATHS))
+            self.assertEqual([r["inference_checks"] for r in out["results"]], [checks, checks])
+            self.assertNotIn("onset_leakage_ms", out["results"][0]["summary"])
+            self.assertTrue((results_dir / out["name"]).is_file())
+
     def test_a_whole_evaluation_runs_and_reports_every_metric(self):
         with tempfile.TemporaryDirectory() as d:
             subs = [write_synthetic_recording(d, f"S{i:02d}", duration_s=20.0,
@@ -592,7 +800,7 @@ class TestEndToEnd(unittest.TestCase):
             self.assertGreater(row["n_kept"], 0)
             self.assertIn("suppression_db", row)
             self.assertIn("rate", row["residual"])
-            self.assertIn("median_ms", row["onset_leakage"])
+            self.assertNotIn("onset_leakage", row)
             self.assertIn("median_db", row["risk"])
         for metric in E.METRIC_PATHS:
             self.assertIn(metric, out["summary"])

@@ -15,7 +15,7 @@ perturbation (does an output move when a later input moves?) and by gradient
 (is d out_t / d in_s exactly zero for s > t?). The second is the one that
 matters for training, because gradients are what training is made of.
 
-It also pins the one place where the full model genuinely is not causal in
+It also pins the one place where the historical model is not causal in
 train mode, and shows it is not the gate: ``BatchNorm1d`` normalises over
 (batch, time), so its batch statistics couple every position to every other.
 That is ordinary, it disappears in ``eval()`` where the statistics are frozen
@@ -218,13 +218,7 @@ class TestGradientInTrainMode(unittest.TestCase):
         self.assertGreater(future, 0.0)
 
     def test_a_residual_block_with_the_gate_is_causal_by_gradient(self):
-        # BatchNorm's batch statistics span time in train mode, which is not
-        # the gate's doing; it is held in eval here so the block's remaining
-        # train-mode behaviour -- dropout and the gate -- is what is measured.
         block = ResidualBlock(C, C, 3, dilation=2, dropout=0.0, se_reduction=4).train()
-        for m in block.modules():
-            if isinstance(m, nn.BatchNorm1d):
-                m.eval()
         future, past = self._future_sensitivity(block)
         self.assertEqual(future, 0.0)
         self.assertGreater(past, 0.0)
@@ -235,8 +229,8 @@ class TestGradientInTrainMode(unittest.TestCase):
 # ============================================================
 class TestWholeModelInTrainMode(unittest.TestCase):
 
-    def _model(self):
-        m = build_model("tcn_se", hidden_channels=16)
+    def _model(self, **kwargs):
+        m = build_model("tcn_se", hidden_channels=16, **kwargs)
         for mod in m.modules():                       # dropout would mask the probe
             if isinstance(mod, (nn.Dropout, nn.Dropout1d)):
                 mod.p = 0.0
@@ -256,18 +250,26 @@ class TestWholeModelInTrainMode(unittest.TestCase):
         # the coupling is BatchNorm's, not the gate's.
         x = torch.randn(2, 1, T, generator=torch.Generator().manual_seed(9))
 
-        m = self._model().train()
+        m = self._model(tcn_norm="batch").train()
         past_all_train, _ = _past_future(m(x), m(_perturbed(x)))
         self.assertGreater(past_all_train, 0.0,
                            "expected BatchNorm's batch statistics to couple time")
 
-        m = self._model().train()
+        m = self._model(tcn_norm="batch").train()
         for mod in m.modules():
             if isinstance(mod, nn.BatchNorm1d):
                 mod.eval()
         past_bn_eval, future = _past_future(m(x), m(_perturbed(x)))
         self.assertEqual(past_bn_eval, 0.0,
                          "something other than BatchNorm couples time in train mode")
+        self.assertGreater(future, 0.0)
+
+    def test_default_model_is_causal_in_train_mode(self):
+        model = self._model().train()
+        self.assertFalse(any(isinstance(layer, nn.BatchNorm1d) for layer in model.modules()))
+        x = torch.randn(2, 1, T, generator=torch.Generator().manual_seed(11))
+        past, future = _past_future(model(x), model(_perturbed(x)))
+        self.assertEqual(past, 0.0)
         self.assertGreater(future, 0.0)
 
     def test_the_bidirectional_twin_is_caught_in_train_mode_too(self):

@@ -1,0 +1,10 @@
+# Native Windows ARM64 / CPython 3.13. Keep the model runtime aligned with development.
+torch @ https://download-r2.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp313-cp313-win_arm64.whl#sha256=97a5160abf3ca9d59a2cd7b4b4de89d9dfe290d36a1ac720262a55fbcee10b6c
+numpy==2.4.5
+scipy==1.17.1
+matplotlib==3.10.9
+pyyaml==6.0.3
+onnx==1.22.0
+onnxruntime==1.30.0
+onnxscript==0.7.2
+pywebview==6.2.1

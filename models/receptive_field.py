@@ -105,6 +105,12 @@ def architectural(model: nn.Module) -> int:
     checkpoint that has been loaded as well as for one just constructed -- the
     same reason ``lookahead.architectural`` works that way.
     """
+    from experiment.methodology import context
+    try:
+        past, future = context(model)
+        return past + future + 1
+    except (ValueError, AttributeError):  # legacy or a bare backbone
+        pass
     span = 0
     for m in model.modules():
         if isinstance(m, CausalConv1d):

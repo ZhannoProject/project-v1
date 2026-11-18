@@ -47,6 +47,7 @@ import torch
 import metrics
 from data.Dataloader import build_dataloaders
 from models.variants import build_model, build_model_from_config
+from experiment.checkpoints import read_checkpoint
 from trainer.losses import LOSS_REGISTRY, build_loss
 
 PROJECT_ROOT = Path(_project_root)
@@ -73,7 +74,7 @@ def recorded_loss(run_dir: Path) -> str | None:
     best = run_dir / "best.pt"
     if best.is_file():
         try:
-            ck = torch.load(best, map_location="cpu", weights_only=False)
+            ck = read_checkpoint(best)
             return (ck.get("run_config") or {}).get("loss_fn")
         except Exception:
             pass
@@ -90,22 +91,8 @@ def artifact_of(name: str) -> str | None:
 
 def _build(ck: dict) -> torch.nn.Module:
     """Rebuild the checkpoint's model: model_config when present, else weight shapes."""
-    cfg = dict(ck.get("model_config") or {})
-    sd = ck["model_state"]
-    if cfg.get("variant"):
-        model = build_model_from_config(cfg)
-    else:
-        # Legacy checkpoint. Shapes give every hyperparameter except n_heads — and
-        # except causality, which leaves no trace in the weights at all; a legacy
-        # checkpoint predates the bidirectional variants, so causal is right.
-        from deploy.export_onnx import infer_arch_from_state_dict
-        arch = infer_arch_from_state_dict(sd)
-        if arch.get("variant") != "tcn":
-            arch["n_heads"] = cfg.get("n_heads", 4)
-        model = build_model(**arch)
-    model.load_state_dict(sd, strict=True)
-    model.eval()
-    return model
+    from experiment.checkpoints import load_model
+    return load_model(ck)[0]
 
 
 @torch.no_grad()
@@ -162,7 +149,7 @@ def identify(run_dir: Path, data_dir: Path, device) -> dict:
     i = min(range(len(vl)), key=vl.__getitem__)
     target, rec_rrmse_t, best_epoch = vl[i], hist["rrmse_t"][i], i + 1
 
-    ck = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
+    ck = read_checkpoint(run_dir / "best.pt")
     try:
         model = _build(ck).to(device)
     except Exception as e:

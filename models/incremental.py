@@ -110,6 +110,7 @@ from models.AttentionBlocks.attention import (
     CausalTransformerDecoder,
 )
 from models.TCN_backbone import CausalConv1d, CausalTCNBackbone, ResidualBlock
+from models.causal_config import ChannelNorm
 
 #: Bytes per cached float.  The caches are float32 like the weights; this is
 #: the unit every number in ``cache_report()`` is quoted in.
@@ -217,7 +218,7 @@ def _is_pointwise(module: nn.Module) -> bool:
             )
         return True
     return isinstance(module, (nn.PReLU, nn.ReLU, nn.GELU, nn.Identity, nn.Dropout,
-                               nn.LayerNorm, nn.Sigmoid, nn.Tanh))
+                               nn.LayerNorm, ChannelNorm, nn.Sigmoid, nn.Tanh))
 
 
 def _step_pointwise(module: nn.Module, x_t: torch.Tensor) -> torch.Tensor:
@@ -304,17 +305,26 @@ class SEStepper:
         self._n = 0
 
     def reset(self, batch_size, device, dtype):
-        self._sum = torch.zeros(batch_size, self.channels, device=device, dtype=dtype)
+        self._sum = (None if self.se.pool_window else
+                     torch.zeros(batch_size, self.channels, device=device, dtype=dtype))
         self._n = 0
+        self._buffer = (torch.zeros(batch_size, self.channels, self.se.pool_window,
+                                   device=device, dtype=dtype) if self.se.pool_window else None)
 
     def state_bytes(self) -> int:
+        if self.se.pool_window:
+            return 0 if getattr(self, "_buffer", None) is None else self._buffer.numel() * BYTES_FP32
         return 0 if self._sum is None else self._sum.numel() * BYTES_FP32
 
     def step(self, x_t):
         """``x_t``: (B, C) -> (B, C), scaled by the gate this sample earns."""
-        self._sum = self._sum + x_t
-        self._n += 1
-        s = self._sum / self._n
+        if self.se.pool_window:
+            self._buffer = torch.cat((self._buffer[..., 1:], x_t.unsqueeze(-1)), dim=-1)
+            s = self._buffer.mean(-1)
+        else:
+            self._sum = self._sum + x_t
+            self._n += 1
+            s = self._sum / self._n
         h = F.relu(F.linear(s, self.se.fc1.weight.squeeze(-1), self.se.fc1.bias))
         g = torch.sigmoid(F.linear(h, self.se.fc2.weight.squeeze(-1), self.se.fc2.bias))
         return x_t * g
@@ -477,7 +487,7 @@ class MHAStepper:
         self.head_dim = attn.head_dim
         self.d_model = attn.d_model
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.window = attn.causal_mask.shape[-1]
+        self.window = getattr(attn, "attention_window", None) or attn.causal_mask.shape[-1]
 
         self.k_cache = _RingCache(self.window, trailing=(self.head_dim,), heads=self.n_heads)
         self.v_cache = _RingCache(self.window, trailing=(self.head_dim,), heads=self.n_heads)
@@ -572,7 +582,7 @@ class MLAStepper:
         self.d_model = attn.d_model
         self.rank = attn.kv_lora_rank
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.window = attn.causal_mask.shape[-1]
+        self.window = getattr(attn, "attention_window", None) or attn.causal_mask.shape[-1]
         self.absorb = absorb
 
         #: The cache: one rank-dimensional latent per step, no heads axis.
@@ -830,7 +840,12 @@ class IncrementalModel:
         samples seen so far — they are not wrong, they are just working from a
         shorter history, exactly as the first positions of any window do.
         """
-        return max(self.receptive_field, self.attention_window)
+        from experiment.methodology import context
+        try:
+            past, _ = context(self.model)
+            return past + 1
+        except ValueError:  # legacy cumulative SE / whole-epoch attention
+            return max(self.receptive_field, self.attention_window)
 
     # -- state ------------------------------------------------
     def reset(self, batch_size: int = 1):

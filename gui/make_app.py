@@ -18,8 +18,7 @@ hand that identity to Python.app, leaving the venv unreadable without any
 prompt.  Without a compiler the shell-script launcher is used as a fallback
 and you may have to grant folder access manually.
 
-The icon (.icns) is rendered from gui/static/icon.png with `iconutil`;
-without PIL or iconutil the bundle is built without an icon.
+Pillow writes the bundle icon (.icns) from gui/static/icon.png.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ import plistlib
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 from gui.config_io import PROJECT_ROOT
@@ -52,27 +50,13 @@ def _sh_quote(p: Path | str) -> str:
 
 
 def build_icns(png: Path, out_icns: Path) -> bool:
-    """png (1024×1024) → .icns via an iconset + iconutil. Returns False if not possible."""
-    if not png.is_file() or shutil.which("iconutil") is None:
-        return False
+    """Write a multi-resolution macOS icon from the source PNG."""
     try:
         from PIL import Image
-    except ImportError:
+        with Image.open(png) as source:
+            source.convert("RGBA").save(out_icns, format="ICNS")
+    except (ImportError, OSError):
         return False
-    src = Image.open(png).convert("RGBA")
-    with tempfile.TemporaryDirectory() as tmp:
-        iconset = Path(tmp) / "icon.iconset"
-        iconset.mkdir()
-        for size in (16, 32, 128, 256, 512):
-            for scale in (1, 2):
-                px = size * scale
-                name = f"icon_{size}x{size}" + ("@2x" if scale == 2 else "") + ".png"
-                src.resize((px, px), Image.LANCZOS).save(iconset / name)
-        try:
-            subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(out_icns)],
-                           check=True, capture_output=True)
-        except subprocess.CalledProcessError:
-            return False
     return out_icns.is_file()
 
 

@@ -59,6 +59,7 @@ from models.AttentionBlocks.attention import (
     CausalTransformerDecoder,
 )
 from models.TCN_backbone import CausalConv1d, CausalTCNBackbone, ResidualBlock
+from models.causal_config import ChannelNorm
 
 #: Added to the scores of positions the stream has not reached yet.  Large
 #: enough that ``exp`` underflows to exactly zero in float32, small enough not
@@ -104,6 +105,8 @@ class ConvStep(nn.Module):
 
 def _pointwise(module: nn.Module, x_t):
     """A layer that maps sample t to sample t, applied in (B, C, 1)."""
+    if isinstance(module, ChannelNorm):
+        return module(x_t)
     if isinstance(module, nn.BatchNorm1d):
         if module.training:
             raise RuntimeError("BatchNorm1d is in training mode; call model.eval() first")
@@ -183,10 +186,16 @@ class SEStep(nn.Module):
 
     @property
     def state_shapes(self):
+        if self.se.pool_window:
+            return [("se_buffer", (self.channels, self.se.pool_window))]
         return [("se_sum", (self.channels, 1)), ("se_count", (1, 1))]
 
     def forward(self, x_t, state):
         """``x_t``: (B, C, 1) -> (B, C, 1), with the running summary advanced."""
+        if self.se.pool_window:
+            buffer = torch.cat((state[0][..., 1:], x_t), dim=-1)
+            g = torch.sigmoid(self.se.fc2(self.se.act(self.se.fc1(buffer.mean(-1, keepdim=True)))))
+            return x_t * g, [buffer]
         run_sum, count = state
         run_sum = run_sum + x_t
         count = count + 1.0
@@ -262,7 +271,7 @@ class MHAStep(nn.Module):
         self.attn = attn
         self.h, self.hd = attn.n_heads, attn.head_dim
         self.d = attn.d_model
-        self.window = attn.causal_mask.shape[-1]
+        self.window = getattr(attn, "attention_window", None) or attn.causal_mask.shape[-1]
         self.scale = self.hd ** -0.5
 
     @property
@@ -317,7 +326,7 @@ class MLAStep(nn.Module):
         self.attn = attn
         self.h, self.hd = attn.n_heads, attn.head_dim
         self.d, self.r = attn.d_model, attn.kv_lora_rank
-        self.window = attn.causal_mask.shape[-1]
+        self.window = getattr(attn, "attention_window", None) or attn.causal_mask.shape[-1]
         self.scale = self.hd ** -0.5
         # Folded once, at construction: (H, r, hd) and (H, hd, r).
         # Detached because these are constants derived from the weights, and
@@ -502,6 +511,12 @@ class StepGraph(nn.Module):
         """
         if self.decoder is not None:
             return self.decoder.window
+        from experiment.methodology import context
+        try:
+            past, _ = context(self.model)
+            return past + 1
+        except ValueError:  # legacy cumulative SE has no finite span
+            pass
         return 1 + sum(s.span for part in self._parts
                        for s in self._conv_steps(part))
 

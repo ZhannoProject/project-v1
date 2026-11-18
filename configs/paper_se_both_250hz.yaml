@@ -1,0 +1,23 @@
+profile: paper
+protocol: paper
+variant: tcn_se
+hidden_channels: 64
+se_reduction: 8
+tcn_norm: none
+se_window: 16
+artifact: BOTH
+target_fs: 250
+normalization: fixed
+resampling: causal
+loss_fn: mse
+selection_metric: gt_mse
+max_epochs: 200
+learning_rate: 0.0005
+attn_lr_scale: 1.0
+master_seed: 42
+output_delay: 0
+hop: 4
+# Includes 20 output samples of causal 256->250 FIR startup.
+valid_history_samples: 220
+valid_future_samples: 102
+save_dir: runs/paper_se_fixed_window16_250hz_delay0_s42

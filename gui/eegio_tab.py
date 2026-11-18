@@ -6,16 +6,13 @@ A thin layer over ``eegio_eval.py``.  It exists so the page can ask three
 things without knowing anything about filters or blink detection: what is on
 disk, which runs are worth comparing, and what happens when they are.
 
-The work is synchronous, like the KD audit tab's and unlike the Train and
-Deploy tabs': a comparison is a few forward passes per subject, not a
-training run, and ``n_subjects`` caps it so a click cannot turn into a
-quarter of an hour.
+Comparisons report progress as each model and recording is processed.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -53,10 +50,8 @@ RESULTS_DIR = PROJECT_ROOT / "eegio_tests"
 #: kB of per-subject rows, so this is months of ordinary use.
 MAX_RESULTS = 200
 
-#: Subjects per comparison unless the page says otherwise.  Twenty subjects
-#: times three models times a forward pass over 100 s is minutes, and the
-#: page should come back before someone wonders whether it has hung.
-DEFAULT_N_SUBJECTS = 4
+#: Use the full EEG-IO cohort by default.
+DEFAULT_N_SUBJECTS = 20
 
 #: The comparison this tab was built for: the causal model, the rung
 #: licensed 16 samples (62.5 ms) ahead, and the unbounded twin that cannot be
@@ -86,34 +81,6 @@ def _finite(obj):
     return obj
 
 
-def _runs_dir() -> Path:
-    from gui import config_io
-    return config_io.RUNS_DIR
-
-
-def _trained_at(name: str) -> tuple:
-    """
-    The rate a run was trained at, and whether it said so itself.
-
-    ``target_fs`` has only been recorded since EEGdenoiseNet became
-    trainable at another rate; before that there was one rate and nothing to
-    record.  So a run with nothing recorded was trained at 256 Hz -- but it
-    is *inferred*, and the two are shown differently, because a directory
-    name no longer implies a rate: ``runs/tcn_mla_both_s67`` held a 256 Hz
-    run and now holds a 250 Hz one.
-    """
-    import json
-
-    h = _runs_dir() / name / "history.json"
-    if not h.is_file():
-        return (None, False)
-    try:
-        fs = (json.loads(h.read_text()).get("config") or {}).get("target_fs")
-    except ValueError:
-        return (None, False)
-    return (float(fs), True) if fs else (None, False)
-
-
 def available_runs() -> List[dict]:
     """
     Finished runs that can be evaluated, with what each one may read ahead
@@ -126,24 +93,24 @@ def available_runs() -> List[dict]:
     run at the wrong one it sees time dilated by 2.4%.  Which one a row is
     has to be visible before it is picked.
     """
-    import eegio_eval as E
     from gui import config_io
 
     out = []
     for r in config_io.list_runs():
         if r["status"] != "complete":
             continue
-        fs, recorded = _trained_at(r["name"])
         out.append({
             "name": r["name"], "variant": r["variant"], "artifact": r["artifact"],
             "master_seed": r["master_seed"], "hidden_channels": r["hidden_channels"],
             "rrmse_t": r["rrmse_t"],
             "causal": r["causal"], "lookahead": r["lookahead"],
             "bidirectional": r["bidirectional"],
+            "tcn_norm": r.get("tcn_norm"),
+            "training_protocol": r.get("training_protocol"),
             #: The rate it trained at, and whether that is its own word for
             #: it or this module's inference from an older run's silence.
-            "train_fs": fs if recorded else E.PROJECT_FS,
-            "train_fs_recorded": recorded,
+            "train_fs": r["train_fs"],
+            "train_fs_recorded": r["train_fs_recorded"],
             "suggested": r["name"] in SUGGESTED,
         })
     out.sort(key=lambda r: (not r["suggested"], r["name"]))
@@ -191,36 +158,46 @@ def _result_path(name: str) -> Path:
 
 def save_result(out: dict) -> str:
     """Write a finished comparison and return the file name."""
-    import json
     from datetime import datetime
+    from uuid import uuid4
+    from experiment.storage import atomic_json
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    name = f"eegio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    name = f"eegio_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid4().hex[:8]}.json"
     # Named before it is written, so the file knows what it is called. A copy
     # that does not is a copy the page cannot select in its own history list.
     out["name"] = name
-    (RESULTS_DIR / name).write_text(json.dumps(out, indent=2))
+    atomic_json(RESULTS_DIR / name, out)
 
     # Oldest first, so the survivors are the newest MAX_RESULTS.
     kept = sorted(RESULTS_DIR.glob("eegio_*.json"))
     for stale in kept[:-MAX_RESULTS]:
-        stale.unlink()
+        stale.unlink(missing_ok=True)
     return name
 
 
 def _describe(out: dict, name: str) -> dict:
     """One row for the history list: enough to choose between two of them."""
     results = out.get("results") or []
+    saved = out.get("saved") or {}
+    target = saved.get("target", "host")
     return {
         "name": name,
-        "saved_at": (out.get("saved") or {}).get("at"),
+        "saved_at": saved.get("at"),
         "runs": [r.get("run") for r in results],
+        "tcn_norms": {r.get("run"): (r.get("arch") or {}).get("tcn_norm") for r in results},
         "baseline": out.get("baseline"),
+        "target": target,
+        **({"replay_mode": saved.get("replay_mode", "paced")} if target == "pi5" else {}),
+        **({"lookahead_comparison": saved["lookahead_comparison"]} if "lookahead_comparison" in saved else {}),
+        "offline_window": saved.get("offline_window"),
+        "non_causal_test_radius": saved.get("non_causal_test_radius"),
+        "metric_protocol": out.get("metric_protocol", "legacy"),
         "n_subjects": len(out.get("subjects") or []),
         "target_fs": out.get("target_fs"),
         "hop": out.get("hop"),
-        "zero_phase": (out.get("saved") or {}).get("zero_phase"),
-        "include_soft": (out.get("saved") or {}).get("include_soft"),
+        "zero_phase": saved.get("zero_phase"),
+        "include_soft": saved.get("include_soft"),
         "n_mismatched": len(out.get("rate_mismatch") or []),
         # The headline of each, so the list can be read without opening a row.
         "summary": {r.get("run"): (r.get("summary") or {}) for r in results},
@@ -237,6 +214,8 @@ def list_results() -> List[dict]:
     for f in sorted(RESULTS_DIR.glob("eegio_*.json"), reverse=True):
         try:
             out.append(_describe(json.loads(f.read_text()), f.name))
+        except FileNotFoundError:
+            continue  # Pruned while reading the history.
         except ValueError:
             # A half-written file is not worth failing the whole list over.
             out.append({"name": f.name, "saved_at": None, "runs": [],
@@ -258,16 +237,19 @@ def meta(data_dir: Optional[str] = None) -> dict:
         "runs": available_runs(),
         "history": list_results(),
         "suggested": list(SUGGESTED),
+        "pi_replay_modes": ["paced", "fast"],
         "metrics": list(E.METRIC_PATHS),
+        "metric_protocol": E.METRIC_PROTOCOL,
+        "legacy_metrics": list(E.LEGACY_METRIC_PATHS),
         "defaults": {
-            "n_subjects": DEFAULT_N_SUBJECTS, "hop": 32, "channel": 0,
+            "n_subjects": DEFAULT_N_SUBJECTS, "hop": E.EvalConfig.hop, "channel": 0,
             "band_hz": list(E.TRAIN_BAND_HZ), "notch_hz": E.POWERLINE_HZ,
             "target_fs": E.PROJECT_FS, "detect_k": 4.0,
         },
-        "rates": [{"value": E.PROJECT_FS, "label": f"{E.PROJECT_FS:g} Hz (training rate)",
+        "rates": [{"value": E.PROJECT_FS, "label": f"{E.PROJECT_FS:g} Hz (resampled)",
                    "note": "resamples 250 -> 256, exactly 128/125"},
                   {"value": E.EEGIO_FS, "label": f"{E.EEGIO_FS:g} Hz (native)",
-                   "note": "no resampling; the model sees time dilated by 2.4%"}],
+                   "note": "uses the recordings at their original sampling rate"}],
         "band_note": (f"{E.TRAIN_BAND_HZ[0]:g}–{E.TRAIN_BAND_HZ[1]:g} Hz with a "
                       f"{E.POWERLINE_HZ:g} Hz notch, read off EEGdenoiseNet's own "
                       f"preprocessing script, applied with sosfilt so the filter is "
@@ -275,7 +257,9 @@ def meta(data_dir: Optional[str] = None) -> dict:
     }
 
 
-def evaluate(spec: dict) -> dict:
+def evaluate(spec: dict, *, on_progress: Optional[Callable[[dict], None]] = None,
+             evaluate_model: Optional[Callable] = None, target: str = "host",
+             lookahead_comparison: Optional[dict] = None) -> dict:
     """
     Run the comparison the page asked for.
 
@@ -285,6 +269,14 @@ def evaluate(spec: dict) -> dict:
     """
     import eegio_eval as E
 
+    offline = spec.get("offline", False)
+    if type(offline) is not bool:
+        raise ValueError("offline must be a boolean")
+    if spec.get("non_causal_test"):
+        raise ValueError("The short-window mode has been retired. Refresh the EEG-IO test page.")
+    if offline and target != "host":
+        raise ValueError("Offline comparison requires local inference")
+    evaluate_model = evaluate_model or E.evaluate_subjects
     runs = [r for r in (spec.get("runs") or []) if r]
     if not runs:
         raise ValueError("pick at least one run")
@@ -301,13 +293,17 @@ def evaluate(spec: dict) -> dict:
 
     cfg = E.EvalConfig(
         channel=int(spec.get("channel") or 0),
-        hop=int(spec.get("hop") or 32),
+        hop=int(spec.get("hop") or E.EvalConfig.hop),
         zero_phase=bool(spec.get("zero_phase")),
         notch_hz=None if spec.get("no_notch") else E.POWERLINE_HZ,
         include_soft=bool(spec.get("include_soft")),
         detect_k=float(spec.get("detect_k") or 4.0),
         target_fs=float(spec.get("target_fs") or E.PROJECT_FS),
+        adjusted_blink_count=lookahead_comparison is not None,
     )
+    checkpoints = {}
+    if offline:
+        cfg, checkpoints = E.prepare_offline(runs, cfg)
 
     by_name = {r["name"]: r for r in available_runs()}
     mismatched = [
@@ -317,17 +313,50 @@ def evaluate(spec: dict) -> dict:
         if r in by_name and by_name[r]["train_fs"] != cfg.target_fs
     ]
 
-    results = [E.evaluate_subjects(data_dir, r, subjects, cfg) for r in runs]
+    subject_count = len(subjects)
+    total = len(runs) * subject_count
+
+    def report(update):
+        if on_progress:
+            on_progress({**update, "model": run, "model_index": index + 1,
+                         "n_models": len(runs), "n_subjects": subject_count, "total": total,
+                         "completed": index * subject_count + update.get("completed_subjects", 0)})
+
+    results = []
+    reference_thresholds_uv = None
+    for index, run in enumerate(runs):
+        report({"phase": "loading_model"})
+        results.append(evaluate_model(data_dir, run, subjects, cfg,
+                                      on_progress=report if on_progress else None,
+                                      **({"checkpoint": checkpoints[run]} if offline else {}),
+                                      **({"reference_thresholds_uv": reference_thresholds_uv}
+                                         if reference_thresholds_uv is not None else {})))
+        if cfg.adjusted_blink_count and index == 0:
+            reference_thresholds_uv = {
+                row["subject"]: row["metric_support"]["adjusted_blink_count"]["threshold_uv"]
+                for row in results[0]["rows"]
+            }
+    if on_progress:
+        on_progress({"phase": "saving", "completed": total, "total": total})
     from datetime import datetime
 
+    hop = None if offline else cfg.hop
     out = _finite({
         # What produced this, so a file found next week can be read. The
         # settings matter as much as the numbers: the same models at another
         # hop or another rate are a different measurement.
         "saved": {
             "at": datetime.now().isoformat(timespec="seconds"),
-            "data_dir": data_dir, "n_subjects": n,
-            "channel": cfg.channel, "hop": cfg.hop, "target_fs": cfg.target_fs,
+            "target": target,
+            **({"replay_mode": spec.get("replay_mode", "paced")} if target == "pi5" else {}),
+            **({"lookahead_comparison": lookahead_comparison} if lookahead_comparison is not None else {}),
+            **({"blink_count_adjustment": {
+                "reference_run": runs[0], "source": "output",
+                "mean_absolute_amplitude_multiplier": E.BLINK_THRESHOLD_MULTIPLIER,
+            }} if cfg.adjusted_blink_count else {}),
+            **({"offline_window": results[0]["config"]["offline_window"]} if offline else {}),
+            "data_dir": data_dir, "n_subjects": subject_count,
+            "channel": cfg.channel, "hop": hop, "target_fs": cfg.target_fs,
             "zero_phase": cfg.zero_phase, "notch_hz": cfg.notch_hz,
             "include_soft": cfg.include_soft, "detect_k": cfg.detect_k,
             "band_hz": list(cfg.band),
@@ -345,11 +374,13 @@ def evaluate(spec: dict) -> dict:
         "tests": E.compare(results),
         "subjects": subjects,
         "baseline": runs[0],
-        "hop": cfg.hop,
+        "hop": hop,
         "target_fs": cfg.target_fs,
         "native_fs": E.EEGIO_FS,
         "causality": results[0]["causality"],
         "metrics": list(E.METRIC_PATHS),
+        "metric_protocol": E.METRIC_PROTOCOL,
+        "legacy_metrics": list(E.LEGACY_METRIC_PATHS),
     })
     # Saved before it is returned, so a result exists on disk even if the
     # page that asked for it is closed before the answer arrives.

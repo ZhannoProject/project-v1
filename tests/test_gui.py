@@ -180,6 +180,24 @@ class ConfigIOTests(unittest.TestCase):
 
 
 class TrainingJobTests(unittest.TestCase):
+    def test_training_sequence_keeps_the_log_and_resets_the_curve_per_model(self):
+        job = TrainingJob()
+        steps = []
+        for label, loss in [("first", 0.1), ("second", 0.2)]:
+            log = f"[fit | Epoch 1/1]\n→ val_loss = {loss} RRMSE_t=0.7 RRMSE_f=0.6 CC=0.8"
+            steps.append({"label": label, "command": [sys.executable, "-c", f"print({log!r})"]})
+        job.start_steps(steps, ROOT)
+        for _ in range(100):
+            if not job.running:
+                break
+            time.sleep(.02)
+        status = job.status()
+        self.assertEqual(status["returncode"], 0)
+        self.assertEqual([s["returncode"] for s in status["steps"]], [0, 0])
+        self.assertEqual([m["val_loss"] for m in status["metrics"]], [0.2])
+        self.assertIn("=== step 1/2: first ===", status["lines"])
+        self.assertIn("=== step 2/2: second ===", status["lines"])
+
     def test_lines_are_buffered_incrementally_and_stop_works(self):
         job = TrainingJob()
         job.start([sys.executable, "-c", "import time\nfor i in range(3): print('line', i)\ntime.sleep(30)"], ROOT)
@@ -201,6 +219,7 @@ class TrainingJobTests(unittest.TestCase):
     def test_train_command_uses_this_interpreter(self):
         cmd = build_train_command("tcn_eog.yaml", "--max_epochs 2 --staged")
         self.assertEqual(cmd, [sys.executable, "-m", "trainer", "--config", "configs/tcn_eog.yaml",
+                               "--profile", "gui",
                                "--max_epochs", "2", "--staged"])
         with self.assertRaises(ValueError):
             build_train_command("../evil.yaml")
@@ -593,6 +612,7 @@ class ApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = _TempConfigs().__enter__()
+        cls.addClassCleanup(cls.tmp.__exit__, None, None, None)
         cls.srv = GUIServer("127.0.0.1", 0)
         cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
         cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
@@ -602,7 +622,6 @@ class ApiTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown(); cls.srv.server_close()
-        cls.tmp.__exit__(None, None, None)
 
     @contextlib.contextmanager
     def no_runs(self, *taken):
@@ -640,6 +659,9 @@ class ApiTests(unittest.TestCase):
         status, meta = self.call("/api/meta")
         self.assertEqual(status, 200)
         self.assertIn("tcn_mla_bi", meta["choices"]["variants"])
+        self.assertIn("tcn_channelnorm", meta["choices"]["variants"])
+        self.assertEqual(meta["variant_settings"]["tcn_channelnorm"],
+                         {"se_reduction": None, "tcn_norm": "channel"})
         self.assertEqual([s["title"] for s in meta["schema"]][:2], ["Model", "Data"])
         self.assertTrue({"tcn_eog.yaml", "tcn_mla_eog_kd.yaml"} <= set(meta["configs"]))
         self.assertEqual(meta["datalists"]["checkpoints"], ["./runs/demo_bi_eog/best.pt"])
@@ -887,34 +909,6 @@ class ApiTests(unittest.TestCase):
             self.assertIn(held.id, [j["id"] for j in jobs.summaries()])
         finally:
             jobs.stop_all()
-
-    def test_a_run_is_named_after_the_directory_it_writes(self):
-        """Four runs of one preset differ only in save_dir, so that is the
-        label that tells them apart on the switcher."""
-        self.assertEqual(server._train_title("tcn_se_both.yaml",
-                                             ["python", "--save_dir", "runs/tcn_se_la1_both_s54"]),
-                         "tcn_se_la1_both_s54")
-        # A preset that names its own save_dir: that is the path, so that is
-        # the label.
-        self.assertEqual(server._train_title("tcn_se_both.yaml", ["python"]), "tcn_se_both")
-
-    def test_a_run_with_no_save_dir_is_named_after_the_one_it_derives(self):
-        """Naming it after the preset gave every run from one file the same
-        pill -- and hid that they derive one directory and overwrite each
-        other. The label repeats the trainer's own derivation instead."""
-        cmd = ["python", "-m", "trainer", "--variant", "tcn_se_la8",
-               "--artifact", "BOTH", "--master_seed", "54"]
-        # No preset to read: derived from the flags alone.
-        self.assertEqual(server._train_title("not_a_preset.yaml", cmd), "tcn_se_la8_both_s54")
-        # Seed 42 keeps the bare name, the rule the trainer follows.
-        self.assertEqual(
-            server._train_title("not_a_preset.yaml", cmd[:-2] + ["--master_seed", "42"]),
-            "tcn_se_la8_both")
-        # A preset that pins save_dir wins over the derivation, because that
-        # is what the trainer does: overriding --variant on such a preset
-        # sends the run to the preset's directory, not a derived one, and the
-        # label has to say where it will really land.
-        self.assertEqual(server._train_title("tcn_eog.yaml", cmd), "tcn_eog")
 
     def test_two_live_runs_deriving_one_directory_get_different_pills(self):
         """They will overwrite each other, which the switcher cannot fix --
@@ -1352,8 +1346,8 @@ class LookaheadPageTests(unittest.TestCase):
         rungs are compared, so both carry the share — one is not enough, and
         two spellings of it would be worse than none.
         """
-        self.assertIn("state.la.meta.shares", self.PAGE)
-        self.assertIn("${n} — tcn_se_la${n}${tail}", self.PAGE)
+        self.assertIn("family.shares", self.PAGE)
+        self.assertIn("${n} — ${variant}_la${n}${tail}", self.PAGE)
         label = re.search(r"const label = r\.unbounded(.*?);\n", self.PAGE, re.S)
         self.assertIsNotNone(label, "the rung label was not found")
         self.assertIn("share", label.group(0), "the rung column drops the share")
@@ -1484,6 +1478,7 @@ class NativeAndBundleTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "app bundles are macOS-only")
     def test_make_app_builds_a_launcher_bundle(self):
         import plistlib
+        from importlib.util import find_spec
         from gui.make_app import build_app
         with tempfile.TemporaryDirectory() as tmp:
             app = build_app(Path(tmp), python="/venv/bin/python", root=Path("/proj/ect"))
@@ -1502,8 +1497,12 @@ class NativeAndBundleTests(unittest.TestCase):
             self.assertEqual(info["CFBundleExecutable"], "launch")
             self.assertEqual(info["CFBundleIdentifier"], "local.eeg-denoise.training-gui")
             self.assertIn("NSDesktopFolderUsageDescription", info)
-            if shutil.which("iconutil"):
-                self.assertTrue((app / "Contents" / "Resources" / "icon.icns").is_file())
+            if find_spec("PIL"):
+                from PIL import Image
+                with Image.open(app / "Contents" / "Resources" / "icon.icns") as icon:
+                    self.assertEqual(icon.format, "ICNS")
+                    self.assertEqual(icon.size, (1024, 1024))
+                    self.assertGreater(len(icon.info["sizes"]), 1)
                 self.assertEqual(info["CFBundleIconFile"], "icon")
             # rebuilding replaces the previous bundle
             build_app(Path(tmp))

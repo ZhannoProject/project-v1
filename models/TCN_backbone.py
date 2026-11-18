@@ -4,7 +4,7 @@ Causal Temporal Convolutional Network (TCN) building blocks.
 This file provides three levels of abstraction:
 
   CausalConv1d        — single causal convolution (left-padding only)
-  ResidualBlock       — two CausalConv1d + PReLU + BN + Dropout + skip
+  ResidualBlock       — two CausalConv1d + PReLU + ChannelNorm + Dropout + skip
   CausalTCNBackbone   — stack of ResidualBlocks with configurable dilations
 
 CausalTCNBackbone replaces the old EEGCausualAllCNN. The key change is
@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List
 
+from models.causal_config import ChannelNorm
 from models.lookahead import allocate
 
 
@@ -146,6 +147,7 @@ class CausalSE(nn.Module):
         # position it scales, which a nonzero lookahead is precisely not.
         self.causal = causal and not self.lookahead
         self.reduction = reduction
+        self.pool_window = None  # finite history is opt-in and saved by the model factory
         # 1x1 convolutions rather than Linear: they apply per timestep without
         # any reshaping, which keeps the whole module in (B, C, T).
         self.fc1 = nn.Conv1d(channels, hidden, kernel_size=1)
@@ -154,6 +156,10 @@ class CausalSE(nn.Module):
 
     def squeeze(self, x: torch.Tensor) -> torch.Tensor:
         """(B, C, T) -> (B, C, T): the context each position is allowed."""
+        if self.pool_window is not None:
+            w = self.pool_window
+            left = w - 1 if self.causal else (w - 1) // 2
+            return F.avg_pool1d(F.pad(x, (left, w - 1 - left)), w, stride=1)
         if self.global_pool:
             return x.mean(dim=2, keepdim=True).expand_as(x)
         T = x.shape[2]
@@ -179,10 +185,10 @@ class CausalSE(nn.Module):
 class ResidualBlock(nn.Module):
     """
     A Temporal Convolutional Network (TCN) Residual Block containing two Causal Conv
-    layers, activation functions, batch normalization, and dropout.
+    layers, activation functions, channel normalization, and dropout.
 
-        x → CausalConv → PReLU → BN → Dropout
-          → CausalConv → PReLU → BN → Dropout → (+shortcut) → out
+        x → CausalConv → PReLU → ChannelNorm → Dropout
+          → CausalConv → PReLU → ChannelNorm → Dropout → (+shortcut) → out
 
     If in_channels != out_channels, a 1×1 conv aligns the skip path.
     ``causal`` is passed straight to both convolutions; the 1×1 shortcut
@@ -206,12 +212,12 @@ class ResidualBlock(nn.Module):
             CausalConv1d(in_channels, out_channels, kernel_size, dilation, causal=causal,
                          lookahead=la1),
             nn.PReLU(),
-            nn.BatchNorm1d(out_channels),
+            ChannelNorm(out_channels),
             nn.Dropout(dropout),
             CausalConv1d(out_channels, out_channels, kernel_size, dilation, causal=causal,
                          lookahead=la2),
             nn.PReLU(),
-            nn.BatchNorm1d(out_channels),
+            ChannelNorm(out_channels),
             nn.Dropout(dropout),
         )
 

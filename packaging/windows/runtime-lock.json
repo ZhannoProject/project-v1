@@ -1,0 +1,36 @@
+{
+  "python": "3.13.9",
+  "dotnet": "10.0.14",
+  "assets": [
+    {
+      "name": "python",
+      "filename": "python-3.13.9-embed-arm64.zip",
+      "url": "https://www.python.org/ftp/python/3.13.9/python-3.13.9-embed-arm64.zip",
+      "sha256": "cba392bd5c7aed68b26d1b523822cc3d80802c085481dfde79262ebfc7179d26",
+      "size": 10328622
+    },
+    {
+      "name": "dotnet",
+      "filename": "dotnet-runtime-10.0.14-win-arm64.zip",
+      "url": "https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.14/dotnet-runtime-10.0.14-win-arm64.zip",
+      "sha512": "8690d0dd94ce1d4df66dd34f85b9f86e81ed5db0c4e5fcd281e5d379b9abd0018547556d1d7e8c0ce33a55ac69835c788c8da7c583fc0f58ccbdd6de227a0294",
+      "sha256": "a1cf63efd2f90376997103ee4f9edd6a50f638965c1910de368f488d42db7625",
+      "size": 35313557
+    },
+    {
+      "name": "desktop",
+      "filename": "windowsdesktop-runtime-10.0.14-win-arm64.zip",
+      "url": "https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/10.0.14/windowsdesktop-runtime-10.0.14-win-arm64.zip",
+      "sha512": "812d1f97bdf9d66a47de148012470280f88d25fc00a2d0698401ac9173a1de5e983f48854768bc0db2996d708c0cfbf4704d1dc5674e29b4fcfa884ebd787412",
+      "sha256": "75899708f5baadc28436df8503eb53bd6730eec85422bb3baa259b8517308f51",
+      "size": 35326821
+    },
+    {
+      "name": "vcredist",
+      "filename": "VC_redist.arm64.exe",
+      "url": "https://aka.ms/vs/17/release/vc_redist.arm64.exe",
+      "sha256": "5139e1440c3a20b92153a4db561c069a0175aaf76c276c3e5b6f56099edcf4b0",
+      "size": 11722336
+    }
+  ]
+}

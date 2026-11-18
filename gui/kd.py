@@ -176,12 +176,10 @@ def _control_for(kd_row: dict, rows: Sequence[dict]) -> Optional[dict]:
 def _load(run: str):
     """Build a model from a run's own checkpoint, without the export guards."""
     import torch
-    from models.variants import build_model_from_config
 
-    ck = torch.load(_runs_dir() / run / "best.pt", map_location="cpu", weights_only=False)
-    model = build_model_from_config(dict(ck["model_config"]))
-    model.load_state_dict(ck["model_state"])
-    return model.eval(), ck
+    from experiment.checkpoints import load_model
+    model, _, ck = load_model(_runs_dir() / run / "best.pt")
+    return model, ck
 
 
 def static_checks(student: str, teacher_run: Optional[str] = None) -> dict:
@@ -314,7 +312,7 @@ def static_checks(student: str, teacher_run: Optional[str] = None) -> dict:
 # The decomposition
 # ============================================================
 def _loader(artifact: str, master_seed: int, batch_size: int = 32,
-            target_fs: Optional[float] = None):
+            target_fs: Optional[float] = None, protocol: Optional[dict] = None):
     """
     The validation split a run was scored on.
 
@@ -326,9 +324,10 @@ def _loader(artifact: str, master_seed: int, batch_size: int = 32,
     teacher. The rate comes from the run's own history.
     """
     from data.Dataloader import build_dataloaders
+    options = dict(artifact_type=artifact, master_seed=master_seed, target_fs=target_fs)
+    options.update(protocol or {})
     _, val, _ = build_dataloaders(str(PROJECT_ROOT / "data" / "EEGdenoisenet" / "data"),
-                                  artifact_type=artifact, batch_size=batch_size,
-                                  master_seed=master_seed, target_fs=target_fs)
+                                  batch_size=batch_size, **options)
     return val
 
 
@@ -339,13 +338,22 @@ def _score(model, artifact: str, master_seed: int,
     import torch
 
     import metrics
+    from data.protocol import evaluation_data
+    protocol = evaluation_data(model, master_seed, artifact)
+    # This replays the teacher reference recorded during a historical KD run:
+    # the teacher saw the student's resampled inputs, even when its own
+    # original training rate differed. New KD runs reject that mismatch.
+    if target_fs is not None:
+        protocol["target_fs"] = target_fs
 
     agg, n = {"rrmse_t": 0.0, "rrmse_s": 0.0, "acc": 0.0}, 0
     with torch.no_grad():
-        for i, b in enumerate(_loader(artifact, master_seed, target_fs=target_fs)):
+        for i, b in enumerate(_loader(artifact, master_seed, target_fs=target_fs, protocol=protocol)):
             if max_batches is not None and i >= max_batches:
                 break
-            m = metrics.compute_all_metrics(model(b["noisy"]), b["clean"])
+            from experiment.methodology import aligned
+            pred, clean = aligned(model(b["noisy"]), b["clean"], model)
+            m = metrics.compute_all_metrics(pred, clean)
             bs = b["noisy"].size(0)
             for k in agg:
                 agg[k] += float(m[k]) * bs
@@ -368,20 +376,30 @@ def decompose(teacher_run: str, students: Sequence[str], artifact: str = "BOTH",
 
     teacher, _ = _load(teacher_run)
     models = {s: _load(s)[0] for s in students}
+    from data.protocol import evaluation_data
+    protocol = evaluation_data(teacher, master_seed, artifact)
+    for model in models.values():
+        if evaluation_data(model, master_seed, artifact) != protocol:
+            raise ValueError("KD decomposition requires matching teacher/student data protocols")
+    from experiment.methodology import aligned, settings
+    crop_keys = ("valid_history_samples", "valid_future_samples")
+    for model in models.values():
+        if any(settings(model).get(k) != settings(teacher).get(k) for k in crop_keys):
+            raise ValueError("KD decomposition requires the same common target interval")
 
     tot = 0
     tg = 0.0
     acc = {s: {"st": 0.0, "cross": 0.0, "sg": 0.0} for s in students}
     with torch.no_grad():
-        for i, b in enumerate(_loader(artifact, master_seed, target_fs=target_fs)):
+        for i, b in enumerate(_loader(artifact, master_seed, target_fs=target_fs, protocol=protocol)):
             if i >= max_batches:
                 break
             x, g = b["noisy"], b["clean"]
-            T = teacher(x)
+            T, g = aligned(teacher(x), g, teacher)
             tg += float(((T - g) ** 2).sum())
             tot += g.numel()
             for s, m in models.items():
-                y = m(x)
+                y, _ = aligned(m(x), b["clean"], m)
                 acc[s]["st"] += float(((y - T) ** 2).sum())
                 acc[s]["cross"] += float((2 * (y - T) * (T - g)).sum())
                 acc[s]["sg"] += float(((y - g) ** 2).sum())

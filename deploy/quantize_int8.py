@@ -105,12 +105,11 @@ class TrainSplitCalibration:
 
     def __init__(self, data_dir: str, artifact: str, master_seed: int,
                  n_batches: int = 16, batch_size: int = 32,
-                 input_name: str = INPUT_NAME):
+                 input_name: str = INPUT_NAME, data_options: dict | None = None):
         from data.Dataloader import build_dataloaders
 
-        train_loader, _, _ = build_dataloaders(
-            data_dir, artifact_type=artifact, batch_size=batch_size,
-            master_seed=master_seed)
+        options = data_options or dict(artifact_type=artifact, master_seed=master_seed)
+        train_loader, _, _ = build_dataloaders(data_dir, batch_size=batch_size, **options)
         self.batches: List[Dict[str, np.ndarray]] = []
         for i, batch in enumerate(train_loader):
             if i >= n_batches:
@@ -327,10 +326,24 @@ def _latency_ms(run: Callable[[np.ndarray], np.ndarray], seq_len: int = 512,
             "p95_ms": round(float(np.percentile(times, 95)), 3)}
 
 
+def _source_data_options(source, master_seed=None, artifact=None):
+    from types import SimpleNamespace
+    from data.protocol import evaluation_data
+    cfg = dict(source.get("data_protocol") or {})
+    prov, prep = source.get("provenance") or {}, source.get("preprocessing") or {}
+    cfg.setdefault("master_seed", prov.get("trained_master_seed"))
+    cfg.setdefault("artifact", prov.get("trained_artifact") or prep.get("artifact_trained_on"))
+    cfg.setdefault("target_fs", prep.get("sample_rate_hz"))
+    cfg.setdefault("normalization", prep.get("normalization", "epoch"))
+    cfg.setdefault("normalization_scale", prep.get("normalization_scale"))
+    return evaluation_data(SimpleNamespace(run_config=cfg, checkpoint_loaded=True),
+                           master_seed, artifact)
+
+
 def verify_int8(fp32_onnx: str | Path, int8_onnx: str | Path, seq_len: int = 512,
-                data_dir: Optional[str] = None, artifact: str = "BOTH",
-                master_seed: int = 42, max_batches: Optional[int] = None,
-                n_threads: int = 2) -> dict:
+                data_dir: Optional[str] = None, artifact: str = None,
+                master_seed: int = None, max_batches: Optional[int] = None,
+                n_threads: int = 2, data_options: dict | None = None) -> dict:
     """
     Everything that has to be true of the quantized graph before it is used.
 
@@ -389,10 +402,16 @@ def verify_int8(fp32_onnx: str | Path, int8_onnx: str | Path, seq_len: int = 512
 
     # ---- what it costs in accuracy, on the real test split ----
     if data_dir:
-        report["master_seed"] = master_seed
+        source_json = Path(fp32_onnx).with_suffix(".json")
+        source = json.loads(source_json.read_text()) if source_json.exists() else {}
+        if data_options is None:
+            data_options = _source_data_options(source, master_seed, artifact)
+        report["master_seed"] = data_options["master_seed"]
         report["test_metrics"] = evaluate_backends(
             {"fp32": run32, "int8": run8},
             data_dir, artifact, master_seed, max_batches,
+            data_options=data_options,
+            score_config=source.get("data_protocol") or {},
         )
         m = report["test_metrics"]
         report["test_metrics"]["delta_int8_minus_fp32"] = {
@@ -408,9 +427,9 @@ def quantize_checkpoint_graph(
     fp32_onnx: str | Path,
     out_dir: Optional[str | Path] = None,
     data_dir: Optional[str] = None,
-    artifact: str = "BOTH",
-    master_seed: int = 42,
-    seq_len: int = 512,
+    artifact: str = None,
+    master_seed: int = None,
+    seq_len: int = None,
     activation: str = "uint8",
     per_channel: bool = True,
     calibrate_method: str = "percentile",
@@ -433,10 +452,18 @@ def quantize_checkpoint_graph(
     stem = fp32_onnx.stem
     suffix = "_int8" if not op_types else "_int8conv"
     int8_path = out_dir / f"{stem}{suffix}.onnx"
+    source_json = fp32_onnx.with_suffix(".json")
+    source = json.loads(source_json.read_text()) if source_json.exists() else {}
+    prep = source.get("preprocessing") or {}
+    seq_len = seq_len or prep.get("window_samples") or 512
+    options = None
+    if data_dir:
+        options = _source_data_options(source, master_seed, artifact)
+        master_seed, artifact = options["master_seed"], options["artifact_type"]
 
     if data_dir:
         calib = TrainSplitCalibration(data_dir, artifact, master_seed,
-                                      n_batches=n_calib_batches)
+                                      n_batches=n_calib_batches, data_options=options)
         calib_desc = {"source": "train split", "artifact": artifact,
                       "master_seed": master_seed, "windows": calib.n_windows}
     else:
@@ -451,7 +478,7 @@ def quantize_checkpoint_graph(
     verification = verify_int8(fp32_onnx, int8_path, seq_len=seq_len,
                                data_dir=data_dir, artifact=artifact,
                                master_seed=master_seed, max_batches=max_batches,
-                               n_threads=n_threads)
+                               n_threads=n_threads, data_options=options)
 
     sidecar = {
         "source_graph": str(fp32_onnx.relative_to(PROJECT_ROOT)
@@ -462,10 +489,12 @@ def quantize_checkpoint_graph(
                          "dtype": "float32"},
                "output": {"name": OUTPUT_NAME, "shape": ["batch", 1, seq_len],
                           "dtype": "float32"}},
-        "preprocessing": {"sample_rate_hz": SAMPLE_RATE_HZ,
+        "preprocessing": prep or {"sample_rate_hz": SAMPLE_RATE_HZ,
                           "window_samples": seq_len,
                           "normalise": "x / max(std(x), 1e-8) per window, "
                                        "rescaled afterwards (as in fp32)"},
+        "provenance": source.get("provenance", {}),
+        "data_protocol": source.get("data_protocol", {}),
         "verification": verification,
     }
     json_path = out_dir / f"{stem}{suffix}.json"
@@ -511,11 +540,11 @@ def main(argv=None):
                     help="EEGdenoiseNet .npy directory; calibration and metrics "
                          "need it. Without it the graph is calibrated on synthetic "
                          "windows and marked as such.")
-    ap.add_argument("--artifact", default="BOTH", choices=["EOG", "EMG", "BOTH"])
-    ap.add_argument("--master_seed", type=int, default=42,
+    ap.add_argument("--artifact", default=None, choices=["EOG", "EMG", "BOTH"])
+    ap.add_argument("--master_seed", type=int, default=None,
                     help="the seed the checkpoint was trained with; it picks the "
                          "split the calibration and the metrics come from")
-    ap.add_argument("--seq_len", type=int, default=512)
+    ap.add_argument("--seq_len", type=int, default=None)
     ap.add_argument("--activation", default="uint8", choices=list(ACTIVATION_TYPES))
     ap.add_argument("--calibrate_method", default="percentile", choices=list(CALIBRATORS),
                     help="percentile is the measured best here; minmax is the one "

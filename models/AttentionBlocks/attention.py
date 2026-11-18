@@ -151,7 +151,14 @@ class CausalMHA(nn.Module):
         # Scaled dot-product attention; the mask is skipped in bidirectional
         # (teacher) mode so every position sees the whole window
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        if self.causal:
+        window = getattr(self, "attention_window", None)
+        if window is not None:
+            idx = torch.arange(T, device=x.device)
+            distance = idx[:, None] - idx[None, :]
+            allowed = ((distance >= 0) & (distance < window) if self.causal
+                       else distance.abs() < window)
+            att = att.masked_fill(~allowed, float("-inf"))
+        elif self.causal:
             att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
 
@@ -288,7 +295,14 @@ class CausalMLA(nn.Module):
         # Scaled dot-product attention; the mask is skipped in bidirectional
         # (teacher) mode so every position sees the whole window
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        if self.causal:
+        window = getattr(self, "attention_window", None)
+        if window is not None:
+            idx = torch.arange(T, device=x.device)
+            distance = idx[:, None] - idx[None, :]
+            allowed = ((distance >= 0) & (distance < window) if self.causal
+                       else distance.abs() < window)
+            att = att.masked_fill(~allowed, float("-inf"))
+        elif self.causal:
             att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
 

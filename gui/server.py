@@ -34,8 +34,12 @@ Local HTTP server behind the training GUI (stdlib only).
     POST /api/eegio/evaluate     {runs, n_subjects, ...} → suppression, fidelity,
                                  residual detections and onset lead per subject,
                                  paired by subject between models
+                                 ?progress=1 streams progress and the final result as NDJSON
     GET  /api/eegio/results      every saved EEG-IO comparison, newest first
     GET  /api/eegio/result?name=X    one of them, in full
+    POST /api/eegio/pi/run        start paced replay of selected runs over SSH
+    GET  /api/eegio/pi/status     progress and saved result for the Pi replay
+    POST /api/eegio/pi/stop       stop the Pi replay identified by its job id
     GET  /api/kd/meta            distilled runs, their teachers and their controls
     GET  /api/kd/checks?student=X    the six KD invariants, with their evidence
     POST /api/kd/decompose       {teacher, students, ...} → ||S-G||^2 split into
@@ -69,18 +73,17 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 from data import Dataloader
-from gui import config_io, eegio_tab, kd, lookahead, params, pi, rfsweep
-# The one place the "seed 42 keeps the bare name" rule is written down; the
-# run titles have to derive the same path the trainer will.
-from trainer.__main__ import DEFAULT_MASTER_SEED
+from gui import config_io, eegio_pi, eegio_tab, kd, lookahead, params, pi, rfsweep, channels
 from gui.config_io import PROJECT_ROOT, RUNS_DIR
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -111,6 +114,7 @@ class Job:
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._closing = False
         self._proc: subprocess.Popen | None = None
         self._lines: collections.deque = collections.deque(maxlen=self.MAX_LINES)
         self._offset = 0                       # index of _lines[0] in the full stream
@@ -130,6 +134,7 @@ class Job:
         # that will not come back.  Output from an older generation is dropped
         # rather than appended to whatever is running now.
         self._gen = 0
+        self._stop_file = Path(tempfile.gettempdir()) / f'eeg-gui-stop-{uuid4().hex}'
         self._reset_state()
 
     # ---- subclass hooks ----
@@ -166,6 +171,8 @@ class Job:
         if not steps:
             raise ValueError("nothing to run")
         with self._lock:
+            if self._closing:
+                raise RuntimeError("Task manager is shutting down")
             if self._active:
                 raise RuntimeError(f"a {self.KIND} job is already in progress")
             self._lines.clear()
@@ -178,6 +185,7 @@ class Job:
             self.started = datetime.now().isoformat(timespec="seconds")
             self.returncode = None
             self._cancelled = False
+            self._stop_file.unlink(missing_ok=True)
             self._active = True
             self._gen += 1
             gen = self._gen
@@ -185,6 +193,15 @@ class Job:
             if log_path:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
         threading.Thread(target=self._run_steps, args=(cwd, gen), daemon=True).start()
+
+    def reopen(self):
+        with self._lock:
+            self._closing = False
+
+    def shutdown(self):
+        with self._lock:
+            self._closing = True
+        self.stop()
 
     def _append(self, line: str):
         """Add one line to the buffer.  Caller holds the lock."""
@@ -224,12 +241,16 @@ class Job:
                         self._emit(f"[gui] {step['label']} exited {rc} — "
                                    "the remaining steps were not run", log, gen)
                     break
+        except Exception as exc:
+            rc = 1
+            self._emit(f'[gui] {type(exc).__name__}: {exc}', log, gen)
         finally:
             with self._lock:
                 if gen == self._gen:
                     self.returncode = rc
                     self._proc = None
                     self._active = False
+                    self._stop_file.unlink(missing_ok=True)
             if log:
                 log.write(f"\n[exit code {rc}]\n")
                 log.close()
@@ -254,14 +275,28 @@ class Job:
         with self._lock:
             if self._cancelled:
                 return None
+            command = list(step['command'])
+            if os.name == 'nt' and command[0] == sys.executable:
+                command[1:1] = ['-X', 'utf8']
             self._proc = subprocess.Popen(
-                step["command"], cwd=str(cwd),
+                command, cwd=str(cwd),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
-                env={**os.environ, "PYTHONUNBUFFERED": "1", **step.get("env", {})},
+                text=True, encoding='utf-8', errors='replace', bufsize=1,
+                env={**os.environ, "PYTHONUNBUFFERED": "1", 'PYTHONUTF8': '1',
+                     'EEG_GUI_STOP_FILE': str(self._stop_file), **step.get("env", {})},
                 start_new_session=(os.name == "posix"),
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
             )
+            if os.name == 'nt':
+                from gui.win_process import ProcessTree
+                try:
+                    self._proc._eeg_tree = ProcessTree(self._proc)
+                except BaseException:
+                    self._proc.kill()
+                    self._proc.wait()
+                    self._proc.stdout.close()
+                    raise
             return self._proc
 
     def _run_one(self, step: dict, cwd: Path, log, gen: int) -> int:
@@ -279,6 +314,8 @@ class Job:
                 proc.stdout.close()
             except (OSError, ValueError):
                 pass
+            if os.name == 'nt' and hasattr(proc, '_eeg_tree'):
+                proc._eeg_tree.close()
         return proc.wait()
 
     # ---- stopping ----
@@ -319,6 +356,23 @@ class Job:
         outlive the SIGTERM sent to bash, and the job stayed "running" with
         nothing left to stop.
         """
+        if os.name == 'nt':
+            # The channel driver can save a stopped manifest and stop its Pi
+            # process cooperatively before the whole local tree is terminated.
+            self._stop_file.touch()
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+            if hasattr(proc, '_eeg_tree'):
+                proc._eeg_tree.terminate()
+            elif proc.poll() is None:
+                proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            return
         group = self._session_of(proc)
         self._signal(proc, group, signal.SIGTERM)
         try:
@@ -355,7 +409,7 @@ class Job:
                 self._gen += 1
                 self._proc = None
                 self._active = False
-                self.returncode = -int(signal.SIGKILL)
+                self.returncode = -9
                 self._append("[gui] stopped — something this step started is still holding "
                              "its output pipe open, so the job was let go of rather than "
                              "left running")
@@ -370,18 +424,18 @@ class Job:
             steps = [{"label": s["label"], "returncode": s["returncode"],
                       "command": " ".join(shlex.quote(c) for c in s["command"])}
                      for s in self.steps]
-        return {
-            **extra,
-            "kind": self.KIND,
-            "id": self.id, "title": self.title,
-            "running": self.running,
-            "returncode": self.returncode,
-            "command": " ".join(shlex.quote(c) for c in self.command),
-            "steps": steps, "step": self.step,
-            "started": self.started,
-            "log_path": str(self.log_path) if self.log_path else None,
-            "since": since, "next": nxt, "lines": lines,
-        }
+            return {
+                **extra,
+                "kind": self.KIND,
+                "id": self.id, "title": self.title,
+                "running": self.running,
+                "returncode": self.returncode,
+                "command": " ".join(shlex.quote(c) for c in self.command),
+                "steps": steps, "step": self.step,
+                "started": self.started,
+                "log_path": str(self.log_path) if self.log_path else None,
+                "since": since, "next": nxt, "lines": lines,
+            }
 
 
 class TrainingJob(Job):
@@ -416,6 +470,7 @@ class TrainingJob(Job):
         self._metrics: list[dict] = []         # one record per finished epoch
         self._epoch: dict | None = None        # epoch in progress
         self._max_epochs: int | None = None
+        self._metrics_step = 0
 
     def _scan(self, line: str):
         """Pull epoch boundaries and validation metrics out of one log line.
@@ -424,6 +479,9 @@ class TrainingJob(Job):
         header has been seen, so the teacher's reference pass that KDTrainer
         runs before training starts is ignored.
         """
+        if self._metrics_step != self.step:
+            self._reset_state()
+            self._metrics_step = self.step
         m = self.EPOCH_RE.search(line)
         if m:
             self._epoch = {"epoch": int(m.group(2)), "phase": m.group(1).strip()}
@@ -460,6 +518,22 @@ class TooManyJobs(RuntimeError):
     """
 
 
+def training_command_config(command, cwd):
+    """Resolve the child CLI's schema before reserving an output directory."""
+    if len(command) < 3 or command[1:3] != ["-m", "trainer"]:
+        return None, None
+    from trainer.__main__ import build_parser
+    from configs import load_config, merge_cli_overrides
+    from experiment.config import resolve_config, resolve_save_dir
+    try:
+        args = build_parser().parse_args(command[3:])
+    except SystemExit as exc:
+        raise ValueError("Invalid training command") from exc
+    values = load_config(str(Path(cwd) / args.config)) if args.config else {}
+    cfg = resolve_save_dir(resolve_config(merge_cli_overrides(values, args)), Path(cwd))
+    return cfg, (Path(cwd) / cfg["save_dir"]).resolve()
+
+
 class TrainingJobs:
     """
     Several training runs at once, each with its own log, buffer and curve.
@@ -493,12 +567,13 @@ class TrainingJobs:
     def __init__(self, factory=TrainingJob):
         self._factory = factory
         self._lock = threading.Lock()
+        self._closing = False
         self._jobs: "collections.OrderedDict[str, Job]" = collections.OrderedDict()
 
     # ---- identity ----
     def _new_id(self, stamp: str) -> str:
-        """``gui_train_<stamp>``, with a suffix if that second is taken."""
-        base = f"gui_train_{stamp}"
+        """Unique across GUI processes/restarts as well as this registry."""
+        base = f"gui_train_{stamp}_{uuid4().hex}"
         if base not in self._jobs:
             return base
         n = 2
@@ -519,21 +594,56 @@ class TrainingJobs:
             return self.MAX_ACTIVE - len([j for j in self._jobs.values() if j.running])
 
     def start(self, command: list[str], cwd: Path, runs_dir: Path, title: str = "") -> Job:
+        cfg, output_dir = training_command_config(command, cwd)
+        label = output_dir.name if output_dir is not None else TrainingJob.KIND
+        return self._start([(label, command, cfg, output_dir)], cwd, runs_dir, title)
+
+    def start_sequence(self, configs, cwd: Path, runs_dir: Path, title: str, key: str) -> Job:
+        planned = [(Path(cfg["save_dir"]).name, [sys.executable], cfg,
+                    (cwd / cfg["save_dir"]).resolve()) for cfg in configs]
+        return self._start(planned, cwd, runs_dir, title, sequence_key=key)
+
+    def _start(self, planned, cwd: Path, runs_dir: Path, title: str, sequence_key=None) -> Job:
+        from experiment.storage import assert_run_available, atomic_json
+        from trainer.checkpoint import ensure_writable
+
+        outputs = {path for _, _, _, path in planned if path is not None}
+        output_dir = planned[0][3] if len(planned) == 1 else None
         with self._lock:
+            if self._closing:
+                raise RuntimeError("Task manager is shutting down")
             active = [j for j in self._jobs.values() if j.running]
             if len(active) >= self.MAX_ACTIVE:
                 raise TooManyJobs(
                     f"{len(active)} training runs are already going, which is the limit "
                     f"({self.MAX_ACTIVE}). Stop one, or wait for it to finish — they share "
                     f"one machine and slow each other down.")
+            if sequence_key is not None and any(j.sequence_key == sequence_key for j in active):
+                raise FileExistsError("A Lookahead queue for this recipe is already running.")
+            for _, _, cfg, path in planned:
+                if path is None:
+                    continue
+                if any(path in j.output_dirs for j in active):
+                    raise FileExistsError(f"A training task already owns {path}")
+                assert_run_available(path)
+                ensure_writable(path, cfg["master_seed"], cfg["overwrite"])
             job_id = self._new_id(datetime.now().strftime("%Y%m%d_%H%M%S"))
             job = self._factory()
             job.id = job_id
-            # Two live runs deriving one directory is a real thing that
-            # happens -- a preset run twice with nothing overridden -- and the
-            # second will write over the first. The switcher cannot fix that,
-            # but it must not show two identical pills while it happens.
-            label = title or job_id
+            job.output_dir = output_dir
+            job.output_dirs = outputs
+            job.sequence_key = sequence_key
+            steps = []
+            for i, (label, command, cfg, _) in enumerate(planned, start=1):
+                if cfg is not None:
+                    suffix = f".{i}" if len(planned) > 1 else ""
+                    snapshot = (Path(runs_dir) / f"{job_id}{suffix}.config.json").resolve()
+                    atomic_json(snapshot, cfg)
+                    command = [command[0], "-m", "trainer", "--config", str(snapshot)]
+                steps.append({"label": label, "command": command})
+            # Labels can repeat for unrelated custom commands. Trainer output
+            # directories above are exclusive even when labels differ.
+            label = title or (output_dir.name if output_dir is not None else job_id)
             taken = {j.title for j in self._jobs.values() if j.running}
             if label in taken:
                 n = 2
@@ -543,7 +653,15 @@ class TrainingJobs:
             job.title = label
             self._jobs[job_id] = job
             self._prune()
-        job.start(command, cwd, runs_dir / f"{job_id}.log")
+            try:
+                log_path = runs_dir / f"{job_id}.log"
+                if len(steps) == 1:
+                    job.start(steps[0]["command"], cwd, log_path)
+                else:
+                    job.start_steps(steps, cwd, log_path)
+            except BaseException:
+                self._jobs.pop(job_id, None)
+                raise
         return job
 
     def _prune(self):
@@ -598,7 +716,15 @@ class TrainingJobs:
     def stop_all(self) -> int:
         with self._lock:
             jobs = [j for j in self._jobs.values() if j.running]
-        return sum(1 for j in jobs if j.stop())
+        count, errors = 0, []
+        for job in jobs:
+            try:
+                count += bool(job.stop())
+            except Exception as exc:
+                errors.append(f"{job.id}: {exc}")
+        if errors:
+            raise RuntimeError("Could not stop every training job: " + "; ".join(errors))
+        return count
 
     @property
     def running(self) -> bool:
@@ -606,11 +732,21 @@ class TrainingJobs:
         with self._lock:
             return any(j.running for j in self._jobs.values())
 
+    def reopen(self):
+        with self._lock:
+            self._closing = False
+
+    def shutdown(self):
+        with self._lock:
+            self._closing = True
+        self.stop_all()
+
     def reset(self):
         """Forget every job. For tests, and for nothing else."""
         self.stop_all()
         with self._lock:
             self._jobs.clear()
+            self._closing = False
 
 
 class EvalJob(Job):
@@ -677,6 +813,39 @@ class DeployJob(Job):
             return self._scan_state.state()
 
 
+class EEGIOPiJob(Job):
+    KIND = "EEG-IO Pi 5 replay"
+
+    def _reset_state(self):
+        self.progress = None
+        self.result_name = None
+        self.error = None
+
+    def _scan(self, line: str):
+        tag, _, payload = line.partition(" ")
+        if tag == "[eegio-progress]":
+            try:
+                progress = json.loads(payload)
+            except ValueError:
+                return
+            if isinstance(progress, dict):
+                self.progress = progress
+        elif tag == "[eegio-pi-samples]" and self.progress and self.progress.get("phase") == "inference":
+            try:
+                done, total = map(int, payload.split())
+            except ValueError:
+                return
+            self.progress = {**self.progress, "samples": done, "total_samples": total}
+        elif tag == "[eegio-result]":
+            self.result_name = payload
+        elif tag == "[eegio-error]":
+            self.error = payload
+
+    def _extra_status(self) -> dict:
+        return {"progress": self.progress, "result_name": self.result_name,
+                "error": self.error, "stopped": self._cancelled}
+
+
 TRAIN_JOBS = TrainingJobs()
 EVAL_JOB = EvalJob()
 DEPLOY_JOB = DeployJob()
@@ -684,6 +853,38 @@ DEPLOY_JOB = DeployJob()
 #: Its own job rather than the training one, because a sweep is many runs and
 #: Stop has to mean the sweep rather than whichever run is going.
 SWEEP_JOB = DeployJob()
+CHANNEL_JOB = Job()
+EEGIO_PI_JOB = EEGIOPiJob()
+DEPLOYMENT_LOCK = threading.Lock()
+
+
+class TaskManager:
+    """One lifecycle policy shared by browser and native launchers."""
+
+    def entries(self):
+        return (("training", TRAIN_JOBS), ("evaluation", EVAL_JOB),
+                ("deploy", DEPLOY_JOB), ("receptive-field sweep", SWEEP_JOB),
+                ("EEG channel experiment", CHANNEL_JOB), ("EEG-IO Pi 5 replay", EEGIO_PI_JOB))
+
+    def active(self):
+        return [(name, job) for name, job in self.entries() if job.running]
+
+    def stop_all(self):
+        errors = []
+        for name, job in self.entries():
+            try:
+                job.shutdown()
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+        if errors:
+            raise RuntimeError("Task shutdown failed: " + "; ".join(errors))
+
+    def reopen(self):
+        for name, job in self.entries():
+            job.reopen()
+
+
+TASKS = TaskManager()
 
 
 # ============================================================
@@ -820,7 +1021,8 @@ def build_eval_command(spec: dict) -> tuple[list[str], str]:
         data_dir = (spec.get("data_dir") or "").strip()
         if not data_dir:
             raise ValueError(f"mode '{mode}' needs a data directory")
-        cmd += ["--data_dir", data_dir, "--artifact", spec.get("artifact") or "EOG"]
+        cmd += ["--data_dir", data_dir]
+        _flag(cmd, "--artifact", spec.get("artifact"))
         _flag(cmd, "--master_seed", spec.get("master_seed"))
 
     if mode in ("switch", "compare_switch", "all"):
@@ -861,59 +1063,11 @@ def build_eval_command(spec: dict) -> tuple[list[str], str]:
     return cmd, save_dir
 
 
-def _train_title(config_name: str, command: list[str]) -> str:
-    """
-    What to call a run on the switcher: the directory it will write.
-
-    The save_dir is the run's identity everywhere else in this project -- it
-    carries the variant, the artifact and the seed -- so it is the one label
-    that tells apart runs of the same preset that differ in one flag, which is
-    the case the switcher exists for.
-
-    Naming it after the *preset* instead, which this did when the command
-    carried no ``--save_dir``, labels every run from one file identically:
-    six pills reading ``mla_rank_sweep_eog`` and no way to tell which is
-    which. It also hid something worth seeing. A preset with no ``save_dir``
-    has the trainer derive one from the variant, artifact and seed, so those
-    six runs were not six experiments -- they were six runs deriving the same
-    directory and overwriting each other. The derivation is repeated here,
-    from the same three keys in the same order of precedence, so the label is
-    the path the run will really write and a collision is visible before it
-    happens rather than afterwards in the Runs tab.
-    """
-    def flag(name: str):
-        return command[command.index(name) + 1] if name in command else None
-
-    if flag("--save_dir"):
-        return flag("--save_dir").rstrip("/").split("/")[-1]
-    try:
-        values = config_io.read_config(config_name).get("values") or {}
-    except (ValueError, FileNotFoundError, OSError):
-        values = {}
-    if values.get("save_dir"):                 # the preset names one itself
-        return str(values["save_dir"]).rstrip("/").split("/")[-1]
-
-    variant = flag("--variant") or values.get("variant")
-    artifact = flag("--artifact") or values.get("artifact")
-    if not variant or not artifact:            # nothing to derive from
-        return config_name[:-5] if config_name.endswith(".yaml") else config_name
-    seed = flag("--master_seed")
-    if seed is None:
-        seed = values.get("master_seed")
-    name = f"{variant}_{str(artifact).lower()}"
-    if flag("--teacher_ckpt") or values.get("teacher_ckpt"):
-        name += "_kd"                          # as trainer/__main__.py does
-    # The default seed keeps the bare name, every other seed gets a suffix --
-    # the rule the trainer and the Lookahead tab both follow.
-    if seed is not None and int(seed) != DEFAULT_MASTER_SEED:
-        name += f"_s{int(seed)}"
-    return name
-
-
 def build_train_command(config_name: str, extra_args: str = "") -> list[str]:
     """`python -m trainer --config configs/<name> [extra flags]` with this interpreter."""
     config_io.config_path(config_name)                 # validates the name
     return [sys.executable, "-m", "trainer", "--config", f"configs/{config_name}",
+            "--profile", "gui",
             *shlex.split(extra_args or "")]
 
 
@@ -921,10 +1075,11 @@ def build_train_command(config_name: str, extra_args: str = "") -> list[str]:
 # HTTP handler
 # ============================================================
 def meta() -> dict:
-    from models.variants import VARIANT_REGISTRY, BIDIRECTIONAL_VARIANTS
+    from models.variants import VARIANT_REGISTRY, BIDIRECTIONAL_VARIANTS, VARIANT_SETTINGS, pinned_kwargs
     runs = config_io.list_runs()
     return {
         "kinds": config_io.runs_by_kind(runs),
+        "run_categories": config_io.run_categories(runs),
         "times": config_io.runs_by_time(runs),
         "losses": config_io.runs_by_loss(runs),
         "optimizers": config_io.runs_by_optimizer(runs),
@@ -935,10 +1090,15 @@ def meta() -> dict:
         "eegio_tests": eegio_tab.list_results(),
         "deploy_logs": pi.list_deploy_logs(),
         "schema": config_io.schema_as_json(),
+        "variant_settings": {name: pinned_kwargs(name) for name in VARIANT_SETTINGS},
         "choices": {
             "variants": list(VARIANT_REGISTRY),
             "bidirectional_variants": BIDIRECTIONAL_VARIANTS,
             "artifacts": config_io.ARTIFACTS,
+            "normalizations": ["fixed", "epoch"],
+            "protocols": ["exploratory", "paper"],
+            "resampling_methods": ["offline", "causal"],
+            "tcn_normalizations": ["none", "channel"],
             "losses": config_io.LOSS_NAMES,
             "feature_losses": ["mse", "l1"],
             "tq_key_modes": ["prod", "mse"],
@@ -1016,6 +1176,34 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("JSON body must be an object")
         return data
 
+    def _stream_eegio(self, spec: dict, **options):
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        connected = True
+
+        def send(event):
+            nonlocal connected
+            if connected:
+                try:
+                    self.wfile.write((json.dumps(event) + "\n").encode())
+                    self.wfile.flush()
+                except ConnectionError:
+                    # A closed page can still find the completed run in history.
+                    connected = False
+
+        try:
+            result = eegio_tab.evaluate(spec, on_progress=lambda update: send({"progress": update}),
+                                        **options)
+        except Exception as exc:
+            send({"error": str(exc) or type(exc).__name__})
+        else:
+            send({"result": result})
+
     def _file(self, path: Path, content_type: str):
         data = path.read_bytes()
         self.send_response(200)
@@ -1039,6 +1227,7 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/runs":
                 runs = config_io.list_runs()
                 return self._json({"runs": runs, "kinds": config_io.runs_by_kind(runs),
+                                   "run_categories": config_io.run_categories(runs),
                                    "times": config_io.runs_by_time(runs),
                                    "losses": config_io.runs_by_loss(runs),
                                    "optimizers": config_io.runs_by_optimizer(runs),
@@ -1092,6 +1281,8 @@ class Handler(BaseHTTPRequestHandler):
                     int(q.get("hidden_channels") or rfsweep.DEFAULT_HIDDEN))})
             if url.path == "/api/eegio/meta":
                 return self._json(eegio_tab.meta(q.get("data_dir")))
+            if url.path == "/api/eegio/pi/status":
+                return self._json(EEGIO_PI_JOB.status(int(q.get("since") or 0)))
             if url.path == "/api/eegio/results":
                 return self._json({"results": eegio_tab.list_results()})
             if url.path == "/api/eegio/result":
@@ -1109,6 +1300,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(SWEEP_JOB.status(int(q.get("since", 0))))
             if url.path == "/api/pi/meta":
                 return self._json(pi.meta())
+            if url.path == "/api/channels/meta":
+                return self._json(channels.meta())
+            if url.path == "/api/channels/status":
+                return self._json({**CHANNEL_JOB.status(int(q.get("since",0))),
+                                   "results":channels.list_results()})
+            if url.path == "/api/channels/result":
+                return self._json(channels.read_result(q.get("name","")))
             if url.path == "/api/pi/status":
                 return self._json(DEPLOY_JOB.status(int(q.get("since", 0))))
             if url.path == "/api/pi/trace":
@@ -1121,7 +1319,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         try:
+            if url.path == "/api/channels/input":
+                size=int(self.headers.get("Content-Length",0))
+                if not 0<size<=64*1024*1024:
+                    return self._error("Upload a NPY recording up to 64 MiB",400)
+                return self._json(channels.save_input(self.rfile.read(size)))
             body = self._body()
+            if url.path == "/api/channels/preview":
+                return self._json({"steps":pi.describe(channels.build_steps(body))})
+            if url.path == "/api/channels/calibrate":
+                return self._json(channels.calibrate(body.get("model","")))
+            if url.path == "/api/channels/power":
+                return self._json(channels.attach_power(body))
+            if url.path == "/api/channels/run":
+                with DEPLOYMENT_LOCK:
+                    if CHANNEL_JOB.running or DEPLOY_JOB.running or EEGIO_PI_JOB.running:
+                        return self._error("Wait for the current device measurement to finish",409)
+                    steps=channels.build_steps(body)
+                    stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+                    CHANNEL_JOB.start_steps(steps,PROJECT_ROOT,RUNS_DIR/f"gui_channels_{stamp}.log")
+                    return self._json({**CHANNEL_JOB.status(0),"planned":pi.describe(steps)})
+            if url.path == "/api/channels/stop":
+                return self._json({"stopped":CHANNEL_JOB.stop(),**CHANNEL_JOB.status(0)})
             if url.path == "/api/preview":
                 text = config_io.render_config(body["name"], body.get("values", {}))
                 return self._json({"name": body["name"], "text": text})
@@ -1180,10 +1399,20 @@ class Handler(BaseHTTPRequestHandler):
                                    "jobs": TRAIN_JOBS.summaries()})
             if url.path == "/api/lookahead/preview":
                 return self._json(lookahead.train_plan(body))
+            if url.path in ("/api/lookahead/missing/preview", "/api/lookahead/missing/train"):
+                plan = lookahead.missing_train_plan(body)
+                runs = plan.pop("runs")
+                key = plan.pop("queue_key")
+                plan["runs"] = [{k: v for k, v in run.items() if k != "config"} for run in runs]
+                if url.path.endswith("/preview") or not runs:
+                    return self._json({"planned": plan})
+                job = TRAIN_JOBS.start_sequence(
+                    [run["config"] for run in runs], PROJECT_ROOT, RUNS_DIR,
+                    title=f"Lookahead · {plan['sample_rate_hz']:g} Hz · {len(runs)} models", key=key)
+                return self._json({**job.status(0), "planned": plan, "jobs": TRAIN_JOBS.summaries()})
             if url.path == "/api/train":
                 cmd = build_train_command(body["name"], body.get("extra_args", ""))
-                job = TRAIN_JOBS.start(cmd, PROJECT_ROOT, RUNS_DIR,
-                                       title=_train_title(body["name"], cmd))
+                job = TRAIN_JOBS.start(cmd, PROJECT_ROOT, RUNS_DIR)
                 return self._json({**job.status(0), "jobs": TRAIN_JOBS.summaries()})
             if url.path == "/api/train/stop":
                 # No id stops the newest running run, which is what a page that
@@ -1205,11 +1434,34 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({**EVAL_JOB.status(0), "save_dir": save_dir})
             if url.path == "/api/eval/stop":
                 return self._json({"stopped": EVAL_JOB.stop(), **EVAL_JOB.status(0)})
-            if url.path == "/api/eegio/evaluate":
+            if url.path in ("/api/eegio/evaluate", "/api/lookahead/eegio"):
+                if body.get("target", "host") != "host":
+                    return self._error("Use the EEG-IO Pi replay endpoint for board runs", 400)
+                options = {}
+                if url.path == "/api/lookahead/eegio":
+                    body, pair = lookahead.eegio_spec(body)
+                    options["lookahead_comparison"] = pair
+                if parse_qs(url.query).get("progress") == ["1"]:
+                    return self._stream_eegio(body, **options)
                 try:
-                    return self._json(eegio_tab.evaluate(body))
+                    return self._json(eegio_tab.evaluate(body, **options))
                 except (FileNotFoundError, ValueError) as e:
                     return self._error(str(e), 400)
+            if url.path == "/api/eegio/pi/run":
+                with DEPLOYMENT_LOCK:
+                    if DEPLOY_JOB.running or CHANNEL_JOB.running or EEGIO_PI_JOB.running:
+                        return self._error("Wait for the current device measurement to finish", 409)
+                    command = eegio_pi.build_command(body)
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    EEGIO_PI_JOB.id = uuid4().hex
+                    EEGIO_PI_JOB.start(command, PROJECT_ROOT, RUNS_DIR / f"gui_eegio_pi_{stamp}.log")
+                    return self._json(EEGIO_PI_JOB.status(0))
+            if url.path == "/api/eegio/pi/stop":
+                with DEPLOYMENT_LOCK:
+                    if body.get("id") != EEGIO_PI_JOB.id:
+                        return self._error("This Pi replay is no longer running", 409)
+                    EEGIO_PI_JOB.stop()
+                    return self._json(EEGIO_PI_JOB.status(0))
             if url.path == "/api/kd/decompose":
                 students = body.get("students") or []
                 if not body.get("teacher") or not students:
@@ -1234,14 +1486,15 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/pi/preview":
                 return self._json({"steps": pi.describe(pi.build_steps(body))})
             if url.path == "/api/pi/run":
-                if DEPLOY_JOB.running:
-                    return self._error("a deploy run is already in progress", 409)
-                # The split check bites here, not on preview: this is the call
-                # that goes on to produce a score.
-                steps = pi.build_steps({**body, "_enforce_split": True})
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                DEPLOY_JOB.start_steps(steps, PROJECT_ROOT, RUNS_DIR / f"gui_deploy_{stamp}.log")
-                return self._json({**DEPLOY_JOB.status(0), "planned": pi.describe(steps)})
+                with DEPLOYMENT_LOCK:
+                    if DEPLOY_JOB.running or CHANNEL_JOB.running or EEGIO_PI_JOB.running:
+                        return self._error("Wait for the current device measurement to finish", 409)
+                    # The split check bites here, not on preview: this is the call
+                    # that goes on to produce a score.
+                    steps = pi.build_steps({**body, "_enforce_split": True})
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    DEPLOY_JOB.start_steps(steps, PROJECT_ROOT, RUNS_DIR / f"gui_deploy_{stamp}.log")
+                    return self._json({**DEPLOY_JOB.status(0), "planned": pi.describe(steps)})
             if url.path == "/api/pi/stop":
                 return self._json({"stopped": DEPLOY_JOB.stop(), **DEPLOY_JOB.status(0)})
             return self._error("not found", 404)
@@ -1257,6 +1510,7 @@ class GUIServer(ThreadingHTTPServer):
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8765, verbose: bool = False):
         super().__init__((host, port), Handler)
+        TASKS.reopen()
         self.verbose = verbose
 
 
@@ -1274,9 +1528,8 @@ def serve(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True,
     except KeyboardInterrupt:
         pass
     finally:
-        for job, what in ((JOB, "training"), (EVAL_JOB, "evaluation"), (DEPLOY_JOB, "deploy")):
-            if job.running:
-                print(f"[gui] stopping the {what} job ...")
-                job.stop()
-        server.server_close()
-        time.sleep(0.1)
+        try:
+            TASKS.stop_all()
+        finally:
+            server.server_close()
+            time.sleep(0.1)

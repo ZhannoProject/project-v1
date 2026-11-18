@@ -142,7 +142,7 @@ project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 from models.TCN_backbone import CausalTCNBackbone, CausalConv1d
 from models.AttentionBlocks.attention import CausalTransformerDecoder, init_transformer_weights
-from models.lookahead import LOOKAHEAD_LADDER
+from models.lookahead import LOOKAHEAD_LADDER, TCN_LOOKAHEAD_LADDER
 from models.receptive_field import DEFAULT_DILATIONS, RF_LADDER, field
 
 #: Default squeeze ratio for the SE variants: C -> C/8 -> C.
@@ -642,11 +642,16 @@ class TCNParallelMLA(nn.Module):
 # ============================================================
 VARIANT_REGISTRY = {
     "tcn":          TCNOnly,
+    "tcn_channelnorm": partial(TCNOnly, se_reduction=None),
     "tcn_mha":      TCNWithMHA,
     "tcn_mla":      TCNWithMLA,
     "tcn_mha_par":  TCNParallelMHA,
     "tcn_mla_par":  TCNParallelMLA,
 }
+
+# Factory-level settings fixed by a named variant, alongside constructor pins.
+# The explicit no-SE alias remains identifiable as the plain TCN family.
+VARIANT_SETTINGS = {"tcn_channelnorm": {"tcn_norm": "channel"}}
 
 # Squeeze-and-Excitation baseline: the same TCN with a causal SE gate on every
 # residual block.  It is in the study as the cheap end of "attention": SE
@@ -712,6 +717,11 @@ for _la in LOOKAHEAD_LADDER:
     _name = f"tcn_se{LOOKAHEAD_SUFFIX}{_la}"
     VARIANT_REGISTRY[_name] = partial(TCNWithSE, causal=False, lookahead=_la)
     LOOKAHEAD_VARIANTS.append(_name)
+TCN_LOOKAHEAD_VARIANTS = []
+for _la in TCN_LOOKAHEAD_LADDER:
+    _name = f"tcn{LOOKAHEAD_SUFFIX}{_la}"
+    VARIANT_REGISTRY[_name] = partial(TCNOnly, causal=False, lookahead=_la, se_reduction=None)
+    TCN_LOOKAHEAD_VARIANTS.append(_name)
 
 # Receptive-field sweep: tcn_rf5 .. tcn_rf509, and the SE family alongside.
 # The name states the reach in samples, so a run cannot be mislabelled about
@@ -761,16 +771,17 @@ def variant_is_causal(variant: str) -> bool:
 
 def pinned_kwargs(variant: str) -> dict:
     """
-    Constructor arguments that the variant NAME itself fixes.
+    Model settings that the variant NAME itself fixes.
 
     ``tcn_mla_r8`` pins ``kv_lora_rank=8``; every ``*_bi`` twin pins
-    ``causal=False``; the five base variants pin nothing.  These are the
-    registry's ``functools.partial`` keywords, and they are authoritative:
+    ``causal=False``; ``tcn_channelnorm`` fixes channel normalization and
+    disables SE. Constructor pins and factory-level settings are authoritative:
     a caller must not be able to override them, or a checkpoint saved as
     ``tcn_mla_r8`` could silently hold a rank-16 model.
     """
     entry = VARIANT_REGISTRY[variant]
-    return dict(entry.keywords) if isinstance(entry, partial) else {}
+    constructor = dict(entry.keywords) if isinstance(entry, partial) else {}
+    return {**constructor, **VARIANT_SETTINGS.get(variant, {})}
 
 
 def base_variant(variant: str) -> str:
@@ -802,7 +813,8 @@ def base_variant(variant: str) -> str:
 
 def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
                 turboquant_key_mode="prod", turboquant_train_mode="off",
-                turboquant_seed=42, **kwargs) -> nn.Module:
+                turboquant_seed=42, tcn_norm="channel", se_window=None,
+                attention_window=None, **kwargs) -> nn.Module:
     """
     Factory function for model construction.
 
@@ -839,6 +851,10 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
     # override its keywords, so without this check build_model("tcn_mla_r8",
     # kv_lora_rank=16) would quietly return a rank-16 model.
     pinned = pinned_kwargs(variant)
+    pinned_norm = pinned.pop("tcn_norm", None)
+    if pinned_norm is not None and tcn_norm != pinned_norm:
+        raise ValueError(f"tcn_norm={tcn_norm} contradicts variant '{variant}' "
+                         f"(which fixes tcn_norm={pinned_norm})")
     for key, value in pinned.items():
         if key in kwargs and kwargs[key] != value:
             raise ValueError(
@@ -847,6 +863,8 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
             )
     from models.AttentionBlocks.turboquant import attach_turboquant
     model = VARIANT_REGISTRY[variant](**kwargs)
+    from models.causal_config import configure_causal_blocks
+    configure_causal_blocks(model, tcn_norm, se_window, attention_window)
     attach_turboquant(model, turboquant, turboquant_bits, turboquant_key_mode,
                      turboquant_train_mode, turboquant_seed)
     # Record the pinned values too, so the checkpoint states its rank / causality
@@ -855,7 +873,8 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
                               turboquant_bits=turboquant_bits,
                               turboquant_key_mode=turboquant_key_mode,
                               turboquant_train_mode=turboquant_train_mode,
-                              turboquant_seed=turboquant_seed)
+                              turboquant_seed=turboquant_seed, tcn_norm=tcn_norm,
+                              se_window=se_window, attention_window=attention_window)
     return model
 
 
@@ -983,7 +1002,7 @@ def resolved_arch(model) -> dict:
     out.update(pinned_kwargs(variant))
     # Not constructor arguments, but part of what produced the weights.
     for key in ("turboquant", "turboquant_bits", "turboquant_key_mode",
-                "turboquant_train_mode", "turboquant_seed"):
+                "turboquant_train_mode", "turboquant_seed", "tcn_norm", "se_window", "attention_window"):
         if key in cfg:
             out[key] = cfg[key]
     return out
@@ -1004,13 +1023,17 @@ def build_model_from_config(config):
     signature = inspect.signature(VARIANT_REGISTRY[variant])
     kwargs = {key: value for key, value in config.items()
               if key in signature.parameters and value is not None}
-    for key, value in pinned_kwargs(variant).items():
+    pinned = pinned_kwargs(variant)
+    for key, value in pinned.items():
         if key in kwargs and kwargs[key] != value:
             print(f"[build_model] variant '{variant}' fixes {key}={value}; "
                   f"ignoring {key}={kwargs[key]} from the config")
         kwargs.pop(key, None)
     for key in ("turboquant", "turboquant_bits", "turboquant_key_mode",
-                "turboquant_train_mode", "turboquant_seed"):
-        if key in config:
-            kwargs[key] = config[key]
+                "turboquant_train_mode", "turboquant_seed", "tcn_norm", "se_window", "attention_window"):
+        if key in config or key in pinned:
+            if key in pinned and key in config and config[key] != pinned[key]:
+                print(f"[build_model] variant '{variant}' fixes {key}={pinned[key]}; "
+                      f"ignoring {key}={config[key]} from the config")
+            kwargs[key] = pinned[key] if key in pinned else config[key]
     return build_model(variant, **kwargs)
