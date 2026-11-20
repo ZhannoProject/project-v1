@@ -114,14 +114,27 @@
   .seg button.active { background: var(--accent); color: var(--accent-text); }
   /* The run switcher: a dot carries the state so the label can stay the run's
      own name, which is the thing that tells four runs of one preset apart. */
-  #jobTabs button { display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
-  #jobTabs .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+  /* The task list: one row per running or queued run, and under a sequence
+     its models in order, so what is waiting is as visible as what is going. */
+  #jobBar { border: 1px solid var(--border); border-radius: 8px; margin: 8px 0; overflow: hidden; }
+  #jobBar .jl-head { display: flex; gap: 8px; padding: 6px 10px; font-size: 12px; color: var(--muted); }
+  #jobTabs .jl-row { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto auto; gap: 8px; align-items: center;
+                     padding: 6px 10px; border-top: 1px solid var(--border); font-variant-numeric: tabular-nums; cursor: pointer; }
+  #jobTabs .jl-row:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+  #jobTabs .jl-row.active { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  #jobTabs .jl-row.jl-step { padding: 3px 10px 3px 28px; font-size: 12px; cursor: default; border-top: 0; }
+  #jobTabs .jl-row.jl-step:hover { background: transparent; }
+  #jobTabs .jl-steps { max-height: 220px; overflow-y: auto; padding-bottom: 4px; }
+  #jobTabs .jl-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #jobTabs .jl-step .jl-title { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+  #jobTabs .jl-state { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  #jobTabs .jl-x { border: 0; background: transparent; color: var(--muted); padding: 0 4px; font-size: 13px; line-height: 1; }
+  #jobTabs .jl-x:hover { color: var(--err); }
+  #jobTabs .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
   #jobTabs .dot.running { background: var(--accent); animation: jobpulse 1.4s ease-in-out infinite; }
   #jobTabs .dot.ok { background: var(--ok); }
   #jobTabs .dot.err { background: var(--err); }
-  #jobTabs .dot.queued { background: transparent; box-shadow: inset 0 0 0 1.5px var(--muted); }
-  #jobTabs button.active .dot.queued { background: transparent; box-shadow: inset 0 0 0 1.5px var(--accent-text); }
-  #jobTabs button.active .dot { background: var(--accent-text); animation: none; }
+  #jobTabs .dot.queued, #jobTabs .dot.waiting { background: transparent; box-shadow: inset 0 0 0 1.5px var(--muted); }
   @keyframes jobpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
   /* Display only: the variant label reads as a model name (TCN_MHA · EOG) while
      the DOM text and /api/runs keep the registry spelling ("tcn_mha"), which is
@@ -463,11 +476,9 @@
         <input type="text" id="extraArgs" class="grow" placeholder="extra CLI flags, e.g. --max_epochs 2 --staged" title="Appended to the command; CLI flags override the YAML">
       </div>
       <div class="cmd" id="cmd"></div>
-      <div class="row" id="jobBar" style="display:none">
-        <span class="muted">runs</span>
-        <span class="seg" id="jobTabs"></span>
-        <span class="grow"></span>
-        <span class="muted" id="jobNote"></span>
+      <div id="jobBar" style="display:none">
+        <div class="jl-head"><span>Training tasks</span><span class="grow"></span><span id="jobNote"></span></div>
+        <div id="jobTabs"></div>
       </div>
       <div class="chartbox">
         <div class="head">
@@ -1492,34 +1503,66 @@
 
   function renderJobTabs() {
     const bar = $("#jobBar"), tabs = $("#jobTabs"), all = state.jobList || [];
-    // The switcher is a queue of what is *going*, not a history. A finished
-    // run leaves it — its log is still on disk and its curve is still in the
-    // Runs tab, so nothing is lost, and the pills stay about the thing the
-    // tab is for. The one exception is the run being read right now: it would
-    // be worse for the selected pill to vanish under the cursor the moment
-    // its run ends.
-    const list = all.filter(j => j.running || j.queued || j.id === state.jobId);
-    // One run is the ordinary case and needs no switcher: the bar appears
-    // only once there is a choice to make.
-    bar.style.display = list.length > 1 ? "" : "none";
-    if (list.length <= 1) return;
-    tabs.innerHTML = list.map(j => {
-      const cls = j.running ? "running" : j.queued ? "queued" : j.returncode === 0 ? "ok" : j.returncode == null ? "" : "err";
-      const where = j.queued ? `queued #${j.queue_position}`
-        : j.epoch ? `epoch ${j.epoch}${j.max_epochs ? "/" + j.max_epochs : ""}`
-        : j.running ? "starting" : j.returncode === 0 ? "finished" : j.returncode == null ? "—"
-        : j.returncode === -1 && !j.started ? "removed from queue" : `exit ${j.returncode}`;
+    // A list of what is *going* or *waiting*, not a history. A finished run
+    // leaves it — its log is on disk and its curve is in the Runs tab — except
+    // the run being read right now, which should not vanish under the cursor.
+    // Oldest first, so the list reads in the order things will happen.
+    const list = all.filter(j => j.running || j.queued || j.id === state.jobId).reverse();
+    bar.style.display = list.some(j => j.running || j.queued) || list.length > 1 ? "" : "none";
+    if (bar.style.display) return;
+    const jobState = j => j.running ? "running" : j.queued ? "queued" : j.returncode === 0 ? "ok"
+      : j.returncode == null || (j.returncode === -1 && !j.started) ? "" : "err";
+    const progress = j => j.epoch ? `epoch ${j.epoch}${j.max_epochs ? "/" + j.max_epochs : ""}` : "starting";
+    const rows = list.map(j => {
+      const cls = jobState(j);
+      const seq = j.steps && j.steps.length > 1;
       const best = j.best_val_loss == null ? "" : ` · best ${j.best_val_loss.toFixed(4)}`;
-      return `<button data-job="${j.id}" class="${j.id === state.jobId ? "active" : ""} job-${cls}"`
-        + ` title="${j.title} — ${where}${best}${j.started ? " · started " + j.started.slice(11, 16) : ""}">`
-        + `<i class="dot ${cls}"></i>${j.title}</button>`;
+      let where = j.queued ? `queued #${j.queue_position}`
+        : j.running ? (seq ? `model ${j.step + 1}/${j.steps.length}` : progress(j) + best)
+        : j.returncode === 0 ? "finished" : j.returncode == null ? "—"
+        : j.returncode === -1 && !j.started ? "removed from queue" : `exit ${j.returncode}`;
+      if (!j.queued && j.started) where += ` · ${j.started.slice(11, 16)}`;
+      const x = j.running || j.queued
+        ? `<button class="jl-x" data-stop="${j.id}" title="${j.queued ? "Remove from the queue" : "Stop this run"}">✕</button>` : "<span></span>";
+      let html = `<div class="jl-row ${j.id === state.jobId ? "active" : ""}" data-job="${j.id}">`
+        + `<i class="dot ${cls}"></i><span class="jl-title" title="${escHtml(j.title)}">${escHtml(j.title)}</span>`
+        + `<span class="jl-state">${where}</span>${x}</div>`;
+      if (seq) {
+        html += `<div class="jl-steps">` + j.steps.map((st, i) => {
+          const going = j.running && i === j.step;
+          const sc = st.returncode === 0 ? "ok" : st.returncode != null ? "err" : going ? "running" : "waiting";
+          const what = st.returncode === 0 ? "done" : st.returncode != null ? `exit ${st.returncode}`
+            : going ? progress(j) + best : j.running || j.queued ? "waiting" : "not run";
+          return `<div class="jl-row jl-step"><i class="dot ${sc}"></i>`
+            + `<span class="jl-title" title="${escHtml(st.label)}">${i + 1}. ${escHtml(st.label)}</span>`
+            + `<span class="jl-state">${what}</span><span></span></div>`;
+        }).join("") + `</div>`;
+      }
+      return html;
     }).join("");
-    tabs.querySelectorAll("button").forEach(b =>
-      b.addEventListener("click", () => selectJob(b.dataset.job)));
+    tabs.innerHTML = rows;
+    const stepRow = tabs.querySelector(".jl-step .dot.running");
+    if (stepRow) {
+      const box = stepRow.closest(".jl-steps"), row = stepRow.parentElement;
+      if (row.offsetTop < box.scrollTop || row.offsetTop > box.scrollTop + box.clientHeight - row.offsetHeight)
+        box.scrollTop = row.offsetTop - box.offsetTop - 40;
+    }
+    tabs.querySelectorAll(".jl-row[data-job]").forEach(r =>
+      r.addEventListener("click", () => selectJob(r.dataset.job)));
+    tabs.querySelectorAll("[data-stop]").forEach(b => b.addEventListener("click", async ev => {
+      ev.stopPropagation();
+      const j = all.find(x => x.id === b.dataset.stop);
+      if (!j) return;
+      if (j.running && !(await ask({ title: "Stop this run?", message: `${j.title} will be stopped`
+          + (j.steps && j.steps.length > 1 ? ", and the models after it in this sequence will not be trained." : "."),
+          ok: "Stop", danger: true }))) return;
+      try { applyStatus(await api("/api/train/stop", { id: j.id })); poll(); }
+      catch (e) { banner(e.message); }
+    }));
     const n = list.filter(j => j.running).length, q = list.filter(j => j.queued).length;
     $("#jobNote").textContent = [
-      n > 1 ? `${n} runs at once — they share this machine, so the per-epoch times in each log are not comparable with a run that had it to itself` : "",
-      q ? `${q} queued — each starts when a running slot frees up` : "",
+      `${n} running`, q ? `${q} queued` : "",
+      n > 1 ? "runs share this machine, so epoch times are not comparable with a run that had it to itself" : "",
     ].filter(Boolean).join(" · ");
   }
 

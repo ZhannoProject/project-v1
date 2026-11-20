@@ -707,6 +707,9 @@ class TrainingJobs:
             if must_wait:
                 job.queued = True
                 job.command = list(steps[0]["command"])
+                # Listed before it starts, so a queued sequence shows its models.
+                job.steps = [{"label": st["label"], "command": list(st["command"]), "env": {},
+                              "returncode": None} for st in steps]
                 self._queue.append((job, steps, cwd, log_path))
                 # A slot can be free with a queue still waiting, in the moment
                 # between a run ending and its callback; first come, first started.
@@ -799,6 +802,11 @@ class TrainingJobs:
                 "max_epochs": j.status(0).get("max_epochs") if j.running or metrics else None,
                 "best_val_loss": best["val_loss"] if best else None,
                 "rrmse_t": metrics[-1].get("rrmse_t") if metrics else None,
+                # A sequence is one job that trains its models in turn; the
+                # list shows which are done, which is going and which wait.
+                **({"steps": [{"label": st["label"], "returncode": st["returncode"]}
+                              for st in j.steps], "step": j.step}
+                   if len(getattr(j, "steps", None) or []) > 1 else {}),
             })
         out.reverse()                           # newest first, as the page lists them
         return out
