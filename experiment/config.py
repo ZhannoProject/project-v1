@@ -217,7 +217,7 @@ def resolve_config(values=None, profile="cli"):
 
 
 def resolve_save_dir(cfg, cwd=Path(".")):
-    """Name an automatic run directory by model, artifact, rate and seed."""
+    """Separate fixed-scale runs from legacy epoch-scale paths and seeds."""
     if cfg.get("save_dir") is not None:
         return cfg
     from data.Dataloader import NATIVE_FS
@@ -225,6 +225,11 @@ def resolve_save_dir(cfg, cwd=Path(".")):
     rate = str(float(cfg.get("target_fs") or NATIVE_FS)).removesuffix(".0").replace("+", "")
     base = f"./runs/{cfg['variant']}_{cfg['artifact'].lower()}" + ("_kd" if cfg.get("teacher_ckpt") else "")
     base += f"_{rate}hz"
+    # Older paths did not record input normalization in their names. Keep
+    # epoch-scale naming compatible, but never send a new fixed-scale run
+    # into that same namespace. Explicit save_dir values remain authoritative.
+    if cfg.get("normalization") == "fixed":
+        base += "_fixed"
     seeded = f"{base}_s{cfg['master_seed']}"
     held, files = recorded_seed(Path(cwd) / base)
     cfg["save_dir"] = (seeded if cfg["master_seed"] != 42 or

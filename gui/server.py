@@ -130,6 +130,12 @@ class Job:
         self.returncode: int | None = None
         self._active = False                   # true from start() until the last step ends
         self._cancelled = False
+        # Set by a registry that holds this job back until there is a free
+        # slot; the job itself only reports it.
+        self.queued = False
+        #: Called (no locks held) once the job has come to rest, so a registry
+        #: with a queue can start the next run without polling for it.
+        self.on_finish = None
         # Bumped by every start, and again if a stop has to abandon a reader
         # that will not come back.  Output from an older generation is dropped
         # rather than appended to whatever is running now.
@@ -254,6 +260,17 @@ class Job:
             if log:
                 log.write(f"\n[exit code {rc}]\n")
                 log.close()
+            self._notify_finish()
+
+    def _notify_finish(self):
+        callback = self.on_finish
+        if callback is None:
+            return
+        try:
+            callback(self)
+        except Exception as exc:                # a queue that cannot advance must not kill the reader
+            with self._lock:
+                self._append(f"[gui] could not start the next queued run: {exc}")
 
     def _spawn(self, step: dict, cwd: Path) -> subprocess.Popen | None:
         """
@@ -413,6 +430,7 @@ class Job:
                 self._append("[gui] stopped — something this step started is still holding "
                              "its output pipe open, so the job was let go of rather than "
                              "left running")
+        self._notify_finish()
         return True
 
     def status(self, since: int = 0) -> dict:
@@ -428,7 +446,7 @@ class Job:
                 **extra,
                 "kind": self.KIND,
                 "id": self.id, "title": self.title,
-                "running": self.running,
+                "running": self.running, "queued": self.queued,
                 "returncode": self.returncode,
                 "command": " ".join(shlex.quote(c) for c in self.command),
                 "steps": steps, "step": self.step,
@@ -510,7 +528,7 @@ class TrainingJob(Job):
 
 class TooManyJobs(RuntimeError):
     """
-    The concurrent-run cap was reached.
+    The concurrent-run cap and the queue behind it are both full.
 
     A conflict rather than a bad request: the call was well formed and would
     succeed once a run finishes, which is the distinction 409 carries and the
@@ -553,14 +571,23 @@ class TrainingJobs:
     which is why this is allowed at all. ``MAX_ACTIVE`` keeps it from becoming
     absurd, and the page says what concurrency costs rather than hiding it.
 
+    A run asked for while ``MAX_ACTIVE`` are going is not refused but queued:
+    it is checked, given its id, config snapshot and output directory at once
+    -- so a bad request still fails at the click, and two queued runs cannot
+    claim one directory -- and starts by itself, oldest first, when a running
+    one ends. ``MAX_QUEUED`` bounds the queue for the same reason ``MAX_ACTIVE``
+    bounds the runs.
+
     A finished job is kept so its log and curve can still be read; the oldest
-    are dropped once there are ``MAX_KEPT`` of them. Jobs still running are
-    never dropped.
+    are dropped once there are ``MAX_KEPT`` of them. Jobs still running or
+    queued are never dropped.
     """
 
     #: Concurrent runs. Four is already more than a laptop wants; the point of
     #: the cap is that an accidental loop cannot spawn fifty.
     MAX_ACTIVE = 4
+    #: Runs waiting for a free slot, started in the order they were asked for.
+    MAX_QUEUED = 16
     #: Finished runs kept for reading back, newest first.
     MAX_KEPT = 16
 
@@ -569,6 +596,8 @@ class TrainingJobs:
         self._lock = threading.Lock()
         self._closing = False
         self._jobs: "collections.OrderedDict[str, Job]" = collections.OrderedDict()
+        #: [(job, steps, cwd, log_path)], oldest first.
+        self._queue: list[tuple] = []
 
     # ---- identity ----
     def _new_id(self, stamp: str) -> str:
@@ -582,16 +611,35 @@ class TrainingJobs:
         return f"{base}_{n}"
 
     # ---- lifecycle ----
+    def _active_count(self) -> int:
+        """Runs holding a slot. Caller holds the lock."""
+        return len([j for j in self._jobs.values() if j.running])
+
+    def _queued_ids(self) -> set[str]:
+        """Caller holds the lock."""
+        return {job.id for job, *_ in self._queue}
+
+    def _pending(self) -> list:
+        """Running and queued jobs: everything that owns its output. Caller holds the lock."""
+        queued = self._queued_ids()
+        return [j for j in self._jobs.values() if j.running or j.id in queued]
+
     def room(self) -> int:
         """
-        How many more runs may start now.
+        How many more runs may be asked for now: free slots plus free queue places.
 
-        Asked before a batch rather than discovered during one: starting two
+        Asked before a batch rather than discovered during one: accepting two
         of three seeds and refusing the third leaves a half-finished request
-        that reads like a failure of the runs that did start.
+        that reads like a failure of the runs that were accepted.
         """
         with self._lock:
-            return self.MAX_ACTIVE - len([j for j in self._jobs.values() if j.running])
+            return (max(0, self.MAX_ACTIVE - self._active_count())
+                    + self.MAX_QUEUED - len(self._queue))
+
+    def counts(self) -> tuple[int, int]:
+        """(running, queued)."""
+        with self._lock:
+            return self._active_count(), len(self._queue)
 
     def start(self, command: list[str], cwd: Path, runs_dir: Path, title: str = "") -> Job:
         cfg, output_dir = training_command_config(command, cwd)
@@ -612,13 +660,15 @@ class TrainingJobs:
         with self._lock:
             if self._closing:
                 raise RuntimeError("Task manager is shutting down")
-            active = [j for j in self._jobs.values() if j.running]
-            if len(active) >= self.MAX_ACTIVE:
+            active = self._pending()
+            must_wait = self._active_count() >= self.MAX_ACTIVE or bool(self._queue)
+            if must_wait and len(self._queue) >= self.MAX_QUEUED:
                 raise TooManyJobs(
-                    f"{len(active)} training runs are already going, which is the limit "
-                    f"({self.MAX_ACTIVE}). Stop one, or wait for it to finish — they share "
-                    f"one machine and slow each other down.")
-            if sequence_key is not None and any(j.sequence_key == sequence_key for j in active):
+                    f"{self._active_count()} training runs are going and {len(self._queue)} are "
+                    f"queued, which is the limit ({self.MAX_ACTIVE} running, {self.MAX_QUEUED} "
+                    f"queued). Stop or dequeue one, or wait for a run to finish.")
+            if sequence_key is not None and any(getattr(j, "sequence_key", None) == sequence_key
+                                                for j in active):
                 raise FileExistsError("A Lookahead queue for this recipe is already running.")
             for _, _, cfg, path in planned:
                 if path is None:
@@ -644,7 +694,7 @@ class TrainingJobs:
             # Labels can repeat for unrelated custom commands. Trainer output
             # directories above are exclusive even when labels differ.
             label = title or (output_dir.name if output_dir is not None else job_id)
-            taken = {j.title for j in self._jobs.values() if j.running}
+            taken = {j.title for j in active}
             if label in taken:
                 n = 2
                 while f"{label} #{n}" in taken:
@@ -653,20 +703,62 @@ class TrainingJobs:
             job.title = label
             self._jobs[job_id] = job
             self._prune()
+            log_path = runs_dir / f"{job_id}.log"
+            if must_wait:
+                job.queued = True
+                job.command = list(steps[0]["command"])
+                self._queue.append((job, steps, cwd, log_path))
+                # A slot can be free with a queue still waiting, in the moment
+                # between a run ending and its callback; first come, first started.
+                self._dispatch()
+                return job
             try:
-                log_path = runs_dir / f"{job_id}.log"
-                if len(steps) == 1:
-                    job.start(steps[0]["command"], cwd, log_path)
-                else:
-                    job.start_steps(steps, cwd, log_path)
+                self._launch(job, steps, cwd, log_path)
             except BaseException:
                 self._jobs.pop(job_id, None)
                 raise
         return job
 
+    def _launch(self, job, steps, cwd, log_path):
+        """Start one job now. Caller holds the lock."""
+        job.on_finish = self._finished
+        if len(steps) == 1:
+            job.start(steps[0]["command"], cwd, log_path)
+        else:
+            job.start_steps(steps, cwd, log_path)
+
+    def _finished(self, job):
+        """A run came to rest: its slot goes to the oldest queued run."""
+        with self._lock:
+            self._dispatch()
+
+    def _dispatch(self):
+        """Start queued runs while slots are free. Caller holds the lock."""
+        while self._queue and not self._closing and self._active_count() < self.MAX_ACTIVE:
+            job, steps, cwd, log_path = self._queue.pop(0)
+            job.queued = False
+            try:
+                self._launch(job, steps, cwd, log_path)
+            except Exception as exc:
+                # Its id and pill already exist, so it ends visibly rather
+                # than vanishing from the list.
+                self._end_unstarted(job, f"[gui] could not start this queued run: {exc}", 1)
+
+    @staticmethod
+    def _end_unstarted(job, message: str, returncode: int):
+        job.queued = False
+        lock = getattr(job, "_lock", None)
+        if lock is None:
+            job.returncode = returncode
+            return
+        with lock:
+            job._append(message)
+            job.returncode = returncode
+
     def _prune(self):
         """Drop the oldest finished jobs. Caller holds the lock."""
-        done = [k for k, j in self._jobs.items() if not j.running]
+        queued = self._queued_ids()
+        done = [k for k, j in self._jobs.items() if not j.running and k not in queued]
         for key in done[: max(0, len(done) - self.MAX_KEPT)]:
             del self._jobs[key]
 
@@ -693,6 +785,7 @@ class TrainingJobs:
         """
         with self._lock:
             jobs = list(self._jobs.values())
+            position = {job.id: i for i, (job, *_) in enumerate(self._queue, start=1)}
         out = []
         for j in jobs:
             metrics = j.metrics() if hasattr(j, "metrics") else []
@@ -700,6 +793,7 @@ class TrainingJobs:
                        key=lambda m: m["val_loss"], default=None)
             out.append({
                 "id": j.id, "title": j.title, "running": j.running,
+                "queued": j.id in position, "queue_position": position.get(j.id),
                 "returncode": j.returncode, "started": j.started,
                 "epoch": metrics[-1]["epoch"] if metrics else None,
                 "max_epochs": j.status(0).get("max_epochs") if j.running or metrics else None,
@@ -710,13 +804,31 @@ class TrainingJobs:
         return out
 
     def stop(self, job_id: str | None = None) -> bool:
+        """Stop a running job, or take a queued one out of the queue."""
         job = self.get(job_id)
-        return bool(job and job.stop())
+        if job is None:
+            return False
+        with self._lock:
+            for i, (queued, *_) in enumerate(self._queue):
+                if queued is job:
+                    del self._queue[i]
+                    self._end_unstarted(job, "[gui] removed from the queue before it started", -1)
+                    return True
+        return bool(job.stop())
+
+    def _drop_queue(self) -> int:
+        """Cancel every queued run, so stopping the running ones promotes nothing."""
+        with self._lock:
+            queued, self._queue = self._queue, []
+            for job, *_ in queued:
+                self._end_unstarted(job, "[gui] removed from the queue before it started", -1)
+        return len(queued)
 
     def stop_all(self) -> int:
+        dropped = self._drop_queue()
         with self._lock:
             jobs = [j for j in self._jobs.values() if j.running]
-        count, errors = 0, []
+        count, errors = dropped, []
         for job in jobs:
             try:
                 count += bool(job.stop())
@@ -728,13 +840,14 @@ class TrainingJobs:
 
     @property
     def running(self) -> bool:
-        """True while any run is going — what the window-close guard asks."""
+        """True while any run is going or waiting — what the window-close guard asks."""
         with self._lock:
-            return any(j.running for j in self._jobs.values())
+            return bool(self._queue) or any(j.running for j in self._jobs.values())
 
     def reopen(self):
         with self._lock:
             self._closing = False
+            self._dispatch()
 
     def shutdown(self):
         with self._lock:
@@ -746,6 +859,7 @@ class TrainingJobs:
         self.stop_all()
         with self._lock:
             self._jobs.clear()
+            self._queue.clear()
             self._closing = False
 
 
@@ -1271,7 +1385,8 @@ class Handler(BaseHTTPRequestHandler):
                     "steps": [], "step": 0, "started": None, "log_path": None,
                     "max_epochs": None, "kind": "train"}
                 return self._json({**status, "jobs": TRAIN_JOBS.summaries(),
-                                   "max_active": TrainingJobs.MAX_ACTIVE})
+                                   "max_active": TRAIN_JOBS.MAX_ACTIVE,
+                                   "max_queued": TRAIN_JOBS.MAX_QUEUED})
             if url.path == "/api/rf/meta":
                 return self._json(rfsweep.meta())
             if url.path == "/api/rf/results":
@@ -1383,11 +1498,12 @@ class Handler(BaseHTTPRequestHandler):
                 # either all launched or all refused.
                 room = TRAIN_JOBS.room()
                 if len(runs) > room:
+                    going, waiting = TRAIN_JOBS.counts()
                     return self._error(
-                        f"{len(runs)} seeds is more than there is room for: "
-                        f"{TRAIN_JOBS.MAX_ACTIVE - room} of {TRAIN_JOBS.MAX_ACTIVE} runs are "
-                        f"already going. Start {room if room else 'fewer'} now, or wait — they "
-                        f"share one machine and slow each other down.", 409)
+                        f"{len(runs)} seeds is more than there is room for: {going} runs are "
+                        f"going and {waiting} queued, against a limit of "
+                        f"{TRAIN_JOBS.MAX_ACTIVE} running and {TRAIN_JOBS.MAX_QUEUED} queued. "
+                        f"Ask for {room if room else 'fewer'} now, or wait for some to finish.", 409)
                 started = [TRAIN_JOBS.start(build_train_command(r["config"], r["extra"]),
                                             PROJECT_ROOT, RUNS_DIR,
                                             title=r["save_dir"].split("/")[-1])

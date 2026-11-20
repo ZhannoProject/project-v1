@@ -93,7 +93,7 @@ def ensure_writable(save_dir, seed, overwrite: bool = False):
         f"{save_dir} already holds {held} ({', '.join(files)}), and {mine}.\n"
         f"  Starting here would overwrite it, and the weights are not recoverable.\n"
         f"  Either:\n"
-        f"    - clear an explicit save_dir to derive the folder from the training rate and seed\n"
+        f"    - clear an explicit save_dir to derive the folder from the training rate, input scale and seed\n"
         f"    - point --save_dir somewhere else\n"
         f"    - pass --overwrite to replace the existing run on purpose"
     )

@@ -1,0 +1,215 @@
+% IEEE Sensors Letters working manuscript, revised 2026-11-20.
+% Original manuscript and bibliography are preserved in archive/pre_letter_20261118/.
+% All empirical results and figure artwork are deliberately unfilled.
+% TBD fields are authoring placeholders, not measured values.
+% The current IEEE Template Selector download for Sensors Letters (IDs 24/25)
+% supplies IEEEtran.cls. Use that downloaded class with its default geometry.
+\documentclass[letterpaper,journal]{IEEEtran}
+\usepackage[T1]{fontenc}
+\usepackage{cite}
+\usepackage{amsmath}
+\interdisplaylinepenalty=2500
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\TBD}[1]{\textcolor{blue!65!black}{\textnormal{[TBD: #1]}}}
+\newcommand{\blank}{\textemdash}
+\newcommand{\figblank}[1]{%
+  \fbox{\parbox[c][#1][c]{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}{\centering\color{gray}\small Figure reserved}}}
+\hyphenation{elec-tro-en-ceph-a-lo-gram electro-en-ceph-a-lo-graphy}
+
+\begin{document}
+% Publication metadata must be supplied by the publisher after acceptance.
+\markboth{IEEE Sensors Letters, Manuscript for Review}{Manuscript for Review}
+\title{Bounded Lookahead for Streaming EEG Artifact Removal on an Edge Device}
+\author{\TBD{author names}%
+\thanks{\TBD{affiliations, city, country}. Corresponding author: \TBD{name and email}.}}
+% No invented submission dates, article number, DOI, IEEE memberships or funding.
+
+\maketitle
+\begin{abstract}
+EEG denoising on an edge device must suppress artifacts and preserve background activity within a declared output delay. Short network execution alone is insufficient when preprocessing or reconstruction requires a complete window. This letter characterizes bounded lookahead for streaming single-channel artifact removal. A temporal convolutional network with channel normalization and squeeze-and-excitation gating estimates each clean sample using a specified horizon of future observations. A lookahead curve and matched results relate reconstruction quality to future-sample waiting time under shared training and scoring conditions. Evaluation combines paired synthetic mixtures with clean references, blink-annotated recordings from a wearable frontal EEG headset, and sample-paced replay of those recordings on a Raspberry Pi 5. For an illustrative future-sample waiting time of \TBD{time} milliseconds, temporal reconstruction error changes from \TBD{baseline} to \TBD{lookahead}, recovering \TBD{fraction} percent of the causal-to-offline gap. Representative device replay yields an end-to-end 99th-percentile latency of \TBD{latency} milliseconds, a deadline-miss rate of \TBD{rate} percent, and an incremental board power of \TBD{power} milliwatts. These measurements support horizon selection according to application deadlines and signal-preservation requirements.
+\end{abstract}
+\begin{IEEEkeywords}
+Electroencephalography, artifact removal, bounded lookahead, edge computing, streaming signal processing.
+\end{IEEEkeywords}
+
+\section{Introduction}
+Wearable electroencephalography (EEG) enables sensing outside controlled laboratories, where ocular and muscular artifacts obscure neural activity \cite{casson2019wearable}. Acquisition, processing, decoding, and feedback share an embedded system's deadline. Denoising must balance quality against latency and memory. Single-channel methods cannot exploit multichannel spatial redundancy.
+
+EEGdenoiseNet supplies paired synthetic mixtures \cite{EEGdenoiseNet}, while EEGDnet exploits local and nonlocal temporal structure \cite{yi2022eegdnet}. Smartphone autoencoders and E2CAR demonstrate device deployment \cite{xing2024autoencoder,liu2026e2car}. Their execution times motivate a systems question: when are all observations required for an output available? Window acquisition, future-sample waiting, and computation contribute separately.
+
+Bindra and Panwar \cite{bindra2026capacity} report a 365-parameter TCN with EOG/EMG correlation coefficients of 0.849/0.797 and a controlled width sweep showing early saturation around 3--6.5 thousand parameters. This motivates examining temporal information alongside model capacity; their single-artifact scores are not directly comparable to the joint mixtures here.
+
+This letter treats the future horizon as a design parameter of the EEG sensing system. Its contribution is a measured basis for choosing that horizon under a device output deadline: one backbone is evaluated under causal, bounded-lookahead, and offline temporal support; the resulting accuracy--waiting curve (Fig.~\ref{fig:tradeoff}, Table~\ref{tab:accuracy}) is checked for signal preservation on real wearable recordings; and representative settings are measured for timing, memory, and power on an edge board. Receptive-field and attention controls price the alternative of spending computation instead of latency.
+
+\begin{figure}[t]
+\centering
+\figblank{24mm}
+\caption{Streaming sensing pipeline and temporal support. Timestamped EEG passes through causal preprocessing, input scaling, the convolutional model, and delayed output. The hop size, permitted future horizon, state buffers, and acquisition and emission timestamps define the processing and latency boundaries.}
+\label{fig:pipeline}
+\end{figure}
+
+\section{Method and Evaluation Protocol}
+\subsection{Bounded Future Context}
+Extending the single-artifact additive model in EEGdenoiseNet \cite{EEGdenoiseNet} to joint ocular and muscular contamination, we write
+\begin{equation}
+ y_t=x_t+\lambda_o o_t+\lambda_m m_t,
+ \label{eq:mixture}
+\end{equation}
+where $x_t$ is clean EEG and $o_t,m_t$ are ocular and muscular artifacts. The mixture coefficients set their individual signal-to-noise ratios (SNRs). The realized mixture SNR is computed from the combined contamination; it is not identified with either component SNR.
+
+For a total future horizon of $L$ samples, we impose the reconstruction constraint
+\begin{equation}
+ \hat{x}_t=f_{\theta,L}(y_{\leq t+L}),\qquad
+ \hat{x}_t\ \text{independent of}\ y_{>t+L}.
+ \label{eq:contract}
+\end{equation}
+The restriction applies to the complete processing path, including scaling and temporal pooling. Here $L$ is the total model-level horizon, not a per-layer allowance. The strictly causal setting is $L=0$; an offline full-segment reference is reported separately.
+
+Five residual blocks each use two kernel-three convolutions, 64 feature channels, and dilations $1,2,4,8,16$ \cite{bai2018empirical,oord2016wavenet,he2016deep}. ChannelNorm operates across features at each time index. Squeeze-and-excitation (SE) gating \cite{hu2018squeeze} uses reduction 8 and cumulative means from the start of each training window; bounded gates shift the summary by their allocated future taps. Offline gates use the whole window. Inputs and targets share one fixed scale fitted as the RMS of the training clean-EEG pool and saved with each checkpoint. Deployment resets remain \TBD{deployment reset policy}.
+
+In the architectural lookahead ladder, a total horizon is allocated across convolution padding and SE pooling. Moving padding toward the future also reduces convolutional access to the past. The ladder therefore varies temporal support, not future access alone; Table~\ref{tab:accuracy} reports each setting's past/future span.
+% AUTHOR ACTION: if switching to fixed-architecture delayed targets, rewrite this
+% paragraph and keep its results separate from the architectural ladder.
+% Legacy cumulative SE, finite-window SE and delayed-target models are not interchangeable.
+
+\subsection{Timing and Stateful Processing}
+At sampling rate $f_s$ (Hz), $L$ samples require a future-sample wait of $\tau_{\mathrm{future}}=1000L/f_s$ ms. Thus $L=1,4,16$ mean 4, 16, and 64 ms at 250 Hz, or 3.90625, 15.625, and 62.5 ms at 256 Hz. Lookahead differs from window length: finite support $[t-P,t+L]$ contains $W=P+L+1$ samples. Cumulative SE can summarize a longer past; acquired history requires no future wait after startup. For hops of $H$ samples, we use the conservative batching-plus-lookahead budget (seconds)
+\begin{equation}
+ B_{\mathrm{alg}}=\frac{H+L}{f_s}.
+ \label{eq:budget}
+\end{equation}
+Each hop must finish within $H/f_s$ to prevent backlog \cite{bci2000timing}; outputs must also meet a deadline specified by the application \cite{wilson2010latencies}. Future waiting consumes output latency even when the processor is idle. Equation~\eqref{eq:budget} excludes filtering, transport, execution, and queueing. Measured end-to-end latency runs from target-sample acquisition to availability of its aligned estimate.
+
+State persists between hops with matched initialization and resets. Beyond-horizon perturbations test bounded dependence. Stateful and reference outputs share valid targets, preprocessing, and scaling; tolerance and maximum discrepancy are \TBD{parity values}. Figure~\ref{fig:pipeline} identifies the timing boundaries.
+% AUTHOR ACTION: do not claim that the old L=0 step exporter validates L>0.
+
+\begin{figure*}[t]
+\centering
+\begin{minipage}{0.485\textwidth}\centering\figblank{34mm}\par\small (a) Accuracy and waiting time\end{minipage}\hfill
+\begin{minipage}{0.485\textwidth}\centering\figblank{34mm}\par\small (b) Incremental board power\end{minipage}
+\caption{Cost of temporal support: reconstruction quality and board power. (a) Test RRMSE$_t$ versus future-sample wait $1000L/f_s$ (ms), with a secondary $L$-sample axis at the stated $f_s$ and seed-wise mean $\pm$ sample SD. The offline reference is an accuracy line without an assigned streaming latency. (b) Incremental Raspberry Pi 5 board power (active minus idle, mean $\pm$ sample SD over repeats) across horizons and inference paths. The curve and Table~\ref{tab:accuracy} support application-specific horizon selection.}
+\label{fig:tradeoff}
+\end{figure*}
+
+\begin{table*}[t]
+\caption{Architectural quantities and pending test scores (mean $\pm$ sample SD over three runs). Budgets are calculated at 250 Hz, $H=4$, excluding execution. Conv. spans exclude SE pooling; $L$ includes all future access. Dashes denote unfilled results.}
+\label{tab:accuracy}
+\centering\footnotesize
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccc@{}}
+\toprule
+Model & $L$ (samples) & Conv. past/future & Budget (ms) & Params & RRMSE$_t$ & RRMSE$_f$ & CC & Gap recovered (\%)\\
+\midrule
+TCN & 0 & 124/0 & 16 & 117,068 & \blank & \blank & \blank & \blank\\
+TCN+SE & 0 & 124/0 & 16 & 122,548 & \blank & \blank & \blank & \blank\\
+TCN+SE & 8 & 118/6 & 48 & 122,548 & \blank & \blank & \blank & \blank\\
+TCN+SE & 16 & 113/11 & 80 & 122,548 & \blank & \blank & \blank & \blank\\
+TCN+SE & 32 & 102/22 & 144 & 122,548 & \blank & \blank & \blank & \blank\\
+TCN+SE offline & -- & 62/62 & -- & 122,548 & \blank & \blank & \blank & \blank\\
+TCN expanded & 0 & \blank & 16 & \blank & \blank & \blank & \blank & \blank\\
+TCN+attention & 0 & \blank & 16 & \blank & \blank & \blank & \blank & \blank\\
+\bottomrule
+\end{tabular*}
+\end{table*}
+
+\subsection{Data and Matched Comparisons}
+EEGdenoiseNet \cite{EEGdenoiseNet} clean and artifact epochs are partitioned into disjoint training, validation, and test pools (70/15/15). The split is at epoch level; BOTH sampling yields 2,380/510/510 training/validation/test pairs per seed. Joint EOG+EMG mixtures use component SNRs from $-7$ to 2 dB. Training draws them independently; validation/test assign the same grid SNR to both components. Offline polyphase resampling converts 256-Hz, 512-sample source epochs to 250 Hz and 500 samples before mixing; it is not an online timing measurement.
+
+Within each seed, settings share source pools, evaluation mixtures, and a common valid target interval. Seeds 42, 54, and 67 control the split, mixture generation, and training randomness. Models use 200 epochs of AdamW \cite{loshchilov2019adamw}, batch size 32, learning rate $5\times10^{-4}$, zero weight decay, dropout 0.1, five warmup epochs, and cosine decay to $10^{-6}$. Validation ground-truth mean squared error selects checkpoints; the held-out test partition supplies final scores.
+
+The primary comparison varies the future horizon within the SE family. Plain convolutional models with matched channel normalization provide a gating control. Receptive-field expansion and causal attention are supporting capacity controls \cite{vaswani2017attention}; latent key--value compression is evaluated only for configurations with recorded settings \cite{deepseekai2024deepseekv2}. These comparisons use matched training and scoring conditions. A depth-changing receptive-field sweep is not treated as an isolated test of context length.
+
+Temporal and spectral relative root-mean-square errors (RRMSE$_t$, RRMSE$_f$) and Pearson correlation (CC) follow EEGdenoiseNet definitions \cite{EEGdenoiseNet}; spectral errors use squared rFFT magnitudes over 0--125 Hz. Clean-input preservation is an additional test. For seed $s$, we define recovery of the SE family's causal-to-offline error gap as
+\begin{equation}
+ G_s(L)=\frac{E_s(0)-E_s(L)}{E_s(0)-E_s(\mathrm{off})},
+ \label{eq:gap}
+\end{equation}
+where $E$ denotes test RRMSE$_t$ and the denominator must be positive. Gap recovery is defined within the SE family; capacity controls are compared through paired absolute errors. Ratios are calculated within seed before aggregation. Means and sample standard deviations use training runs as the repeat unit; test segments are not counted as independent training repeats.
+
+\subsection{Real Recordings and Device Measurements}
+EEG-IO provides blink-annotated frontal recordings from 20 participants, acquired with a wearable OpenBCI board at 250 Hz \cite{agarwal2019blink}. The preliminary Fp1 test uses forward 1--80-Hz filtering, a 60-Hz notch, hard blink labels, and 3-s scoring warmup. SE resets within each 512-sample inference window (hop 4). Blink ratios use $\pm2$-s epochs and a central $\pm0.5$-s interval; background scoring excludes $\pm0.5$ s around all blink labels. Matched-lookahead settings remain \TBD{final real-data settings}.
+
+Endpoints are the blink amplitude ratio \cite{robbins2020sensitive}, background input--output RMSE, and label-matched blink counts using the amplitude threshold of \cite{hazarika2024easr} (six times the mean absolute amplitude, 250-ms peak separation), with one per-participant threshold from the causal output applied to the input and every output. Without paired clean EEG, background RMSE measures alteration, not neural-signal loss; clean-input tests assess preservation against known targets. Repeats are aggregated within participant before paired comparisons and multiplicity correction; annotations are not independent participants.
+
+On a Raspberry Pi 5, these recordings are fed to the final model exports one sample at a time at their native rate; each run records runtime version, precision, thread count, processor affinity, governor, temperature, and throttling status. Hop duration is compared with $H/f_s$; processing duty cycle is computation time divided by hop duration. Device results include per-hop timing, end-to-end timing, missed deadlines, and peak process memory. Replicated streams, each with independent state, measure processing load. An external meter samples board power during replay and at idle; incremental energy per hop is $(P_{\mathrm{active}}-P_{\mathrm{idle}})H/f_s$.
+
+\begin{figure}[t]
+\centering
+\figblank{28mm}
+\caption{Real-recording suppression and preservation. (a) Blink-aligned input and reconstructed waveforms, aggregated within participant before group summaries. (b) Paired participant-level background alteration or clean-input preservation. Waveform axes use seconds and $\mu$V; input references and valid-event counts accompany the group summaries.}
+\label{fig:real}
+\end{figure}
+
+\begin{table}[t]
+\caption{Representative Raspberry Pi 5 replay with final weights; SE example denotes the nonzero horizon specified in the text. Entries summarize per-repeat percentiles as mean $\pm$ sample SD over three complete repeats. Power is measured with an external meter.}
+\label{tab:device}
+\centering\footnotesize
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Quantity & TCN & SE $L=0$ & SE example & Attn.\\
+\midrule
+Precision & \blank & \blank & \blank & \blank\\
+Hop / rate (samples/Hz) & \blank & \blank & \blank & \blank\\
+Hop p50 / p99 (ms) & \blank & \blank & \blank & \blank\\
+End-to-end p99 (ms) & \blank & \blank & \blank & \blank\\
+Missed deadlines (\%) & \blank & \blank & \blank & \blank\\
+Processing duty (\%) & \blank & \blank & \blank & \blank\\
+Peak process RAM (MB) & \blank & \blank & \blank & \blank\\
+Idle board power (W) & \blank & \blank & \blank & \blank\\
+Incr.\ energy / hop (mJ) & \blank & \blank & \blank & \blank\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Results and Discussion}
+\subsection{Accuracy Versus Waiting Time}
+Figure~\ref{fig:tradeoff} and Table~\ref{tab:accuracy} relate reconstruction quality to the declared future horizon. For illustration, at $L=\TBD{horizon}$, RRMSE$_t$ changes from \TBD{causal error} to \TBD{lookahead error}, with a recovered gap of \TBD{mean and SD}. The corresponding extra future-sample wait is \TBD{time} ms. The largest marginal improvement occurs over \TBD{interval}; the results beyond that interval show \TBD{measured trend}. Application deadlines and preservation requirements determine which configurations are acceptable.
+
+The capacity controls in Table~\ref{tab:accuracy} change RRMSE$_t$ by \TBD{paired differences}, with costs in Table~\ref{tab:device}. Feasible configurations must meet execution, memory, and output-delay constraints, verified by measurement rather than parameter count.
+
+\subsection{Artifact Suppression and Signal Preservation}
+A preliminary fixed-scale $L=0$ test (seed 67, 20 participants) yielded median blink amplitude ratio 7.132, background input--output RMSE 18.538 $\mu$V, and blink-count reduction 0.0\% (single model, not a paired comparison).
+
+The matched-lookahead changes in blink amplitude ratio, background RMSE, and event counts are \TBD{paired lookahead results}; corrected participant-level statistics and threshold sensitivity are \TBD{paired statistics and count sensitivity}. Figure~\ref{fig:real} relates blink suppression to background alteration.
+
+Clean-input RRMSE is \TBD{preservation result}. Suppression and preservation are read jointly, since global attenuation can cut artifact counts while altering background activity; recordings that informed development are reported as exploratory.
+
+\textit{Training-mixture transfer.} In exploratory matched-seed comparisons, EOG+EMG training (BOTH) attenuated EEG-IO recordings more strongly than EOG-only training, removing more blink-interval power while also altering more background activity, and a gain-insensitive blink measure did not consistently favour either mixture. Because adding EMG at a fixed per-component SNR also raises total contamination, this stronger attenuation is not attributed to EMG exposure itself; the lookahead comparisons therefore keep one training mixture fixed.
+% Exploratory provenance (project v1/eegio_tests/, causal filter, H=4, 20 participants), BOTH minus EOG-only:
+% eegio_20261121_050523_470031_231d7329.json  s54, epoch scale (= diagnostics/eegio_20261105_eog):
+%   suppression +4.4 dB, bg RMSE +2.1 uV, BAR 3.99 vs 5.44 (BOTH better)
+% eegio_20261121_045746_941364_e99b85e5.json  s88, fixed scale, as recorded:
+%   suppression +3.7 dB, bg RMSE +0.8 uV, BAR 5.64 vs 4.00 (EOG-only better)
+% eegio_20261121_035606_404698_fef101af.json  s88, fixed scale, rescaled diagnostic:
+%   suppression +2.6 dB, bg RMSE +1.8 uV, BAR 3.45 vs 3.19 (EOG-only better)
+% Seeds also differ in input scaling. Text kept qualitative on purpose (author's decision).
+
+\subsection{Measured Edge Performance}
+Table~\ref{tab:device} reports the final-weight replay measurements. At a representative horizon of \TBD{device horizon} samples, hop p99 is \TBD{hop p99} ms against a \TBD{hop deadline} ms processing budget. Measured end-to-end p99 is \TBD{end-to-end p99} ms, with \TBD{miss rate}\% missed hop deadlines. The final-pipeline parity error is \TBD{maximum error}. A saved model-input check for the $L=0$, seed-67 model gave maximum error $2.98\times10^{-7}$ at tolerance $10^{-4}$; it excludes filtering and finite-lookahead deployment. Incremental board power is \TBD{incremental power} mW, or \TBD{energy} mJ per hop; Fig.~\ref{fig:tradeoff}(b) compares it across horizons and inference paths.
+
+The highest replicated-stream load meeting the timing criterion is \TBD{stream count and criterion}; queue growth and missed deadlines, not average inference time, identify overload.
+
+\subsection{Scope of the Findings}
+The curve is specific to the tested artifact mixture, preprocessing, and padding-shift design, which changes past and future access together. Training sources were zero-phase filtered while deployment filters causally; in an exploratory three-seed EEG-IO control, zero-phase preprocessing lowered background RMSE by 3--6~$\mu$V for every model and seed, whereas the $L=0$ versus $L=8$ ranking varied with seed under both filters, so real-data lookahead comparisons should use causally filtered training mixtures and seed-level aggregation.
+% Exploratory provenance (H=4, 20 participants, paired by participant): seed 42 causal eegio_20261120_234535_476155_ae12ce5a.json (Pi), zero-phase eegio_20261121_002333_952987_6b607705.json (host); seeds 54/67 causal and zero-phase eegio_20261121_0057*.json and eegio_20261121_0058*.json (host).
+Epoch-level synthetic splits and replayed recordings do not establish generalization to new participants, other acquisition hardware, or acquisition-driver timing.
+
+\section{Conclusion}
+Figure~\ref{fig:tradeoff} and Table~\ref{tab:accuracy} describe how reconstruction quality varies with future-sample waiting time. Matched tests show \TBD{accuracy--delay result} and \TBD{preservation result}. Representative device replay yields \TBD{timing and power result}. Together, these measurements let a sensing system choose its future horizon from its output deadline and signal-preservation requirement.
+
+\section*{Acknowledgment}
+% Preserve the original AI-assistance disclosure without asserting a completed review.
+Artificial intelligence tools assisted with code development and manuscript drafting. \TBD{confirm author verification and final disclosure wording}.
+% Add verified funding and acknowledgments only; do not invent grant information.
+
+% The journal requires at least one column reserved for references.
+% Do not reduce class font sizes, geometry, or spacing to force the page count.
+% Start the references in their own column to reserve the required space.
+\newpage
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+\end{document}

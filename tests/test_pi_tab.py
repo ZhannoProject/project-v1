@@ -1494,9 +1494,9 @@ class PageTests(unittest.TestCase):
         block = self.PAGE[self.PAGE.index("const deployBadge"):][:1200]
         for state in ("onnx", "export first", "no export"):
             self.assertIn(state, block)
-        # A bounded-lookahead rung is refused like a teacher but for its own
-        # reason, and the badge has to give that reason rather than the
-        # teacher's: the horizon is finite, and what it costs is a delay.
+        # A bounded-lookahead rung is deployable, unlike a teacher, and the
+        # badge has to say why and at what price: the horizon is finite, and
+        # what it costs is an L-sample output delay.
         self.assertIn("r.lookahead", block)
         self.assertIn("bounded lookahead", block)
         self.assertIn('state.pickFor === "deploy"', block,
@@ -1826,6 +1826,50 @@ class TestdataGeneratorTests(unittest.TestCase):
             if out.get("created"):
                 created.unlink(missing_ok=True)
 
+    def _model_250hz_with_256hz_set(self):
+        sets = {t["name"]: t for t in pi.list_testdata()}
+        for m in pi.list_models():
+            if m.get("train_fs") != 250.0 or m.get("master_seed") is None:
+                continue
+            seed = int(m["master_seed"])
+            name = f"{m['artifact']}_test100" + ("" if seed == 42 else f"_s{seed}") + ".npz"
+            if (sets.get(name) or {}).get("fs") == 256.0:
+                return m, name
+        self.skipTest("no 250 Hz model with a same-seed 256 Hz set in this tree")
+
+    def test_a_set_at_another_sample_rate_is_refused_before_the_run(self):
+        """The board refuses a 250 Hz model on 256 Hz epochs; the page must say so first."""
+        model, name = self._model_250hz_with_256hz_set()
+        bad = pi.split_mismatch(model["name"], name)
+        self.assertIsNotNone(bad)
+        self.assertEqual(bad["level"], "error")
+        self.assertIn("256 Hz", bad["text"])
+
+    def test_the_generator_cuts_at_the_models_rate(self):
+        """It used to cut every set at 256 Hz, whatever rate the model ran at."""
+        data_dir = Path("data/EEGdenoisenet/data")
+        if not (data_dir / "EEG_all_epochs.npy").is_file():
+            self.skipTest("EEGdenoiseNet .npy files are not present")
+        model, _ = self._model_250hz_with_256hz_set()
+        out = pi.cut_testdata_for(model["name"], n=20)
+        try:
+            self.assertTrue(out["name"].endswith("_250hz.npz"), out["name"])
+            self.assertEqual({t["name"]: t for t in pi.list_testdata()}[out["name"]]["fs"], 250.0)
+            self.assertIsNone(pi.split_mismatch(model["name"], out["name"]))
+        finally:
+            if out.get("created"):
+                (pi.TESTDATA_DIR / out["name"]).unlink(missing_ok=True)
+
+
+class StepBenchScanTests(unittest.TestCase):
+    def test_the_per_sample_bench_line_of_a_step_graph_is_read(self):
+        st = scan("[bench] median 0.3091 ms | p95 0.3221 ms | max 0.3955 ms per sample;  "
+                  "one sample = 4.0 ms at 250 Hz -> 12.9x real-time headroom, 3,235 Hz ceiling")
+        self.assertEqual(st["bench"]["median_ms"], 0.3091)
+        self.assertTrue(st["bench"]["per_sample"])
+        self.assertEqual(st["bench"]["hop_budget_ms"], 4.0)
+        self.assertEqual(st["bench"]["realtime_headroom_x"], 12.9)
+
 
 class DeployRunListingTests(unittest.TestCase):
     """
@@ -1871,8 +1915,11 @@ class DeployRunListingTests(unittest.TestCase):
     def test_rows_carry_the_deadline_and_the_environment(self):
         for r in pi.list_deploy_runs():
             with self.subTest(model=r["model"]):
-                # hop / 256 Hz, in ms -- what the median has to beat.
-                self.assertAlmostEqual(r["budget_ms"], r["hop"] / 256.0 * 1000, places=2)
+                # hop / the trace's own rate, in ms -- what the median has to
+                # beat. A fixed 256 Hz made hop 4 at 250 Hz 15.62 ms, not 16.
+                self.assertAlmostEqual(r["budget_ms"], r["hop"] / r["sample_rate_hz"] * 1000, places=2)
+                if r["model"].endswith(("250hz_fixed", "250hz_s42")) or "_250hz" in r["model"]:
+                    self.assertEqual(r["sample_rate_hz"], 250.0, r["model"])
                 if r["median_ms"] is not None:
                     self.assertEqual(r["realtime_ok"], r["median_ms"] < r["budget_ms"])
                     self.assertAlmostEqual(r["duty_cycle"], r["median_ms"] / r["budget_ms"],
@@ -2021,7 +2068,7 @@ class InferenceModeTests(unittest.TestCase):
                 # Hop 1 is the literal truth and what makes the duty cycle
                 # comparable with a windowed run at any hop.
                 self.assertEqual(r["hop"], 1)
-                self.assertAlmostEqual(r["budget_ms"], 1000 / 256.0, places=2)
+                self.assertAlmostEqual(r["budget_ms"], 1000 / r["sample_rate_hz"], places=2)
                 # Both machines now: the host runs it in torch, the Pi runs
                 # the exported step graph. Which one is read from the trace's
                 # environment block, not from its filename.

@@ -14,8 +14,26 @@ two separate measurements that have to be reported together -- a model that
 scores well on the first alone has simply learned to attenuate everything.
 
 The EEG-IO v2 standard reports blink amplitude ratio, background RMSE, and
-blink count reduction. Batch/step parity and causality are model checks. The
-legacy metrics are saved alongside:
+blink count reduction. Batch/step parity and causality are model checks.
+Sources (the manuscript cites both):
+
+    blink amplitude ratio   K. A. Robbins, J. Touryan, T. Mullen, C. Kothe and
+                            N. Bigdely-Shamlo, "How Sensitive Are EEG Results to
+                            Preprocessing Methods: A Benchmarking Study," IEEE
+                            TNSRE 28(5):1081-1090, 2020, doi:10.1109/TNSRE.2020.2980223
+                            (Sec. II.F; implemented as defined there).
+    blink count reduction   D. Hazarika, K. N. Vishnu, R. Ransing and C. N. Gupta,
+                            "Dynamical Embedding of Single-Channel EEG for Artifact
+                            Subspace Reconstruction" (E-ASR), Sensors 24(20):6734,
+                            2024, doi:10.3390/s24206734 -- Eq. (7): threshold
+                            6 x mean amplitude, peaks >= 250 ms apart. Matching to
+                            EEG-IO labels and the adjusted (shared-threshold)
+                            variant are this project's additions.
+    background RMSE         adapted from the same E-ASR paper, which scores real
+                            data on hand-picked artifact-free stretches; here the
+                            artifact-free part is the label-free background mask.
+
+The legacy metrics are saved alongside:
 
     suppression S      how much blink-interval power the model removed
     fidelity D_b       how much of the background survived it
@@ -314,7 +332,12 @@ def fidelity_db(x: np.ndarray, y: np.ndarray, background: np.ndarray) -> float:
 
 
 def _blink_amplitude_ratio(signal, centers, fs):
-    """Robbins et al. blink amplitude ratio on a subject's averaged waveform."""
+    """
+    Blink amplitude ratio (Robbins et al., IEEE TNSRE 2020, Sec. II.F) on a
+    subject's blink-locked average: baseline on |t| >= 1.5 s of a +-2 s epoch,
+    then mean |.| within +-0.5 s over mean |.| in the baseline. Near 1 means the
+    blink was removed; well above 1, residue; near 0, background removed too.
+    """
     if not len(centers):
         return float("nan")
     half = round(BAR_EPOCH_S * fs)
@@ -329,11 +352,16 @@ def _blink_amplitude_ratio(signal, centers, fs):
 
 
 def _blink_peak_threshold(amplitude, valid):
+    # E-ASR Eq. (7) (Hazarika et al., Sensors 2024): six times the mean amplitude.
     return float(BLINK_THRESHOLD_MULTIPLIER * amplitude[valid].mean()) if valid.any() else float("nan")
 
 
 def _annotated_peak_count(signal, valid, centers, fs, *, threshold_uv=None):
-    """E-ASR amplitude threshold with one-to-one matching to EEG-IO labels."""
+    """
+    E-ASR blink count (Hazarika et al., Sensors 2024, Eq. 7: threshold and
+    250 ms minimum peak distance), with one-to-one matching to EEG-IO labels
+    within +-BLINK_MATCH_S -- the matching is this project's addition.
+    """
     from scipy.signal import find_peaks
 
     if not len(centers):
@@ -777,6 +805,48 @@ class EvalConfig:
     drop_corrupt: bool = True
     offline_window: Optional[OfflineWindow] = None
     adjusted_blink_count: bool = False
+    #: Diagnostic: bring each recording to the level the model was trained
+    #: at before inference, and back to microvolts after it (see
+    #: ``input_rescale``). Local inference only.
+    rescale_input: bool = False
+
+
+def robust_level_uv(x: np.ndarray, valid: np.ndarray) -> float:
+    """
+    Background RMS estimated without labels: 1.4826 x the median absolute
+    deviation, which equals the RMS for Gaussian background and barely moves
+    for sparse, large events such as blinks (about 3% of EEG-IO samples).
+    """
+    v = np.asarray(x, dtype=np.float64)[valid]
+    if not v.size:
+        return float("nan")
+    return float(1.4826 * np.median(np.abs(v - np.median(v))))
+
+
+def input_rescale(x: np.ndarray, valid: np.ndarray, run_config: dict) -> dict:
+    """
+    The gain that puts a recording's background at the level the model was
+    trained on.
+
+    A fixed-scale model divides every input by ``normalization_scale``, the
+    RMS of its training clean-EEG pool, so training EEG reaches it at about
+    1.0. EEG-IO's Fp1 background is roughly 19 dB quieter in those units.
+    Multiplying by ``normalization_scale / robust_level_uv`` brings it to 1.0;
+    dividing the output by the same gain returns it to microvolts, so every
+    metric stays comparable with an unscaled run. A per-window (epoch)
+    normalized model is already level-free, and is left at gain 1.
+    """
+    from data.protocol import normalization_config
+
+    level = robust_level_uv(x, valid)
+    norm = normalization_config(run_config or {})
+    if norm["normalization"] != "fixed":
+        return {"gain": 1.0, "background_level_uv": level, "target_level_uv": None,
+                "reason": "per-window input scaling is already level-free"}
+    if not (np.isfinite(level) and level > 0):
+        raise ValueError("cannot estimate the recording's background level")
+    target = norm["normalization_scale"]
+    return {"gain": float(target / level), "background_level_uv": level, "target_level_uv": target}
 
 
 def evaluate_recording(rec: Recording, apply_fn: Callable[[np.ndarray], np.ndarray],
@@ -839,8 +909,19 @@ def evaluate_recording(rec: Recording, apply_fn: Callable[[np.ndarray], np.ndarr
     matched = float(len(kept) / len(ann)) if len(ann) else float("nan")
     bg = background_mask(n, kept, fs, cfg.guard_s, exclude=corrupt)
 
+    rescale = None
+    if cfg.rescale_input:
+        if replay_result is not None:
+            raise ValueError("Rescaled input is a local diagnostic; the Pi replays the raw recording")
+        level_valid = ~corrupt.copy()
+        level_valid[:min(n, math.ceil(SCORE_WARMUP_S * fs))] = False
+        rescale = input_rescale(x, level_valid, getattr(apply_fn, "run_config", {}))
     if replay_result is None:
-        y = apply_fn(x)
+        if rescale is None:
+            y = apply_fn(x)
+        else:
+            gain = rescale["gain"]
+            y = np.asarray(apply_fn(np.asarray(x) * gain)) / gain
     start, stop = 0, n
     protocol = getattr(apply_fn, "run_config", {})
     paper = protocol.get("protocol") == "paper"
@@ -888,6 +969,7 @@ def evaluate_recording(rec: Recording, apply_fn: Callable[[np.ndarray], np.ndarr
         "residual": residual_detectable(y, fs, kept, k=cfg.detect_k),
         "risk": blink_snr_estimate(x, kept, bg),
         **({"pi_replay": hardware} if replay_result is not None else {}),
+        **({"input_rescale": rescale} if rescale is not None else {}),
         **standard,
     }
 
@@ -949,6 +1031,7 @@ def evaluate_subjects(data_dir: str, run: str, subjects: Optional[Sequence[str]]
         "inference_checks": checks,
         "config": {"band_hz": list(cfg.band), "notch_hz": cfg.notch_hz,
                    "zero_phase": cfg.zero_phase, "target_fs": cfg.target_fs,
+                   "rescale_input": cfg.rescale_input,
                    "win": offline.samples if offline else cfg.win,
                    "hop": None if offline else cfg.hop, "detect_k": cfg.detect_k,
                    **({"offline_window": asdict(offline)} if offline else {}),
@@ -976,7 +1059,8 @@ ALL_METRIC_PATHS = {**METRIC_PATHS, **LEGACY_METRIC_PATHS}
 
 
 def pluck(row: dict, metric: str) -> float:
-    return _pluck(row, ALL_METRIC_PATHS[metric])
+    # The adjusted count is a top-level row key, present only when it was asked for.
+    return _pluck(row, ALL_METRIC_PATHS.get(metric, (metric,)))
 
 
 def _pluck(row: dict, path: Tuple[str, ...]) -> float:

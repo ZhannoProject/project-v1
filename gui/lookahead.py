@@ -363,6 +363,85 @@ def _eegio_pairs(runs, family, hidden):
     ]
 
 
+def _eegio_groups(runs, family, hidden):
+    """One matched recipe across seeds, with one checkpoint per seed/rung."""
+    baselines, rungs = _comparison_runs(runs, family, hidden)
+    grouped = {}
+    for run, recipe in baselines:
+        key = json.dumps(_without_seed(recipe), sort_keys=True)
+        grouped.setdefault(key, []).append((run, recipe))
+    groups = []
+    for key, references in grouped.items():
+        members, duplicates, baseline_map = [], [], {}
+        for baseline, recipe in sorted(references, key=lambda item: (item[0]["master_seed"], item[0]["name"])):
+            seed = baseline["master_seed"]
+            if str(seed) in baseline_map:
+                duplicates.append(baseline["name"])
+                continue
+            baseline_map[str(seed)] = baseline["name"]
+            candidates = [baseline, *(run for run, actual in rungs
+                                      if run["master_seed"] == seed and actual == recipe)]
+            seen = set()
+            for run in sorted(candidates, key=lambda r: (r["lookahead"] is None, r["lookahead"] or 0, r["name"])):
+                budget = run["lookahead"]
+                if budget in seen:
+                    duplicates.append(run["name"])
+                    continue
+                seen.add(budget)
+                members.append({"run": run["name"], "master_seed": seed, "lookahead": budget,
+                                "baseline": baseline["name"]})
+        # All baselines precede the rungs so each seed's count reference is ready.
+        members.sort(key=lambda m: (m["lookahead"] != 0, m["master_seed"],
+                                    m["lookahead"] is None, m["lookahead"] or 0))
+        template = references[0][0]
+        recipe = references[0][1]
+        optimizer = recipe.get("optimizer") or {}
+        optimizer_name = (optimizer.get("label") or optimizer.get("name", "")) if isinstance(optimizer, dict) else str(optimizer)
+        label = f"{template['epochs']} epochs · {template['loss_fn'] or LADDER_LOSS}"
+        if recipe["training"].get("batch_size"):
+            label += f" · batch {recipe['training']['batch_size']}"
+        if optimizer_name:
+            label += f" · {optimizer_name}"
+        budgets = sorted({m["lookahead"] for m in members}, key=lambda b: (b is None, b or 0))
+        groups.append({"id": hashlib.sha256(key.encode()).hexdigest()[:16], "label": label,
+                       "baseline": members[0]["run"], "baselines": baseline_map,
+                       "runs": [m["run"] for m in members], "members": members,
+                       "seeds": sorted({m["master_seed"] for m in members}),
+                       "rungs": budgets, "duplicates": duplicates,
+                       "coverage": [{"lookahead": b, "seeds": [m["master_seed"] for m in members if m["lookahead"] == b]}
+                                    for b in budgets],
+                       "target_fs": template["train_fs"], "tcn_norm": template["tcn_norm"],
+                       "input_normalization": template["input_normalization"],
+                       "variant": family["id"], "hidden_channels": hidden, "artifact": template["artifact"],
+                       "settings": _without_seed(recipe)})
+    # Name otherwise identical choices by their actual data/model settings.
+    labels = [g["label"] for g in groups]
+    for group in groups:
+        if labels.count(group["label"]) > 1:
+            data = group["settings"]["data"]
+            group["label"] += (f" · SNR {data['snr_range_db']} · split {data['split_ratios']}"
+                               f" · dropout {group['settings']['model'].get('dropout')}")
+    return sorted(groups, key=lambda g: (-len(g["runs"]), -len(g["seeds"]), g["id"]))
+
+
+def _rescale_flag(spec: dict) -> bool:
+    value = spec.get("rescale_input", False)
+    if type(value) is not bool:
+        raise ValueError("rescale_input must be a boolean")
+    return value
+
+
+def _offline_zero_phase_flag(spec: dict, zero_phase: bool) -> bool:
+    """Zero-phase filtering for the offline reference only; causal rungs keep the causal filter."""
+    value = spec.get("offline_zero_phase", False)
+    if type(value) is not bool:
+        raise ValueError("offline_zero_phase must be a boolean")
+    if value and zero_phase:
+        raise ValueError("Every model is already zero-phase filtered; choose the causal filter "
+                         "to give only the offline reference zero-phase input")
+    return value
+
+
 def eegio_spec(spec: dict) -> tuple[dict, dict]:
     """Resolve a baseline and matching rungs for one shared EEG-IO evaluation."""
     from gui.eegio_tab import DEFAULT_N_SUBJECTS
@@ -370,6 +449,27 @@ def eegio_spec(spec: dict) -> tuple[dict, dict]:
     records = list_runs()
     family, hidden = _family(spec, records), _hidden_channels(spec)
     runs = spec.get("runs")
+    if runs is None:
+        groups = _eegio_groups(ladder_runs(spec.get("artifact") or "BOTH", family, records=records), family, hidden)
+        selected = next((g for g in groups if g["id"] == spec.get("comparison_id")), None)
+        if selected is None:
+            raise ValueError("Choose a model type and a matching training setup. Refresh Lookahead after training.")
+        if not any(m["lookahead"] != 0 for m in selected["members"]):
+            raise ValueError("This model type has no completed matching lookahead rungs yet.")
+        n = spec.get("n_subjects", DEFAULT_N_SUBJECTS)
+        zero_phase = spec.get("zero_phase", False)
+        if type(n) is not int or not 1 <= n <= DEFAULT_N_SUBJECTS:
+            raise ValueError(f"Choose between 1 and {DEFAULT_N_SUBJECTS} subjects")
+        if type(zero_phase) is not bool:
+            raise ValueError("zero_phase must be a boolean")
+        comparison = {**selected, "schema_version": 2, "scope": "all_seeds_all_rungs",
+                      "master_seed": None, "lookahead": None, "latency_ms": None,
+                      "rungs": {m["run"]: m["lookahead"] for m in selected["members"]},
+                      "baseline_by_run": {m["run"]: m["baseline"] for m in selected["members"]}}
+        return {"runs": selected["runs"], "offline": True, "target_fs": selected["target_fs"],
+                "n_subjects": n, "zero_phase": zero_phase,
+                "rescale_input": _rescale_flag(spec),
+                "offline_zero_phase": _offline_zero_phase_flag(spec, zero_phase)}, comparison
     if (not isinstance(runs, list) or len(runs) < 2
             or any(not isinstance(run, str) for run in runs) or len(set(runs)) != len(runs)):
         raise ValueError("Choose a causal baseline and at least one distinct lookahead rung")
@@ -397,7 +497,9 @@ def eegio_spec(spec: dict) -> tuple[dict, dict]:
     if type(zero_phase) is not bool:
         raise ValueError("zero_phase must be a boolean")
     return {"runs": runs, "offline": True, "target_fs": comparison["target_fs"],
-            "n_subjects": n, "zero_phase": zero_phase}, comparison
+            "n_subjects": n, "zero_phase": zero_phase,
+            "rescale_input": _rescale_flag(spec),
+            "offline_zero_phase": _offline_zero_phase_flag(spec, zero_phase)}, comparison
 
 
 def _seed_stats(values: list[float]) -> dict:
@@ -659,6 +761,7 @@ def measure(spec: dict | None = None) -> dict:
         **family,
         "runs": runs,
         "eegio_pairs": _eegio_pairs(runs, family, hidden),
+        "eegio_groups": _eegio_groups(runs, family, hidden),
     }
 
 

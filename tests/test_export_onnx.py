@@ -319,3 +319,96 @@ class ModeLabellingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoundedLookaheadDeployTests(unittest.TestCase):
+    """
+    A lookahead-L rung runs online as a causal system whose output is L samples
+    late: the export declares L and verifies bounded dependence, and the
+    windowed stream emits each output only once its L future inputs exist.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        torch.set_num_threads(1)
+        torch.manual_seed(0)
+        cls.tmp = tempfile.TemporaryDirectory()
+        _, ckpt = _checkpoint(cls.tmp.name, "tcn_se_la8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cls.sidecar = export_checkpoint(ckpt, out_dir=cls.tmp.name, name="la8")
+        cls.d = EEGDenoiser(Path(cls.tmp.name) / "la8.onnx", 1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_the_export_declares_and_verifies_its_horizon(self):
+        v, p = self.sidecar["verification"], self.sidecar["preprocessing"]
+        self.assertEqual(v["lookahead_samples"], 8)
+        self.assertEqual(v["causality_past_diff"], 0.0)
+        self.assertLessEqual(v["observed_future_reach"], 8)
+        self.assertEqual(p["lookahead_samples"], 8)
+        self.assertEqual(self.d.lookahead, 8)
+
+    def test_a_step_graph_is_refused(self):
+        _, ckpt = _checkpoint(self.tmp.name, "tcn_se_la4")
+        with contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaisesRegex(ValueError, "causal-only"):
+            export_checkpoint(ckpt, out_dir=self.tmp.name, name="la4", incremental=True)
+
+    def test_streamed_outputs_are_final_and_l_samples_late(self):
+        d, L, H = self.d, 8, 4
+        W = d.window
+        x = np.random.default_rng(1).standard_normal(W + 40 * H).astype(np.float32) * 25
+        out = d.denoise_stream(x, hop=H)
+        # Every emitted sample equals the output of the window that ends L
+        # samples after it -- the first window in which its future is real.
+        for t in (W - L - 1, W, W + 17, len(x) - L - 1):
+            end = max(W, t + L + 1)
+            end = W + -(-(end - W) // H) * H          # windows end on the hop grid
+            ref = d.denoise_epochs(x[end - W:end])[t - (end - W)]
+            self.assertAlmostEqual(float(out[t]), float(ref), places=4)
+        s = StreamingDenoiser(d, H)
+        pushed = np.concatenate([s.push(x[i:i + H]) for i in range(0, len(x), H)])
+        self.assertEqual(len(pushed), len(x) - L)
+        np.testing.assert_allclose(pushed, out[:len(pushed)], atol=1e-5)
+
+    def test_latency_adds_the_lookahead_wait(self):
+        m = LatencyMonitor(4, self.d.sample_rate)
+        x = np.zeros(self.d.window + 64, dtype=np.float32)
+        stream_realtime(self.d, x, 4, m)
+        s = m.summary()
+        self.assertEqual(s["lookahead_samples"], 8)
+        self.assertAlmostEqual(s["target_e2e_latency_ms"]["median"] - s["e2e_latency_ms"]["median"],
+                               1000 * 8 / self.d.sample_rate, places=2)
+
+
+class ReplayChunkAlignmentTests(unittest.TestCase):
+    def test_hops_are_cut_from_the_window_not_from_sample_zero(self):
+        """500 % 32 != 0 used to leave each hop's data waiting 12 samples."""
+        class Fake:
+            window, sample_rate, lookahead, meta, last_run_s = 500, 1e6, 0, {}, 0.0
+            def denoise_epochs(self, x, sigma=None):
+                return np.asarray(x, dtype=np.float32)
+        seen = []
+        orig = raspi_infer.StreamingDenoiser.push
+        def spy(self, chunk):
+            seen.append(len(chunk))
+            return orig(self, chunk)
+        from unittest import mock
+        with mock.patch.object(raspi_infer.StreamingDenoiser, "push", spy), \
+             mock.patch.object(raspi_infer, "normalization_scale", lambda *a, **k: 1.0):
+            y = stream_realtime(Fake(), np.arange(500 + 3 * 32, dtype=np.float32), 32)
+        self.assertEqual(seen, [500, 32, 32, 32])
+        self.assertEqual(len(y), 596)
+
+
+class StepGraphReplayTests(unittest.TestCase):
+    def test_a_step_graph_reports_no_lookahead(self):
+        """The paced replay reads .lookahead off every denoiser it streams."""
+        self.assertEqual(raspi_infer.IncrementalDenoiser.lookahead, 0)
+        self.assertEqual(raspi_infer.EEGDenoiser.lookahead, 0)
+
+    def test_the_step_graph_has_its_own_paced_replay(self):
+        """stream_realtime() assumed the windowed interface and crashed on a step graph."""
+        self.assertTrue(callable(getattr(raspi_infer.IncrementalDenoiser, "stream_realtime", None)))

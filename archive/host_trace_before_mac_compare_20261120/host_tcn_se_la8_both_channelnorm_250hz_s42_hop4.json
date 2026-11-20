@@ -1,0 +1,208 @@
+{
+  "hop": 4,
+  "sample_rate_hz": 250.0,
+  "hop_budget_ms": 16.0,
+  "n_hops": 12375,
+  "wall_s": 24.876,
+  "first_window_ms": 2.036,
+  "infer_ms": {
+    "median": 1.973,
+    "mean": 1.998,
+    "p95": 2.034,
+    "p99": 2.32,
+    "max": 20.142,
+    "min": 1.901,
+    "std": 0.309
+  },
+  "total_ms": {
+    "median": 1.983,
+    "mean": 2.009,
+    "p95": 2.048,
+    "p99": 2.354,
+    "max": 20.174,
+    "min": 1.912,
+    "std": 0.313
+  },
+  "overhead_ms": {
+    "median": 0.01,
+    "mean": 0.011,
+    "p95": 0.017,
+    "p99": 0.039,
+    "max": 0.601,
+    "min": 0.009,
+    "std": 0.009
+  },
+  "deadline_misses": 2,
+  "miss_rate": 0.0002,
+  "realtime_headroom_x": 7.81,
+  "throughput_hops_per_s": 497.46,
+  "jitter_ms": 0.065,
+  "duty_cycle": {
+    "mean": 0.1256,
+    "p95": 0.128,
+    "p99": 0.1471
+  },
+  "interval_ms": {
+    "median": 1.984,
+    "mean": 2.01,
+    "p95": 2.051,
+    "p99": 2.362,
+    "max": 20.175,
+    "min": 1.912,
+    "std": 0.313
+  },
+  "inference": {
+    "mode": "windowed",
+    "runtime": "onnxruntime",
+    "window": 500,
+    "hop": 4,
+    "kv_cache": false,
+    "recompute_factor": 125.0,
+    "note": "each hop re-runs the whole window; the exported graph has no cache inputs or outputs, so no state carries between calls"
+  },
+  "environment": {
+    "board": "Darwin arm64",
+    "platform": {
+      "system": "Darwin",
+      "release": "27.0.0",
+      "machine": "arm64",
+      "python": "3.12.13"
+    },
+    "supports": {
+      "governor": false,
+      "affinity": false
+    },
+    "cpu": {
+      "count": 10,
+      "online": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "affinity": null,
+      "affinity_str": null,
+      "in_use": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "cpufreq": {
+        "0": {},
+        "1": {},
+        "2": {},
+        "3": {},
+        "4": {},
+        "5": {},
+        "6": {},
+        "7": {},
+        "8": {},
+        "9": {}
+      }
+    },
+    "threads": {
+      "requested": 2,
+      "runtime": {
+        "intra_op": 2,
+        "workers": 1,
+        "inter_op": 1,
+        "execution_mode": "sequential",
+        "allow_spinning": true,
+        "openmp_in_build": false,
+        "omp_num_threads": "2",
+        "onnxruntime": "1.30.0"
+      },
+      "omp": "2",
+      "mkl": "2"
+    },
+    "interrupts": {},
+    "thermal": {
+      "temp_c": null,
+      "throttled": {},
+      "arm_clock": null
+    },
+    "load": {
+      "avg1": 1.83,
+      "avg5": 1.88,
+      "avg15": 1.88
+    },
+    "checks": [
+      {
+        "name": "governor",
+        "status": "n/a",
+        "detail": "Darwin exposes no CPU governor \u2014 the clock cannot be pinned from software here",
+        "want": "every CPU in use at \"performance\""
+      },
+      {
+        "name": "affinity",
+        "status": "n/a",
+        "detail": "Darwin has no CPU affinity API \u2014 the scheduler is free to move the work",
+        "want": "pinned to a fixed set of CPUs, one per thread, off the housekeeping core"
+      },
+      {
+        "name": "threads",
+        "status": "pass",
+        "detail": "2 onnxruntime intra-op threads (1 worker + the caller), pool spinning; OMP_NUM_THREADS=2 governs numpy here, not onnxruntime (this build has no OpenMP)",
+        "want": "an explicit onnxruntime intra-op thread count"
+      },
+      {
+        "name": "thermal",
+        "status": "n/a",
+        "detail": "no throttle flag on this platform",
+        "want": "no throttling latched since boot"
+      },
+      {
+        "name": "load",
+        "status": "warn",
+        "detail": "1-min load 1.83 \u2014 something else is using the machine",
+        "want": "nothing else running (1-min load < 1.0)"
+      }
+    ],
+    "verdict": "unlocked",
+    "summary": "Measurements were taken on Darwin arm64, on a platform that exposes no CPU frequency governor, no CPU affinity control available, and 2 onnxruntime intra-op threads (1 worker and the calling thread), the thread pool spinning between inferences. The machine was not held in a fixed state, so these figures are indicative only and the tail in particular is not reproducible.",
+    "blockers": [
+      "Darwin exposes no CPU governor \u2014 the clock cannot be pinned from software here",
+      "Darwin has no CPU affinity API \u2014 the scheduler is free to move the work"
+    ]
+  },
+  "scores": {
+    "testdata": "BOTH_test100_250hz.npz",
+    "n_epochs": 100,
+    "hop": 4,
+    "split": {
+      "artifact": "BOTH",
+      "master_seed": 42,
+      "source": "recorded"
+    },
+    "modes": {
+      "noisy input (no model)": {
+        "rrmse_t": 2.0025901794433594,
+        "rrmse_s": 5.973189830780029,
+        "acc": 0.4715895354747772
+      },
+      "epoch mode": {
+        "rrmse_t": 0.6619346737861633,
+        "rrmse_s": 0.604734480381012,
+        "acc": 0.7539309859275818
+      },
+      "stream mode (hop 4)": {
+        "rrmse_t": 0.6857545971870422,
+        "rrmse_s": 0.6532752513885498,
+        "acc": 0.739849865436554
+      }
+    }
+  }
+}

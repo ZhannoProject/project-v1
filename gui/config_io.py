@@ -159,7 +159,8 @@ SCHEMA: List[Section] = [
     ]),
     Section("Output", [
         Field("save_dir", "str", GUI_DEFAULTS["save_dir"], nullable=True,
-              help="Leave empty for runs/<variant>_<artifact>[_kd]_<rate>hz[_s<seed>]. "
+              help="Leave empty for runs/<variant>_<artifact>[_kd]_<rate>hz[_fixed][_s<seed>]. "
+                   "Fixed input scale adds _fixed; epoch scale keeps the legacy name. "
                    "The native rate is 256 Hz and the default seed is 42."),
         Field("overwrite", "bool", GUI_DEFAULTS["overwrite"],
               help="Replace the run already in that folder. Without it, training refuses "

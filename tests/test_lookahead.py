@@ -489,10 +489,16 @@ class TestTheTabsNumbers(unittest.TestCase):
              patch("gui.lookahead._checkpoint_info", side_effect=info):
             spec, pair = eegio_spec({"runs": ["causal", "bounded"], "target_fs": 250, "offline": False})
             self.assertEqual(spec, {"runs": ["causal", "bounded"], "target_fs": 256.0,
-                                    "offline": True, "zero_phase": False, "n_subjects": 20})
+                                    "offline": True, "zero_phase": False, "n_subjects": 20,
+                                    "rescale_input": False, "offline_zero_phase": False})
             self.assertEqual((pair["master_seed"], pair["lookahead"], pair["latency_ms"]), (42, 16, 62.5))
             case, _ = eegio_spec({"runs": pair["runs"], "n_subjects": 5, "zero_phase": True})
             self.assertEqual((case["n_subjects"], case["zero_phase"]), (5, True))
+            only_offline, _ = eegio_spec({"runs": pair["runs"], "offline_zero_phase": True})
+            self.assertEqual((only_offline["zero_phase"], only_offline["offline_zero_phase"]), (False, True))
+            for bad in ({"offline_zero_phase": True, "zero_phase": True}, {"offline_zero_phase": "yes"}):
+                with self.assertRaises(ValueError):
+                    eegio_spec({"runs": pair["runs"], **bad})
             sweep_runs = ["causal", "short", "bounded", "offline"]
             sweep, plan = eegio_spec({"runs": sweep_runs})
             self.assertEqual(sweep["runs"], sweep_runs)
@@ -789,7 +795,12 @@ class TestRunsTabTellsTheRungsApart(unittest.TestCase):
         self.assertEqual(_rung_of(self.rows["tcn_se_both"]), 0)
         self.assertIsNone(_rung_of(self.rows["tcn_se_bi_both"]))
 
-    def test_the_exporter_refuses_a_rung_and_says_why(self):
+    def test_a_rung_exports_but_not_as_a_step_graph(self):
+        """
+        A bounded rung runs online with its output delayed by L samples, so
+        it is exportable; only the causal-only step graph refuses it. The
+        unbounded teacher stays refused.
+        """
         from unittest import mock
 
         from gui import pi
@@ -797,16 +808,15 @@ class TestRunsTabTellsTheRungsApart(unittest.TestCase):
              mock.patch.object(pi, "RUNS_DIR", self.tmp):
             models = {m["name"]: m for m in pi.list_models()}
             rung = models["tcn_se_la32_both"]
-            self.assertFalse(rung["exportable"])
-            self.assertFalse(rung["deployable"])
+            self.assertTrue(rung["exportable"])
             self.assertEqual(rung["lookahead"], 32)
             self.assertTrue(models["tcn_se_both"]["exportable"])
             self.assertFalse(models["tcn_se_bi_both"]["exportable"])
 
             with self.assertRaises(ValueError) as ctx:
-                pi._export_step({"model": "tcn_se_la32_both"})
+                pi._export_step({"model": "tcn_se_la32_both", "incremental": True})
             self.assertIn("32 samples", str(ctx.exception))
-            self.assertIn("125.0 ms", str(ctx.exception))
+            self.assertIn("causal-only", str(ctx.exception))
 
     def test_a_model_row_with_neither_flag_is_exportable(self):
         # Rows built elsewhere (and the tests that mock them) carry only

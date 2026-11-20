@@ -188,7 +188,8 @@ def _describe(out: dict, name: str) -> dict:
         "tcn_norms": {r.get("run"): (r.get("arch") or {}).get("tcn_norm") for r in results},
         "baseline": out.get("baseline"),
         "target": target,
-        **({"replay_mode": saved.get("replay_mode", "paced")} if target == "pi5" else {}),
+        **({"replay_mode": saved.get("replay_mode", "paced"),
+            "incremental": bool(saved.get("incremental"))} if target == "pi5" else {}),
         **({"lookahead_comparison": saved["lookahead_comparison"]} if "lookahead_comparison" in saved else {}),
         "offline_window": saved.get("offline_window"),
         "non_causal_test_radius": saved.get("non_causal_test_radius"),
@@ -197,11 +198,44 @@ def _describe(out: dict, name: str) -> dict:
         "target_fs": out.get("target_fs"),
         "hop": out.get("hop"),
         "zero_phase": saved.get("zero_phase"),
+        "rescale_input": bool(saved.get("rescale_input")),
+        "offline_zero_phase": bool(saved.get("offline_zero_phase")),
+        "zero_phase_runs": saved.get("zero_phase_runs") or [],
         "include_soft": saved.get("include_soft"),
         "n_mismatched": len(out.get("rate_mismatch") or []),
         # The headline of each, so the list can be read without opening a row.
         "summary": {r.get("run"): (r.get("summary") or {}) for r in results},
+        **({"lookahead_summary": out["lookahead_summary"]} if "lookahead_summary" in out else {}),
     }
+
+
+def _lookahead_seed_summary(results, comparison):
+    """Summarize participant medians within seed, then mean/sample SD across seeds."""
+    import statistics
+    import math
+
+    by_name = {r["run"]: r for r in results}
+    groups = {}
+    for member in comparison["members"]:
+        result = by_name[member["run"]]
+        group = groups.setdefault(member["lookahead"], [])
+        group.append((member, result.get("summary") or {}))
+    out = []
+    for budget, rows in sorted(groups.items(), key=lambda item: (item[0] is None, item[0] or 0)):
+        metrics = {}
+        for key in sorted({key for _, summary in rows for key in summary}):
+            values = [(m["master_seed"], s[key]["median"]) for m, s in rows
+                      if isinstance(s.get(key), dict) and s[key].get("median") is not None]
+            values = [(seed, value) for seed, value in values if isinstance(value, (int, float))
+                      and math.isfinite(value)]
+            if values:
+                numbers = [v for _, v in values]
+                metrics[key] = {"n": len(numbers), "mean": statistics.mean(numbers),
+                                "sd": statistics.stdev(numbers) if len(numbers) > 1 else None,
+                                "seeds": [seed for seed, _ in values], "values": numbers}
+        out.append({"lookahead": budget, "seeds": [m["master_seed"] for m, _ in rows],
+                    "runs": [m["run"] for m, _ in rows], "metrics": metrics})
+    return out
 
 
 def list_results() -> List[dict]:
@@ -257,6 +291,24 @@ def meta(data_dir: Optional[str] = None) -> dict:
     }
 
 
+def _flag(spec: dict, key: str) -> bool:
+    value = spec.get(key, False)
+    if type(value) is not bool:
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
+def _offline_reference_runs(comparison: dict, runs: List[str]) -> List[str]:
+    """The comparison's offline (unbounded-future) runs, in evaluation order."""
+    if "members" in comparison:
+        offline = {m["run"] for m in comparison["members"] if m["lookahead"] is None}
+    elif "rungs" in comparison:
+        offline = {run for run, budget in comparison["rungs"].items() if budget is None}
+    else:
+        offline = set(runs[1:2]) if comparison.get("lookahead", 0) is None else set()
+    return [run for run in runs if run in offline]
+
+
 def evaluate(spec: dict, *, on_progress: Optional[Callable[[dict], None]] = None,
              evaluate_model: Optional[Callable] = None, target: str = "host",
              lookahead_comparison: Optional[dict] = None) -> dict:
@@ -295,15 +347,32 @@ def evaluate(spec: dict, *, on_progress: Optional[Callable[[dict], None]] = None
         channel=int(spec.get("channel") or 0),
         hop=int(spec.get("hop") or E.EvalConfig.hop),
         zero_phase=bool(spec.get("zero_phase")),
+        rescale_input=_flag(spec, "rescale_input"),
         notch_hz=None if spec.get("no_notch") else E.POWERLINE_HZ,
         include_soft=bool(spec.get("include_soft")),
         detect_k=float(spec.get("detect_k") or 4.0),
         target_fs=float(spec.get("target_fs") or E.PROJECT_FS),
-        adjusted_blink_count=lookahead_comparison is not None,
+        # The Lookahead comparison always asks for it; a Pi replay asks for it
+        # in its spec. The first run sets the per-subject threshold.
+        adjusted_blink_count=lookahead_comparison is not None
+        or spec.get("adjusted_blink_count") is True,
     )
     checkpoints = {}
     if offline:
         cfg, checkpoints = E.prepare_offline(runs, cfg)
+    # Optional: the offline reference reads zero-phase input, the filter its
+    # training data had, while every causal rung keeps the causal filter.
+    zero_phase_runs = []
+    if _flag(spec, "offline_zero_phase"):
+        if lookahead_comparison is None or not offline:
+            raise ValueError("offline_zero_phase applies to Lookahead comparisons only")
+        if cfg.zero_phase:
+            raise ValueError("Every model is already zero-phase filtered")
+        zero_phase_runs = _offline_reference_runs(lookahead_comparison, runs)
+        if not zero_phase_runs:
+            raise ValueError("This comparison has no offline reference to filter differently")
+    from dataclasses import replace as _replace
+    zero_phase_cfg = _replace(cfg, zero_phase=True)
 
     by_name = {r["name"]: r for r in available_runs()}
     mismatched = [
@@ -324,23 +393,43 @@ def evaluate(spec: dict, *, on_progress: Optional[Callable[[dict], None]] = None
 
     results = []
     reference_thresholds_uv = None
+    batch = bool(lookahead_comparison and lookahead_comparison.get("schema_version") == 2)
+    baseline_by_run = lookahead_comparison.get("baseline_by_run", {}) if batch else {}
+    threshold_by_baseline = {}
     for index, run in enumerate(runs):
         report({"phase": "loading_model"})
-        results.append(evaluate_model(data_dir, run, subjects, cfg,
+        if batch:
+            baseline = baseline_by_run[run]
+            if baseline != run and baseline not in threshold_by_baseline:
+                raise ValueError("Evaluate each seed's causal baseline before its lookahead rungs")
+            reference_thresholds_uv = threshold_by_baseline.get(baseline)
+        results.append(evaluate_model(data_dir, run, subjects,
+                                      zero_phase_cfg if run in zero_phase_runs else cfg,
                                       on_progress=report if on_progress else None,
                                       **({"checkpoint": checkpoints[run]} if offline else {}),
                                       **({"reference_thresholds_uv": reference_thresholds_uv}
                                          if reference_thresholds_uv is not None else {})))
-        if cfg.adjusted_blink_count and index == 0:
+        if cfg.adjusted_blink_count and (index == 0 or batch and baseline_by_run[run] == run):
             reference_thresholds_uv = {
                 row["subject"]: row["metric_support"]["adjusted_blink_count"]["threshold_uv"]
-                for row in results[0]["rows"]
+                for row in results[-1]["rows"]
             }
+            if batch:
+                threshold_by_baseline[run] = reference_thresholds_uv
     if on_progress:
         on_progress({"phase": "saving", "completed": total, "total": total})
     from datetime import datetime
 
     hop = None if offline else cfg.hop
+    if batch:
+        by_name = {r["run"]: r for r in results}
+        tests = []
+        for seed, baseline in lookahead_comparison["baselines"].items():
+            members = [by_name[name] for name in runs if name != baseline and baseline_by_run[name] == baseline]
+            tests.extend({**test, "master_seed": int(seed)} for test in E.compare([by_name[baseline], *members]))
+    else:
+        tests = E.compare(results, (*E.ALL_METRIC_PATHS, E.ADJUSTED_BLINK_COUNT)
+                          if cfg.adjusted_blink_count else tuple(E.ALL_METRIC_PATHS))
     out = _finite({
         # What produced this, so a file found next week can be read. The
         # settings matter as much as the numbers: the same models at another
@@ -348,16 +437,20 @@ def evaluate(spec: dict, *, on_progress: Optional[Callable[[dict], None]] = None
         "saved": {
             "at": datetime.now().isoformat(timespec="seconds"),
             "target": target,
-            **({"replay_mode": spec.get("replay_mode", "paced")} if target == "pi5" else {}),
+            **({"replay_mode": spec.get("replay_mode", "paced"),
+                "incremental": bool(spec.get("incremental"))} if target == "pi5" else {}),
             **({"lookahead_comparison": lookahead_comparison} if lookahead_comparison is not None else {}),
             **({"blink_count_adjustment": {
                 "reference_run": runs[0], "source": "output",
+                **({"reference_by_run": baseline_by_run} if batch else {}),
                 "mean_absolute_amplitude_multiplier": E.BLINK_THRESHOLD_MULTIPLIER,
             }} if cfg.adjusted_blink_count else {}),
             **({"offline_window": results[0]["config"]["offline_window"]} if offline else {}),
             "data_dir": data_dir, "n_subjects": subject_count,
             "channel": cfg.channel, "hop": hop, "target_fs": cfg.target_fs,
             "zero_phase": cfg.zero_phase, "notch_hz": cfg.notch_hz,
+            "rescale_input": cfg.rescale_input,
+            **({"offline_zero_phase": True, "zero_phase_runs": zero_phase_runs} if zero_phase_runs else {}),
             "include_soft": cfg.include_soft, "detect_k": cfg.detect_k,
             "band_hz": list(cfg.band),
             # Each model with the rate it trained at, which the run rows do
@@ -371,7 +464,8 @@ def evaluate(spec: dict, *, on_progress: Optional[Callable[[dict], None]] = None
         # -- but it changes what every number below means, so it is said.
         "rate_mismatch": mismatched,
         "results": results,
-        "tests": E.compare(results),
+        "tests": tests,
+        **({"lookahead_summary": _lookahead_seed_summary(results, lookahead_comparison)} if batch else {}),
         "subjects": subjects,
         "baseline": runs[0],
         "hop": hop,

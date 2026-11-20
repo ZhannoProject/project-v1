@@ -767,9 +767,16 @@ class ApiTests(unittest.TestCase):
                 ids.append(s["id"])
             self.assertEqual(len(set(ids)), server.TrainingJobs.MAX_ACTIVE,
                              "each run needs an id of its own, or they share a log")
-            status, err = self.call("/api/train", {"name": "tcn_eog.yaml"})
-            self.assertEqual(status, 409)
-            self.assertIn(str(server.TrainingJobs.MAX_ACTIVE), err["error"])
+            # Past the cap a run waits rather than being refused ...
+            status, queued = self.call("/api/train", {"name": "tcn_eog.yaml"})
+            self.assertEqual(status, 200)
+            self.assertTrue(queued["queued"])
+            self.assertFalse(queued["running"])
+            # ... and stopping it takes it out of the queue without touching the four.
+            status, s = self.call("/api/train/stop", {"id": queued["id"]})
+            self.assertTrue(s["stopped"])
+            self.assertFalse(s["queued"])
+            self.assertEqual(s["returncode"], -1)
 
         # Every run is listed, and each is addressable by id.
         status, s = self.call(f"/api/train/status?id={ids[0]}")
@@ -780,7 +787,7 @@ class ApiTests(unittest.TestCase):
         # finished run is kept so its log and curve can be read back, which is
         # most of why the switcher is worth having.
         self.assertTrue(any(not j["running"] for j in s["jobs"]))
-        self.assertEqual(s["jobs"][0]["id"], ids[-1], "newest first")
+        self.assertEqual(s["jobs"][0]["id"], queued["id"], "newest first")
 
         # Stopping one leaves the others alone.
         status, s = self.call("/api/train/stop", {"id": ids[0]})
@@ -853,7 +860,8 @@ class ApiTests(unittest.TestCase):
         slow = [sys.executable, "-c", "import time; print('x', flush=True); time.sleep(30)"]
         try:
             with self.no_runs(), \
-                 mock.patch.object(server.TRAIN_JOBS, "MAX_ACTIVE", 2), \
+                 mock.patch.object(server.TRAIN_JOBS, "MAX_ACTIVE", 1), \
+                 mock.patch.object(server.TRAIN_JOBS, "MAX_QUEUED", 1), \
                  mock.patch.object(server, "build_train_command", return_value=slow):
                 code, body = self.call("/api/lookahead/train",
                                        {"lookahead": 124, "master_seeds": [42, 54, 67]})
@@ -861,6 +869,23 @@ class ApiTests(unittest.TestCase):
             self.assertIn("more than there is room for", body["error"])
             self.assertEqual(server.TRAIN_JOBS.summaries(), [],
                              "a refused batch must not leave runs going")
+        finally:
+            server.TRAIN_JOBS.stop_all()
+
+    def test_seeds_past_the_running_cap_are_queued_not_refused(self):
+        server.TRAIN_JOBS.reset()
+        slow = [sys.executable, "-c", "import time; print('x', flush=True); time.sleep(30)"]
+        try:
+            with self.no_runs(), \
+                 mock.patch.object(server.TRAIN_JOBS, "MAX_ACTIVE", 2), \
+                 mock.patch.object(server, "build_train_command", return_value=slow):
+                code, body = self.call("/api/lookahead/train",
+                                       {"lookahead": 124, "master_seeds": [42, 54, 67]})
+            self.assertEqual(code, 200, body)
+            by_id = {j["id"]: j for j in body["jobs"]}
+            states = [(by_id[i]["running"], by_id[i]["queued"]) for i in body["started"]]
+            self.assertEqual(states, [(True, False), (True, False), (False, True)])
+            self.assertEqual(by_id[body["started"][2]]["queue_position"], 1)
         finally:
             server.TRAIN_JOBS.stop_all()
 
@@ -907,6 +932,62 @@ class ApiTests(unittest.TestCase):
                         break
                     time.sleep(0.01)
             self.assertIn(held.id, [j["id"] for j in jobs.summaries()])
+        finally:
+            jobs.stop_all()
+
+    @staticmethod
+    def _wait(predicate, timeout=10.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_queued_runs_start_in_order_as_slots_free_up(self):
+        jobs = server.TrainingJobs()
+        jobs.MAX_ACTIVE = 2
+        tmp = Path(tempfile.gettempdir())
+        root = config_io.PROJECT_ROOT
+        slow = [sys.executable, "-c", "import time; print('go', flush=True); time.sleep(30)"]
+        quick = [sys.executable, "-c", "print('done')"]
+        try:
+            a = jobs.start(slow, root, tmp)
+            b = jobs.start(slow, root, tmp)
+            c = jobs.start(quick, root, tmp)
+            d = jobs.start(slow, root, tmp)
+            self.assertTrue(a.running and b.running)
+            self.assertTrue(c.queued and d.queued)
+            self.assertFalse(c.running or d.running)
+            self.assertEqual(jobs.counts(), (2, 2))
+            self.assertEqual([j["queue_position"] for j in jobs.summaries() if j["queued"]], [2, 1],
+                             "newest first, so the later one is further back")
+            self.assertTrue(jobs.running, "the close guard must see waiting runs")
+            a.stop(grace=0.5)
+            # c takes a's slot, finishes at once, and hands its slot to d.
+            self.assertTrue(self._wait(lambda: c.returncode == 0 and d.running))
+            self.assertIn("done", c.status(0)["lines"])
+            self.assertEqual(jobs.counts(), (2, 0))
+        finally:
+            jobs.stop_all()
+
+    def test_a_full_queue_refuses_and_stop_all_drops_the_queue_first(self):
+        jobs = server.TrainingJobs()
+        jobs.MAX_ACTIVE, jobs.MAX_QUEUED = 1, 1
+        tmp = Path(tempfile.gettempdir())
+        slow = [sys.executable, "-c", "import time; time.sleep(30)"]
+        try:
+            running = jobs.start(slow, config_io.PROJECT_ROOT, tmp)
+            waiting = jobs.start(slow, config_io.PROJECT_ROOT, tmp)
+            with self.assertRaises(server.TooManyJobs):
+                jobs.start(slow, config_io.PROJECT_ROOT, tmp)
+            self.assertEqual(jobs.room(), 0)
+            jobs.stop_all()
+            self.assertTrue(self._wait(lambda: not running.running))
+            time.sleep(0.2)
+            self.assertFalse(waiting.running, "a stopped batch must not promote the queue")
+            self.assertEqual(waiting.returncode, -1)
+            self.assertFalse(jobs.running)
         finally:
             jobs.stop_all()
 

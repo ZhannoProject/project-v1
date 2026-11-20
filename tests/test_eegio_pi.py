@@ -172,6 +172,164 @@ class EEGIOPiTests(unittest.TestCase):
                 self.assertEqual(fast["observation_s"], 0.)
 
 
+class EEGIOPiLookaheadAndStepTests(unittest.TestCase):
+    """
+    A bounded-lookahead model replayed windowed, and a causal model replayed
+    through its one-sample step graph at H=1, both through the GUI runner.
+
+    The reference is independent of the replay code: the PyTorch model run
+    once over the whole preprocessed recording. A causal conv model with
+    finite context gives the same output at every sample whichever window it
+    is computed in, provided the window holds its past and its L future
+    samples -- which is exactly what the emission rule promises. A cumulative
+    SE run through the step graph carries its running mean from the first
+    sample, which is again the whole-recording forward pass.
+    """
+
+    SCALE = 2.0
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.enterContext(patch.object(eegio_eval, "PROJECT_ROOT", self.root))
+        self.enterContext(patch.object(config_io, "RUNS_DIR", self.root / "runs"))
+        self.enterContext(patch.object(eegio_tab, "RESULTS_DIR", self.root / "results"))
+        self.data = self.root / "eegio"
+        write_synthetic_recording(self.data, duration_s=16.012, n_blinks=1, n_soft=0, amplitude=60)
+        self.enterContext(patch.object(eegio_tab, "DATA_DIR_CANDIDATES", (self.data,)))
+        self.addCleanup(torch.set_num_threads, torch.get_num_threads())
+        torch.set_num_threads(1)
+        cfg = {"target_fs": 250, "normalization": "fixed", "normalization_scale": self.SCALE}
+        self.models = {}
+        for run, variant, lookahead in (("causal_cumulative_se", "tcn_se", None),
+                                        ("lookahead8", "tcn_la8", 8)):
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(11)
+                model = build_model(variant, hidden_channels=8, tcn_norm="channel").eval()
+            folder = config_io.RUNS_DIR / run
+            folder.mkdir(parents=True)
+            torch.save(dict(model_state=model.state_dict(), model_config=resolved_arch(model),
+                            run_config=cfg, epoch=0), folder / "best.pt")
+            self.models[run] = (model, lookahead)
+        self.enterContext(patch.object(eegio_tab, "available_runs", return_value=[
+            {"name": run, "train_fs": 250., "causal": lookahead is None, "lookahead": lookahead,
+             "bidirectional": False, "train_fs_recorded": True, "training_protocol": "exploratory"}
+            for run, (_, lookahead) in self.models.items()
+        ]))
+        rec = read_recording(str(self.data), "S00")
+        self.filtered = eegio_eval.preprocess(rec.signal[0], rec.fs)
+        self.duration_s = rec.duration_s
+
+    def reference(self, run):
+        model = self.models[run][0]
+        with torch.no_grad():
+            x = torch.from_numpy(self.filtered / self.SCALE)[None, None].float()
+            return model(x)[0, 0].numpy() * self.SCALE
+
+    def replay(self, runs, **change):
+        clock = 0.
+
+        def sleep(seconds):
+            nonlocal clock
+            clock += seconds
+
+        timer = SimpleNamespace(perf_counter=lambda: clock, sleep=sleep)
+        board = {"board": "Raspberry Pi 5 Model B (test fixture)", "verdict": "locked"}
+        remote = LoopbackRemote()
+        spec = {**dict(runs=runs, target_fs=250, n_subjects=1, hop=4, ssh="pi@host"), **change}
+        stdout = io.StringIO()
+        with patch.object(eegio_pi, "Remote", return_value=remote), \
+             patch.object(preflight, "pin"), patch.object(preflight, "check", return_value=board), \
+             patch.object(eegio_replay, "time", timer), contextlib.redirect_stdout(stdout):
+            self.assertEqual(eegio_pi.main([eegio_pi.build_command(spec)[-1]]), 0, stdout.getvalue())
+        result = eegio_tab.read_result(eegio_tab.list_results()[0]["name"])
+        return result, remote.traces
+
+    def test_requests_the_runner_must_refuse(self):
+        base = dict(target_fs=250, n_subjects=1, hop=4, ssh="pi@host")
+        with self.assertRaisesRegex(ValueError, "causal-only"):
+            eegio_pi.build_command({**base, "runs": ["lookahead8"], "incremental": True})
+        with self.assertRaises(ValueError):
+            eegio_pi.build_command({**base, "runs": ["causal_cumulative_se"], "incremental": "yes"})
+        with patch.object(eegio_tab, "available_runs", return_value=[
+                {"name": "teacher", "train_fs": 250., "causal": False, "lookahead": None,
+                 "bidirectional": True, "train_fs_recorded": True}]):
+            with self.assertRaisesRegex(ValueError, "bounded-lookahead"):
+                eegio_pi.build_command({**base, "runs": ["teacher"]})
+        command = eegio_pi.build_command({**base, "runs": ["causal_cumulative_se", "lookahead8"]})
+        self.assertFalse(json.loads(command[-1])["incremental"])
+
+    def test_lookahead_outputs_match_the_whole_recording_forward_pass(self):
+        reference = self.reference("lookahead8")
+        for mode, hop in (("fast", 1), ("fast", 4), ("paced", 4)):
+            with self.subTest(mode=mode, hop=hop):
+                result, traces = self.replay(["lookahead8"], hop=hop, replay_mode=mode)
+                filtered, output = traces[0]
+                np.testing.assert_array_equal(filtered, self.filtered)
+                # Every sample, the final L flushed from the last window included.
+                np.testing.assert_allclose(output, reference, atol=2e-4, rtol=1e-4)
+                report = result["results"][0]["rows"][0]["pi_replay"]
+                self.assertEqual(report["lookahead_samples"], 8)
+                self.assertAlmostEqual(report["lookahead_wait_ms"], 32.0)
+                self.assertEqual(report["backend"], "onnx_windowed")
+                self.assertEqual(report["paced"], mode == "paced")
+
+    def test_emitting_without_the_lookahead_delay_would_be_caught(self):
+        # Guards the test above: the newest hop of each window, as a causal
+        # model emits it, is not the whole-recording output for an L=8 model.
+        model, _ = self.models["lookahead8"]
+        x = torch.from_numpy(self.filtered[:500] / self.SCALE)[None, None].float()
+        with torch.no_grad():
+            window = model(x)[0, 0].numpy() * self.SCALE
+        reference = self.reference("lookahead8")
+        self.assertGreater(np.abs(window[-4:] - reference[496:500]).max(), 1e-3)
+
+    def test_step_graph_at_hop_one_carries_state_across_the_recording(self):
+        reference = self.reference("causal_cumulative_se")
+        for mode in ("fast", "paced"):
+            with self.subTest(mode=mode):
+                result, traces = self.replay(["causal_cumulative_se"], hop=1,
+                                             replay_mode=mode, incremental=True)
+                np.testing.assert_allclose(traces[0][1], reference, atol=2e-4, rtol=1e-4)
+                self.assertTrue(result["saved"]["incremental"])
+                self.assertTrue(eegio_tab.list_results()[0]["incremental"])
+                report = result["results"][0]["rows"][0]["pi_replay"]
+                self.assertEqual((report["backend"], report["hop_samples"]), ("onnx_step", 1))
+                self.assertEqual(report["lookahead_samples"], 0)
+                if mode == "paced":
+                    self.assertEqual(report["deadline_misses"], 0)
+
+    def test_adjusted_blink_count_uses_the_baseline_threshold_for_every_model(self):
+        result, _ = self.replay(["causal_cumulative_se", "lookahead8"], hop=4, replay_mode="fast")
+        key = eegio_eval.ADJUSTED_BLINK_COUNT
+        self.assertEqual(result["saved"]["blink_count_adjustment"]["reference_run"], "causal_cumulative_se")
+        base, rung = (r["rows"][0] for r in result["results"])
+        for row in (base, rung):
+            self.assertIn(key, row)
+            self.assertIn(key, result["results"][0]["summary"])
+        threshold = base["metric_support"]["adjusted_blink_count"]["threshold_uv"]
+        self.assertTrue(np.isfinite(threshold))
+        self.assertEqual(rung["metric_support"]["adjusted_blink_count"]["threshold_uv"], threshold)
+        # The input is counted against the same cutoff for both models.
+        self.assertEqual(rung["metric_support"]["adjusted_blink_count"]["input_blink_count"],
+                         base["metric_support"]["adjusted_blink_count"]["input_blink_count"])
+        self.assertIn(key, {t["metric"] for t in result["tests"]})
+
+    def test_fast_full_windows_are_the_paced_computation_batched(self):
+        # A cumulative SE has no valid short graph, so fast replay batches
+        # full windows; it must give exactly what the paced hop loop gives.
+        outputs = {}
+        for mode in ("paced", "fast"):
+            result, traces = self.replay(["causal_cumulative_se"], hop=2, replay_mode=mode)
+            outputs[mode] = traces[0][1]
+            report = result["results"][0]["rows"][0]["pi_replay"]
+            if mode == "fast":
+                self.assertIsNone(report["inference_window_samples"])
+                self.assertEqual(report["window_batch_size"], eegio_replay.FAST_WINDOW_BATCH)
+        np.testing.assert_allclose(outputs["fast"], outputs["paced"], atol=2e-5, rtol=1e-5)
+
+
 class EEGIOPiApiTests(unittest.TestCase):
     def request(self, path, body=None):
         from gui.server import Handler

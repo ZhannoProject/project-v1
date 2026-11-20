@@ -119,6 +119,8 @@
   #jobTabs .dot.running { background: var(--accent); animation: jobpulse 1.4s ease-in-out infinite; }
   #jobTabs .dot.ok { background: var(--ok); }
   #jobTabs .dot.err { background: var(--err); }
+  #jobTabs .dot.queued { background: transparent; box-shadow: inset 0 0 0 1.5px var(--muted); }
+  #jobTabs button.active .dot.queued { background: transparent; box-shadow: inset 0 0 0 1.5px var(--accent-text); }
   #jobTabs button.active .dot { background: var(--accent-text); animation: none; }
   @keyframes jobpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
   /* Display only: the variant label reads as a model name (TCN_MHA · EOG) while
@@ -126,6 +128,7 @@
      what the YAML and build_model() use. The run rows below are directory names
      in runs/, so they stay as they are on disk. */
   tr.group td { background: var(--code); font-weight: 600; color: var(--text); text-transform: uppercase; }
+  tr.temporal-group td { border-top: 2px solid var(--accent); color: var(--accent); padding-top: 12px; }
   tr.group .sub { font-weight: 400; color: var(--muted); margin-left: 8px; font-size: 11.5px; text-transform: none; }
   /* A second line inside an ordinary cell: what a measurement was of, under
      its name. tr.group's .sub is a trailing caption on one line and stays so. */
@@ -633,6 +636,9 @@
            Shown here before a run, refused by the API, and refused again by
            raspi_infer on the board. -->
       <div id="piSplitBanner" class="banner" style="margin:0 0 10px"></div>
+      <!-- Errors the run printed (mostly on stderr from the board). The log box
+           at the bottom scrolls them out of view behind later lines. -->
+      <div id="piErrBanner" class="banner err" style="margin:0 0 10px;white-space:pre-wrap"></div>
 
       <div class="row steps">
         <label class="chk" id="piExportWrap" title="Write deploy/artifacts/<model>.onnx from that run's best.pt first — verified against PyTorch and refused if it is not causal. Ticked for you when the model has no export yet."><input type="checkbox" id="piExport"> export first</label>
@@ -840,10 +846,10 @@
           <option value="validation">EEGdenoiseNet</option>
           <option value="eegio">EEG-IO</option>
         </select>
-        <label class="muted" for="laModelBtn">Baseline model</label>
-        <button id="laModelBtn" type="button" aria-haspopup="dialog" disabled>Choose a run…</button>
-        <label class="muted" for="laVariant">architecture</label>
+        <label class="muted" for="laVariant">Model type</label>
         <select id="laVariant" title="Architecture for measuring and training rungs" disabled><option value="tcn_se">TCN + SE</option></select>
+        <label class="muted" for="laComparison">Training setup</label>
+        <select id="laComparison" title="Matched training recipe across all available seeds" disabled></select>
         <label class="muted" for="laArtifact">artifact</label>
         <select id="laArtifact" title="Which trained runs to read off the ladder"></select>
         <label class="muted" for="laWidth">hidden channels</label>
@@ -856,17 +862,21 @@
 
       <div id="laEegio" hidden>
         <div class="row">
-          <label class="muted" for="laEegioRung">Test rungs</label>
-          <button id="laEegioRung" type="button" aria-haspopup="dialog" disabled>All matched rungs</button>
-          <button id="laEegioAllRungs" type="button" hidden>Use all matched rungs</button>
+          <span id="laEegioScope" class="muted">All available seeds and rungs</span>
           <label class="muted" for="laEegioFilter">Filter</label>
           <select id="laEegioFilter">
             <option value="causal">Causal</option>
             <option value="zero">Zero-phase</option>
+            <option value="causal_offline_zero" title="Causal rungs keep the causal filter; only the offline reference reads zero-phase filtered input, the filter its EEGdenoiseNet training data had. Offline processing can filter both ways, so this is its fair operating condition, but its input then differs from the rungs'.">Causal · offline ref zero-phase</option>
+          </select>
+          <label class="muted" for="laEegioLevel">Input level</label>
+          <select id="laEegioLevel" title="Diagnostic: divide each recording by its own background level (1.4826 x MAD, no labels used) instead of the training scale, so its background reaches the model at the training-EEG level; outputs are scaled back, so scores stay in microvolts. EEG-IO Fp1 is about 19 dB quieter than EEGdenoiseNet training EEG in model units. Local inference only.">
+            <option value="recorded">As recorded</option>
+            <option value="rescaled">Rescaled to training level</option>
           </select>
           <label class="muted" for="laEegioN">Subjects</label>
           <input id="laEegioN" type="number" min="1" max="20" value="20" required style="width:60px">
-          <button id="btnLaEegio" class="primary" disabled>Run EEG-IO</button>
+          <button id="btnLaEegio" class="primary" disabled>Run all seeds &amp; rungs</button>
         </div>
         <div class="row">
           <label class="muted" for="laEegioMetric">Plot</label>
@@ -985,6 +995,8 @@
           <option value="paced">Original speed</option>
           <option value="fast" disabled>Fast replay</option>
         </select>
+        <label class="muted" title="Replay the one-sample step graph instead of re-running the whole window every hop: state is carried between samples, nothing is recomputed. Causal models only; a bounded-lookahead model is always replayed windowed, its outputs emitted L samples late.">
+          <input type="checkbox" id="eegioPiStep"> step graph</label>
       </div>
       <div class="row">
         <label class="muted">models</label>
@@ -1003,6 +1015,7 @@
           <label class="muted" for="eegioRate">rate</label>
           <select id="eegioRate" title="Sampling rate for evaluation. Match it to the model's training rate for a same-rate test."></select>
           <label class="chk"><input type="checkbox" id="eegioZero"> zero-phase filter (non-causal control)</label>
+          <label class="chk" title="Diagnostic: divide each recording by its own background level (1.4826 x MAD, no labels used) instead of the training scale, so its background reaches the model at the training-EEG level; outputs are scaled back, so scores stay in microvolts. EEG-IO Fp1 is about 19 dB quieter than EEGdenoiseNet training EEG in model units. Local inference only."><input type="checkbox" id="eegioRescale"> rescale to training level (diagnostic)</label>
           <label class="chk"><input type="checkbox" id="eegioOffline"> Full-context offline comparison</label>
         </span>
         <span class="muted" id="eegioPiPreprocess" hidden>250 Hz (native) · causal filters</span>
@@ -1426,7 +1439,19 @@
       // No clearing here: the new run gets its own buffer, and the one that
       // was on screen keeps its log for when you switch back to it.
       applyStatus(s); selectJob(s.id, { force: true }); showTab("train"); startPolling();
+      noteQueued([s.id], s.jobs);
     } catch (e) { banner(e.message); }
+  }
+
+  // A run asked for while every slot is taken waits in the queue and starts
+  // by itself; say so once, since its log stays empty until then.
+  function noteQueued(ids, jobs) {
+    const queued = (jobs || []).filter(j => j.queued && ids.includes(j.id));
+    if (!queued.length) return;
+    const n = queued.length;
+    banner(`${n === 1 ? "This run is" : `${n} of these runs are`} queued `
+      + `(${queued.map(j => "#" + j.queue_position).join(", ")}) — `
+      + `${n === 1 ? "it starts" : "they start"} automatically as running slots free up.`, "info");
   }
 
   async function stop() {
@@ -1473,15 +1498,17 @@
     // tab is for. The one exception is the run being read right now: it would
     // be worse for the selected pill to vanish under the cursor the moment
     // its run ends.
-    const list = all.filter(j => j.running || j.id === state.jobId);
+    const list = all.filter(j => j.running || j.queued || j.id === state.jobId);
     // One run is the ordinary case and needs no switcher: the bar appears
     // only once there is a choice to make.
     bar.style.display = list.length > 1 ? "" : "none";
     if (list.length <= 1) return;
     tabs.innerHTML = list.map(j => {
-      const cls = j.running ? "running" : j.returncode === 0 ? "ok" : j.returncode == null ? "" : "err";
-      const where = j.epoch ? `epoch ${j.epoch}${j.max_epochs ? "/" + j.max_epochs : ""}`
-        : j.running ? "starting" : j.returncode === 0 ? "finished" : j.returncode == null ? "—" : `exit ${j.returncode}`;
+      const cls = j.running ? "running" : j.queued ? "queued" : j.returncode === 0 ? "ok" : j.returncode == null ? "" : "err";
+      const where = j.queued ? `queued #${j.queue_position}`
+        : j.epoch ? `epoch ${j.epoch}${j.max_epochs ? "/" + j.max_epochs : ""}`
+        : j.running ? "starting" : j.returncode === 0 ? "finished" : j.returncode == null ? "—"
+        : j.returncode === -1 && !j.started ? "removed from queue" : `exit ${j.returncode}`;
       const best = j.best_val_loss == null ? "" : ` · best ${j.best_val_loss.toFixed(4)}`;
       return `<button data-job="${j.id}" class="${j.id === state.jobId ? "active" : ""} job-${cls}"`
         + ` title="${j.title} — ${where}${best}${j.started ? " · started " + j.started.slice(11, 16) : ""}">`
@@ -1489,10 +1516,11 @@
     }).join("");
     tabs.querySelectorAll("button").forEach(b =>
       b.addEventListener("click", () => selectJob(b.dataset.job)));
-    const n = list.filter(j => j.running).length;
-    $("#jobNote").textContent = n > 1
-      ? `${n} runs at once — they share this machine, so the per-epoch times in each log are not comparable with a run that had it to itself`
-      : "";
+    const n = list.filter(j => j.running).length, q = list.filter(j => j.queued).length;
+    $("#jobNote").textContent = [
+      n > 1 ? `${n} runs at once — they share this machine, so the per-epoch times in each log are not comparable with a run that had it to itself` : "",
+      q ? `${q} queued — each starts when a running slot frees up` : "",
+    ].filter(Boolean).join(" · ");
   }
 
   async function poll() {
@@ -1503,7 +1531,7 @@
       // Keep polling while *any* run is going: the selected one may have
       // finished while another is still filling its own log, and the pills
       // have to stay current or the switcher lies about what is alive.
-      const anyRunning = (s.jobs || []).some(j => j.running);
+      const anyRunning = (s.jobs || []).some(j => j.running || j.queued);
       if (!anyRunning) { clearInterval(pollTimer); pollTimer = null; refreshRuns(); }
     } catch (e) { clearInterval(pollTimer); }
   }
@@ -1534,16 +1562,23 @@
     if (s.command) $("#cmd").textContent = s.command;
     const trainingSteps = s.steps || [];
     const trainingStep = trainingSteps[s.step];
+    const mine = (state.jobList || []).find(j => j.id === state.jobId);
     $("#logNote").textContent = [
+      mine && mine.queued
+        ? `Queued #${mine.queue_position} — starts automatically when one of the ${s.max_active || 4} running slots frees up; Stop removes it from the queue` : "",
       trainingSteps.length > 1 && trainingStep
         ? `Run ${s.step + 1}/${trainingSteps.length} · ${trainingStep.label}` : "",
       s.log_path ? `Mirrored to ${s.log_path}` : "",
     ].filter(Boolean).join(" · ");
     // Train stays available while another run is going — that is the point of
     // allowing several — and is refused by the server at the cap.
+    // Train stays available past the cap too: the run waits in the queue. It
+    // is refused only once the queue is full as well.
     const active = (state.jobList || []).filter(j => j.running).length;
-    $("#btnTrain").disabled = active >= (s.max_active || 4);
-    $("#btnStop").disabled = !s.running;
+    const waiting = (state.jobList || []).filter(j => j.queued).length;
+    $("#btnTrain").disabled = active >= (s.max_active || 4) && waiting >= (s.max_queued ?? 16);
+    $("#btnStop").disabled = !(s.running || s.queued);
+    $("#btnStop").title = s.queued ? "Remove this run from the queue" : "";
     renderJobTabs();
     updatePills(s);
   }
@@ -1557,7 +1592,9 @@
     // The pill speaks for the whole tab, not the selected run: with three
     // going it should say so rather than report whichever one is on screen.
     const active = (state.jobList || []).filter(x => x.running).length;
-    if (active > 1) { j.className = "pill running"; j.lastElementChild.textContent = `${active} training…`; }
+    const waiting = (state.jobList || []).filter(x => x.queued).length;
+    if (waiting) { j.className = "pill running"; j.lastElementChild.textContent = `${active} training · ${waiting} queued`; }
+    else if (active > 1) { j.className = "pill running"; j.lastElementChild.textContent = `${active} training…`; }
     else if (s.running) { j.className = "pill running"; j.lastElementChild.textContent = "training…"; }
     else if (s.returncode == null) { j.className = "pill"; j.lastElementChild.textContent = "idle"; }
     else if (s.returncode === 0) { j.className = "pill ok"; j.lastElementChild.textContent = "finished"; }
@@ -1652,14 +1689,6 @@
     channels: { title: "Choose a model for the EEG channel experiment", get: () => state.channels.model, set: n => setChannelModel(n) },
     eval: { title: "Choose a run to evaluate", get: () => state.evalRun, set: n => setEvalRun(n) },
     deploy: { title: "Choose a model to deploy", get: () => state.pi.model, set: n => setPiModel(n) },
-    laBaseline: { title: "Choose a causal baseline for Lookahead",
-                  hint: "Choose a completed causal baseline to load its Lookahead settings.",
-                  get: () => state.la.eegio.baseline, set: setLaEegioBaseline,
-                  allowed: r => Object.hasOwn(state.la.meta?.baselines || {}, r.name) },
-    laRung: { title: "Choose a Lookahead comparison checkpoint",
-              hint: "These checkpoints match the selected baseline.",
-              get: () => state.la.eegio.rung, set: setLaEegioRung,
-              allowed: r => laEegioGroup().some(p => p.runs[1] === r.name) },
     // The EEG-IO test compares models against a baseline, so this one holds
     // several and the dialog stays open while they are chosen. The first
     // picked is the baseline, which is why order is kept.
@@ -1742,7 +1771,7 @@
     state.pickFor = PICK_FOR[forWhat] ? forWhat : "eval";
     const target = PICK_FOR[state.pickFor];
     $("#pickTitle").textContent = target.title;
-    state.pickCategory = state.pickFor === "laRung" ? "all" : state.runsCategory;
+    state.pickCategory = ["deploy", "eegio", "laRung"].includes(state.pickFor) ? "all" : state.runsCategory;
     const selected = target.get();
     const names = Array.isArray(selected) ? selected : selected ? [selected] : [];
     const categories = new Set((state.meta.runs || []).filter(r => names.includes(r.name)).map(runCategory));
@@ -2035,7 +2064,8 @@
     if (m) {
       const meta = document.createElement("span");
       meta.className = "meta";
-      meta.textContent = [m.variant, m.artifact].filter(Boolean).join(" · ");
+      const run = (state.meta.runs || []).find(r => r.name === name) || m;
+      meta.textContent = [m.variant, m.artifact, runTemporalInfo(run).label].filter(Boolean).join(" · ");
       btn.append(meta);
     }
     const caret = document.createElement("span");
@@ -2123,6 +2153,10 @@
         + `score would be inflated. Cut a matching set: `
         + `<code>python -m deploy.make_testdata --artifact ${t.artifact || m.artifact || "EOG"} `
         + `--master_seed ${m.master_seed}</code>` };
+    if (piRateMismatch(m, t))
+      return { level: "err", text: `<b>Sample-rate mismatch.</b> <b>${m.name}</b> runs at `
+        + `${m.train_fs} Hz but <b>${t.name}</b> holds ${t.fs} Hz epochs — the board refuses this `
+        + `pair. Cut a matching set: <code>python -m deploy.make_testdata --ckpt runs/${m.name}/best.pt</code>` };
     if (t.artifact && m.artifact && t.artifact !== m.artifact)
       return { level: "warn", text: `<b>${m.name}</b> was trained on ${m.artifact} but `
         + `<b>${t.name}</b> is ${t.artifact} — a cross-artifact probe, not a like-for-like score` };
@@ -2139,7 +2173,13 @@
     const m = piModel();
     if (!t || !m) return null;
     if (m.master_seed == null || t.master_seed == null) return "unknown";
-    return Number(m.master_seed) === Number(t.master_seed) ? "match" : "leak";
+    if (Number(m.master_seed) !== Number(t.master_seed)) return "leak";
+    return piRateMismatch(m, t) ? "rate" : "match";
+  }
+
+  // A 250 Hz model refuses 256 Hz epochs on the board, so this pair cannot run.
+  function piRateMismatch(m, t) {
+    return m && t && m.train_fs && t.fs && Math.abs(Number(m.train_fs) - Number(t.fs)) > 1e-6;
   }
 
   function piTestdataSet(name) {
@@ -2170,7 +2210,7 @@
   }
 
   const TD_TAG = { match: ["matches", "match"], leak: ["wrong split", "leak"],
-                   unknown: ["unverified", "unk"] };
+                   rate: ["wrong rate", "leak"], unknown: ["unverified", "unk"] };
 
   function renderPiTestdataMenu() {
     const menu = $("#piTestdataMenu");
@@ -2186,7 +2226,7 @@
     }
     // Matching sets first: with several seeds in play the right one should not
     // have to be hunted for in a list sorted by filename.
-    const order = { match: 0, unknown: 1, leak: 2, null: 1 };
+    const order = { match: 0, unknown: 1, rate: 2, leak: 2, null: 1 };
     for (const t of [...sets].sort((a, b) =>
         (order[piTestdataStatus(a)] ?? 1) - (order[piTestdataStatus(b)] ?? 1)
         || a.name.localeCompare(b.name))) {
@@ -2206,7 +2246,7 @@
       const meta = document.createElement("span");
       meta.className = "meta";
       meta.textContent = t.master_seed != null
-        ? `${t.artifact || "?"} · seed ${t.master_seed} · ${t.size_kb} kB`
+        ? `${t.artifact || "?"} · seed ${t.master_seed}${t.fs ? ` · ${t.fs} Hz` : ""} · ${t.size_kb} kB`
         : `${t.size_kb} kB`;
       b.append(meta);
       b.addEventListener("click", ev => {
@@ -2803,6 +2843,10 @@
     const needsStepExport = onPi && stepModel && !stepModel.step_exported;
     inc.disabled = false;
     inc.parentElement.classList.remove("off");
+    // The step graph is causal-only: a lookahead model streams through the
+    // windowed path, which holds each output back until its future arrives.
+    const stepLook = stepModel && stepModel.lookahead;
+    if (stepLook) { inc.checked = false; inc.disabled = true; inc.parentElement.classList.add("off"); }
     inc.parentElement.title = onPi
       ? "One sample at a time on the board, state carried in and out of the graph — "
         + "no hop buffering, and a real KV cache. Runs <model>_step.onnx"
@@ -2812,6 +2856,9 @@
       : "Run the trained checkpoint one sample at a time in PyTorch, carrying a real KV cache, "
         + "and compare its per-sample cost with the windowed path at this hop. Writes a trace "
         + "that appears in the Runs tab beside the windowed measurement of the same model.";
+    if (stepLook) inc.parentElement.title = `Not for a lookahead model: ${stepModel.name} reads `
+      + `${stepModel.lookahead} samples ahead and the one-sample step graph is causal-only. `
+      + "The windowed path emits each output once its future samples have arrived.";
     // Exporting the step graph is the one thing that makes it possible, so
     // ask for it rather than letting the run fail on a missing file.
     if (needsStepExport && inc.checked) $("#piExport").checked = true;
@@ -2839,9 +2886,12 @@
     }
     $("#piGovernorWrap").style.display = onPi ? "" : "none";
     const hop = Number($("#piHop").value);
-    const fs = (piExport() || {}).sample_rate_hz || 256;
+    const fs = (piExport() || {}).sample_rate_hz || (piModel() || {}).train_fs || 256;
+    const look = Number((piModel() || {}).lookahead) || 0;
     $("#piHopHint").textContent = hop > 0
       ? `buffering delay ${(1e3 * hop / fs).toFixed(1)} ms at ${fs} Hz`
+        + (look ? ` + lookahead ${look} samples = ${(1e3 * look / fs).toFixed(1)} ms → `
+          + `${(1e3 * (hop + look) / fs).toFixed(1)} ms budget` : "")
       : "buffering delay = hop / fs";
     // Affinity is a Linux control. Offering it on a host that has no such API
     // would be offering a setting that quietly does nothing, so the field says
@@ -2934,7 +2984,8 @@
       state.pi.ranExport = (spec.export && !checkOnly) ? spec.export_run : null;
       state.pi.checkOnly = checkOnly;
       $("#piLog").textContent = "";
-      state.pi.next = 0; state.pi.parsed = {}; state.pi.seenTraces = [];
+      state.pi.next = 0; state.pi.parsed = {}; state.pi.seenTraces = []; state.pi.errors = [];
+      state.pi.openedTrace = null;
       if (!checkOnly) {
         // This run's own numbers, not last week's: the panels go back to live
         // and reload themselves as soon as it writes a trace.  A state check
@@ -2967,7 +3018,12 @@
       const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
       log.textContent += (log.textContent ? "\n" : "") + s.lines.join("\n");
       if (atBottom) log.scrollTop = log.scrollHeight;
+      const errs = s.lines.filter(l => /\bERROR\b|^Traceback|^\w*Error:/.test(l));
+      if (errs.length) state.pi.errors = (state.pi.errors || []).concat(errs);
     }
+    const eb = $("#piErrBanner"), errs = state.pi.errors || [];
+    eb.classList.toggle("show", errs.length > 0);
+    eb.textContent = errs.join("\n");
     state.pi.next = s.next ?? state.pi.next;
     state.pi.running = s.running;
     state.pi.returncode = s.returncode;
@@ -3143,7 +3199,24 @@
   // The model the *run* used, not whatever the form has selected now: a run
   // that exports first then measures the file it just wrote, and the
   // verification facts printed beside those numbers have to belong to it.
+  // The export a trace opened from the Runs tab was measured with, read off
+  // its name ({host|latency|incremental}_<export>_hop<N>[...].json). A step
+  // graph is <export>_step beside the windowed one. When that export is gone
+  // the card says so rather than borrowing the form's model.
+  function piTraceExport(name) {
+    const m = name && /^(host|latency|incremental)_(.+)_hop\d+(?:_duty|_realtime)?\.json$/.exec(name);
+    if (!m) return null;
+    const lat = state.pi.loaded.latency;
+    const mode = ((lat && lat.name === name && (lat.summary || {}).inference) || {}).mode
+      || (m[1] === "incremental" ? "incremental" : "windowed");
+    const ex = piMeta().exports;
+    return (mode === "incremental" && ex.find(x => x.name === m[2] + "_step"))
+      || ex.find(x => x.name === m[2]) || { name: m[2], gone: true };
+  }
+
   function piRunExport() {
+    const opened = piTraceExport(state.pi.openedTrace);
+    if (opened) return opened;
     const onnx = ((state.pi.parsed || {}).model || {}).onnx;
     if (onnx) {
       const stem = onnx.split("/").pop().replace(/\.onnx$/, "");
@@ -3163,7 +3236,22 @@
         + (e.params != null ? ` · <b>${fmtK(e.params)}</b> params` : "")
         + (e.window ? ` · ${e.window} samples at ${e.sample_rate_hz || 256} Hz` : "")
         + (e.checkpoint ? ` · from ${escHtml(e.checkpoint)}` : ""));
-      if (e.sidecar) {
+      if (e.gone) {
+        facts.push("this export is no longer in deploy/artifacts/, so what it was verified against cannot be shown");
+      } else if (e.sidecar && e.causality_past_diff == null && e.max_abs_diff_vs_incremental != null) {
+        // A one-sample step graph is verified against models/incremental.py, not
+        // by the windowed causality probe; its causality comes from the windowed
+        // export it was built beside.
+        facts.push(`step graph verified: agrees with the incremental model to <b>${e.max_abs_diff_vs_incremental.toExponential(1)}</b>`
+          + (e.n_steps ? ` over ${e.n_steps} steps` : "")
+          + " · causality is checked on the windowed export");
+      } else if (e.sidecar && e.lookahead_samples) {
+        facts.push(`export verified: agrees with PyTorch to <b>${e.max_abs_diff_vs_torch != null ? e.max_abs_diff_vs_torch.toExponential(1) : "—"}</b>`
+          + `; bounded lookahead <b>L = ${e.lookahead_samples}</b> (${ms(e.future_wait_ms, 1)} ms wait) — a perturbed `
+          + `sample moves no output more than ${e.lookahead_samples} samples before it (by <b>${fmt(e.causality_past_diff, 3)}</b>)`
+          + (e.causality_past_diff === 0 ? ", so outputs are emitted " + e.lookahead_samples + " samples late" : " — <b>contract violated</b>")
+          + (e.host_latency_ms_median != null ? ` · ${ms(e.host_latency_ms_median)} ms per window on the export host` : ""));
+      } else if (e.sidecar) {
         facts.push(`export verified: agrees with PyTorch to <b>${e.max_abs_diff_vs_torch != null ? e.max_abs_diff_vs_torch.toExponential(1) : "—"}</b>`
           + `, and a perturbation of a future sample moves the past by <b>${fmt(e.causality_past_diff, 3)}</b>`
           + (e.causality_past_diff === 0 ? " — strictly causal" : " — <b>not causal</b>")
@@ -3196,7 +3284,8 @@
     const tile = (v, k, d = "") => tiles.push(
       `<div class="stat"><b>${v}</b><span class="k">${k}</span>${d ? `<div class="d">${d}</div>` : ""}</div>`);
     if (p.bench) {
-      tile(`${ms(p.bench.median_ms)} ms`, "one window, back-to-back",
+      tile(`${ms(p.bench.median_ms)} ms`,
+           p.bench.per_sample ? "one sample step, back-to-back" : "one window, back-to-back",
            `p95 ${ms(p.bench.p95_ms)} · max ${ms(p.bench.max_ms)}`);
     }
     if (s) {
@@ -3696,6 +3785,41 @@
       : "recorded by the run itself"}">${guessed ? "~" : ""}${t}</span>`;
   }
 
+  const RUN_TEMPORAL_GROUPS = [
+    ["causal", "No lookahead"],
+    ["lookahead", "Bounded lookahead / output delay"],
+    ["offline", "Offline / unbounded future"],
+  ];
+
+  function runTemporalInfo(r) {
+    const variant = r.variant || "";
+    const positive = value => Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : 0;
+    const lookahead = positive(r.lookahead) || positive(variant.match(/_la(\d+)(?:_|$)/)?.[1]);
+    const delay = positive(r.output_delay);
+    const rate = positive(r.train_fs);
+    if (r.bidirectional || /_bi(?:_|$)/.test(variant) || (r.causal === false && !lookahead && !delay)) {
+      return { key: "offline", label: "Offline · unbounded", title: "Uses future context without a declared finite horizon." };
+    }
+    if (lookahead || delay) {
+      const wait = samples => rate
+        ? `${Number((1000 * samples / rate).toFixed(2))} ms @ ${rate} Hz`
+        : "sampling rate unknown";
+      const labels = [];
+      if (lookahead) labels.push(`Lookahead L=${lookahead} · ${wait(lookahead)}`);
+      if (delay) labels.push(`Output delay D=${delay} · ${wait(delay)}`);
+      return { key: "lookahead", label: labels.join(" · "),
+        title: "Declared future horizon or output delay in samples and milliseconds; excludes batching, execution and transport. These labels are not measured end-to-end latency." };
+    }
+    return { key: "causal", label: "No lookahead", title: "No bounded lookahead or output delay is recorded for this model." };
+  }
+
+  function runTemporalBadge(r, includeCausal = false) {
+    const info = runTemporalInfo(r);
+    if (info.key === "causal" && !includeCausal) return "";
+    return `<span class="badge ${info.key === "offline" ? "bi" : info.key === "lookahead" ? "la" : ""}"`
+      + ` title="${escHtml(info.title)}">${escHtml(info.label)}</span>`;
+  }
+
   function runRow(r, when = "", mode = "tab") {
     const protocol = {
       legacy: '<span class="badge exploratory" title="Historical checkpoint from before the paper training protocol.">Legacy</span>',
@@ -3706,11 +3830,7 @@
       : '<span class="badge exploratory" title="The training protocol could not be verified.">Unverified</span>';
     const qualifiedBadge = r.qualified
       ? '<span class="badge ok" title="Verified legacy validation record: AdamW, MSE, 200 epochs and matching checkpoint history. Scope: historical validation.">Qualified</span>' : "";
-    const badges = (r.bidirectional ? '<span class="badge bi" title="non-causal with no bounded horizon: its attention or its pooling reads the whole 512-sample epoch. A teacher, not a deployable model">bi</span>' : "")
-      + (r.lookahead
-          ? `<span class="badge la" title="bounded lookahead: this run may read ${r.lookahead} sample${r.lookahead === 1 ? "" : "s"} past the one it emits, which is ${(1000 * r.lookahead / 256).toFixed(1)} ms of output delay. Not causal, so the ONNX exporter refuses it — but the horizon is finite and stated, unlike a bi teacher">la${r.lookahead}</span>`
-          + `<span class="badge la" title="the output delay this rung's lookahead costs at 256 Hz">+${(1000 * r.lookahead / 256).toFixed(1)} ms</span>`
-          : "")
+    const badges = runTemporalBadge(r)
       + (r.kd ? '<span class="badge kd">kd</span>' : "")
       + (r.status === "stale" ? '<span class="badge stale" title="history.json and the weights beside it come from different runs — this directory was re-used">stale</span>' : "")
       + (r.status === "interrupted" ? '<span class="badge partial" title="no history.json: the run did not finish">partial</span>' : "")
@@ -3726,15 +3846,15 @@
     // which of them can already be run and which would be exported first —
     // the distinction the Deploy tab's model field is about.
     const deployBadge = (state.pickFor === "deploy" && mode === "pick")
-      ? (r.bidirectional || r.lookahead
-          ? `<span class="badge fail" title="${r.lookahead
-              ? `bounded lookahead: it reads ${r.lookahead} samples ahead, so the exporter refuses it. Deploying one means delaying the output ${(1000 * r.lookahead / 256).toFixed(1)} ms, which no path here implements yet`
-              : "non-causal: it needs the future, so the ONNX exporter refuses it"}">no export</span>`
+      ? (r.bidirectional
+          ? `<span class="badge fail" title="non-causal: it needs the whole future, so the ONNX exporter refuses it">no export</span>`
+          : r.lookahead && !(piMeta().models || []).some(m => m.name === r.name && m.exported)
+            ? `<span class="badge" title="${runTemporalInfo(r).label}. A bounded lookahead model: exported with L declared and verified, and its outputs are emitted ${r.lookahead} samples late">export first · L=${r.lookahead}</span>`
           : (piMeta().models || []).some(m => m.name === r.name && m.exported)
             ? '<span class="badge ok" title="an ONNX export already exists for this run">onnx</span>'
             : '<span class="badge" title="no ONNX export yet — picking this one exports it first">export first</span>')
       : "";
-    const rateBadge = mode === "pick" && ["eegio", "laBaseline", "laRung"].includes(state.pickFor)
+    const rateBadge = mode === "pick" && ["eegio"].includes(state.pickFor)
       ? `<span class="badge${r.train_fs_recorded ? "" : " guessed"}" title="${r.train_fs_recorded
           ? "Recorded training sampling rate" : "Default training rate inferred from legacy metadata"}">${r.train_fs} Hz</span>`
       : "";
@@ -3775,9 +3895,11 @@
     const columns = standard ? EEGIO_STANDARD_COLS : EEGIO_LEGACY_COLS;
     const when = (r.saved_at || r.name || "").replace("T", " ").slice(0, 16);
     const flags = [standard ? "EEG-IO v2" : "Legacy", r.zero_phase ? "zero-phase" : null,
+                   r.rescale_input ? "rescaled to training level" : null,
+                   r.offline_zero_phase ? "offline ref zero-phase" : null,
                    r.offline_window ? `Offline · ${r.offline_window.samples} samples` : null,
                    r.non_causal_test_radius ? `Historical short window · ±${r.non_causal_test_radius} samples` : null,
-                   r.target === "pi5" ? `Pi 5 SSH · ${eegioReplayLabel(r.replay_mode)}` : null,
+                   r.target === "pi5" ? `Pi 5 SSH · ${eegioReplayLabel(r.replay_mode, r.incremental)}` : null,
                    r.include_soft ? "soft blinks" : null,
                    r.n_mismatched ? `comparison includes ${r.n_mismatched} model(s) at another rate` : null]
       .filter(Boolean).join(" · ");
@@ -3811,8 +3933,11 @@
   function pickRunAllowed(run) {
     const target = PICK_FOR[state.pickFor];
     if (target?.allowed) return target.allowed(run);
+    // On the Pi: causal models, and bounded-lookahead rungs (replayed windowed
+    // with outputs emitted L samples late). Never a _bi teacher.
+    const bounded = !run.bidirectional && Number.isInteger(run.lookahead) && run.lookahead > 0;
     return state.pickFor !== "eegio" || $("#eegioTarget").value !== "pi5"
-      || (run.status === "complete" && run.causal);
+      || (run.status === "complete" && (run.causal || bounded));
   }
 
   function fillRunCategories(select, current, rate = null, allowed = () => true) {
@@ -3824,12 +3949,31 @@
     select.value = current;
   }
 
-  function runsMarkup(view, mode = "tab") {
+  function runsMarkup(view, mode = "tab", temporalGroup = null) {
     const category = mode === "pick" ? state.pickCategory : state.runsCategory;
     const rate = mode === "pick" ? pickTrainingRate() : null;
     const includes = r => (category === "all" || runCategory(r) === category)
-      && (rate === null || r.train_fs === rate) && (mode !== "pick" || pickRunAllowed(r));
+      && (rate === null || r.train_fs === rate) && (mode !== "pick" || pickRunAllowed(r))
+      && (temporalGroup === null || runTemporalInfo(r).key === temporalGroup);
     const all = (state.meta.runs || []).filter(includes);
+    if (mode === "pick" && ["deploy", "eegio"].includes(state.pickFor) && temporalGroup === null) {
+      // Keep the existing recipe/time views inside each future-access group.
+      // Filtering never changes the selected models or their baseline order.
+      const visible = ["kind", "loss", "optim"].includes(view)
+        ? all.filter(r => r.status === "complete") : all;
+      const sections = RUN_TEMPORAL_GROUPS.map(([key, label]) => {
+        const rows = visible.filter(r => runTemporalInfo(r).key === key);
+        if (!rows.length) return "";
+        const section = runsMarkup(view, mode, key);
+        return `<tr class="group temporal-group" data-temporal-group="${key}"><td colspan="10">${label}`
+          + `<span class="sub">${rows.length} model${rows.length === 1 ? "" : "s"}</span></td></tr>`
+          + `<tr><td colspan="10" class="muted">${section.note.html ?? escHtml(section.note.text)}</td></tr>`
+          + section.html;
+      }).filter(Boolean);
+      return { html: sections.join("") || HEAD + '<tr><td colspan="10" class="muted">No models match this group, training rate and view.</td></tr>',
+        note: { text: `${visible.length} models · grouped by future access · times use each model's training sampling rate`
+          + (all.length > visible.length ? ` · ${all.length - visible.length} unfinished or stale runs hidden` : "") } };
+    }
     const scopedGroups = (groups, sourceKey) => (groups || []).map(g => {
       const runs = g.runs.filter(includes);
       return { ...g, runs, n: runs.length,
@@ -3978,6 +4122,10 @@
       const names = (b.dataset.traces || b.dataset.trace || "").split(" ").filter(Boolean);
       // Clear first: a row with no duty sweep must not keep another run's.
       state.pi.loaded = { latency: null, duty: null };
+      // The header card and the bench tile describe "the run on screen". With
+      // nothing running, that is now this measurement — not the model the
+      // Deploy form happens to have picked, nor the last job's parsed log.
+      if (!state.pi.running) { state.pi.parsed = {}; state.pi.openedTrace = b.dataset.trace; }
       const sel = $("#piTrace");
       if ([...sel.options].some(o => o.value === b.dataset.trace)) sel.value = b.dataset.trace;
       // The per-hop trace goes last so it, not the real-time replay beside it,
@@ -4215,9 +4363,9 @@
         if (seq !== laMeasureSeq) return;
         state.la.meta = meta;
         const previous = variants.value;
-        variants.replaceChildren(...Object.values(meta.families).map(family =>
+        variants.replaceChildren(...Object.values(meta.families).filter(family => family.id !== "tcn_se").map(family =>
           new Option(family.label, family.id)));
-        if (Object.hasOwn(meta.families, previous)) variants.value = previous;
+        if ([...variants.options].some(option => option.value === previous)) variants.value = previous;
       }
       catch (e) {
         if (seq === laMeasureSeq) {
@@ -4304,27 +4452,32 @@
 
     const eegio = laUsesEegio();
     const metric = eegio ? LOOKAHEAD_EEGIO_COLS.find(col => col[0] === $("#laEegioMetric").value) : null;
-    const group = eegio ? laEegioGroup() : [];
+    const group = eegio ? laEegioGroup() : null;
+    const batch = saved?.lookahead_comparison?.schema_version === 2;
+    const seedSummary = new Map((saved?.lookahead_summary || []).map(r => [r.lookahead, r]));
     const runsAt = new Map();
     if (saved) {
-      runsAt.set(0, saved.runs[0]);
-      for (const pair of group) {
-        if (saved.runs.includes(pair.runs[1])) runsAt.set(pair.lookahead, pair.runs[1]);
+      const comparison = saved.lookahead_comparison;
+      for (const [index, run] of saved.runs.entries()) {
+        const budget = comparison.rungs ? comparison.rungs[run] : index === 0 ? 0 : comparison.lookahead;
+        runsAt.set(budget, run);
       }
     }
-    const rows = eegio && group.length ? d.rows.map(r => ({...r,
-      latency_ms: r.licensed == null ? null : 1000 * r.licensed / group[0].target_fs})) : d.rows;
-    const summary = r => saved?.summary?.[runsAt.get(r.lookahead)];
+    const rows = eegio && group ? d.rows.map(r => ({...r,
+      latency_ms: r.licensed == null ? null : 1000 * r.licensed / group.target_fs})) : d.rows;
+    const summary = r => batch ? seedSummary.get(r.lookahead)?.metrics : saved?.summary?.[runsAt.get(r.lookahead)];
     const missingAdjusted = saved && !saved.summary?.[saved.runs[0]]?.blink_count_reduction_adjusted_pct;
     const score = r => {
       if (!r) return {};
       if (!eegio) return r.rrmse_t;
       const stats = summary(r)?.[metric[0]];
+      if (batch) return stats || {};
       return { mean: stats?.median, n: stats?.median == null ? 0 : stats.n };
     };
     const digits = eegio ? 2 : 4;
     const repeatNote = r => eegio
-      ? (score(r).n ? `${score(r).n} subjects · seed ${saved.lookahead_comparison.master_seed}` : "No saved score")
+      ? (score(r).n ? batch ? `${score(r).n} seeds · ${saved.n_subjects} subjects per seed`
+        : `${score(r).n} subjects · seed ${saved.lookahead_comparison.master_seed}` : "No saved score")
       : seedNote(r);
     const plain = d.variant === "tcn";
     const reference = rows.find(r => plain ? r.lookahead === d.capacity.conv / 2 : r.unbounded);
@@ -4337,7 +4490,8 @@
     const priced = rungs.filter(r => score(r).n);
 
     renderLookaheadChart(rows, score, metric,
-      missingAdjusted && metric?.[0] === "blink_count_reduction_adjusted_pct");
+      missingAdjusted && metric?.[0] === "blink_count_reduction_adjusted_pct", batch,
+      eegio && Boolean(saved?.offline_zero_phase));
 
     // --- the gap this ladder exists to fill ---
     const gap = score(floor0).mean != null && score(reference).mean != null
@@ -4357,7 +4511,7 @@
       + `<th class="num" title="How far the weights actually reach, by perturbing one input sample and finding how far back the output moves. Can fall short of licensed: a dead ReLU in an SE gate drops a licensed dependence to exactly zero.">measured</th>`
       + `<th class="num">used</th>`
       + `<th class="num" title="The convolution window: taps behind t / taps ahead of it. A kernel has a fixed number of taps to place and puts each one on one side or the other, so the two always sum to 124 — lookahead does not add context, it slides the same window forward. The rung number can exceed 124 because the SE gates peek forward as well, and it is the licence that sets the latency. A rung with 0 behind has no past at all: the anti-causal mirror of the baseline, not a better-informed version of it.">window</th>`
-      + `<th class="num">params</th><th class="num">${eegio ? "seed" : "seeds"}</th>`
+      + `<th class="num">params</th><th class="num">seeds</th>`
       + (eegio ? eegioMetricHead(LOOKAHEAD_EEGIO_COLS)
         : `<th class="num">RRMSE_t</th><th class="num">RRMSE_f</th><th class="num">CC</th>`) + `<th></th></tr>`;
 
@@ -4370,6 +4524,7 @@
         ? `${r.variant} <span class="muted" title="Its convolutions are centred: 62 taps either `
           + `side, the same 125-sample window as every rung. Unbounded refers to the SE gate, `
           + `which pools globally.">unbounded</span> <span class="muted">centred</span>`
+          + (eegio && saved?.offline_zero_phase ? ` <span class="warn" title="${OFFLINE_ZERO_TIP}">zero-phase filter</span>` : "")
         : r.variant ? r.variant + share + (r.one_sided ? ` <span class="warn">mirror</span>` : "")
         : `<span class="muted">la${r.lookahead} (unregistered)</span>`;
       const lat = r.unbounded ? `<span class="muted">—</span>`
@@ -4392,9 +4547,13 @@
               + (r.share ? ` · licence ${r.share}` : "")}">`
           + `${r.past == null ? "—" : `${r.past} / ${r.ahead}`}</td>`
         + `<td class="num">${fmtK(r.params)}</td>`
-        + `<td class="num">${eegio ? (runsAt.has(r.lookahead) ? saved.lookahead_comparison.master_seed : "—")
+        + `<td class="num">${eegio ? (batch ? seedSummary.get(r.lookahead)?.seeds.join(" ") || "—"
+          : runsAt.has(r.lookahead) ? saved.lookahead_comparison.master_seed : "—")
           : r.seeds.length ? r.seeds.join(" ") : "<span class='muted'>—</span>"}</td>`
-        + (eegio ? eegioMetricCells(LOOKAHEAD_EEGIO_COLS, null, key => summary(r)?.[key]?.median)
+        + (eegio ? batch ? LOOKAHEAD_EEGIO_COLS.map(([key]) => {
+            const stats = summary(r)?.[key];
+            return `<td class="num">${stats ? fmt(stats.mean, 2) + (stats.sd == null ? "" : " ± " + fmt(stats.sd, 2)) : "—"}</td>`;
+          }).join("") : eegioMetricCells(LOOKAHEAD_EEGIO_COLS, null, key => summary(r)?.[key]?.median)
           : `<td class="num">${metricCell(r.rrmse_t)}</td>`
         + `<td class="num">${metricCell(r.rrmse_s)}</td>`
         + `<td class="num">${metricCell(r.acc)}</td>`)
@@ -4404,7 +4563,9 @@
 
     box.innerHTML = stats
       + `<div style="overflow:auto"><table id="params">${head}${body}</table></div>`
-      + (eegio ? `<p class="hint">${saved ? `Subject medians from one offline test on ${saved.n_subjects} subjects. Latency is the model lookahead budget.`
+      + (eegio ? `<p class="hint">${saved ? batch
+        ? `Participant medians within each seed, then mean ± sample SD across seeds. Seed coverage is listed for each rung; missing rungs are not filled in. Latency is the model lookahead budget.`
+        : `Subject medians from one offline test on ${saved.n_subjects} subjects. Latency is the model lookahead budget.`
         + (missingAdjusted ? " Rerun this test for adjusted blink counts." : "")
         : "Run EEG-IO to score the available rungs on one shared set of recordings."}</p>`
       : `<div class="row"><span class="muted">Measured at ${d.hidden_channels} channels on `
@@ -4427,7 +4588,7 @@
     return `${s.mean.toFixed(4)}${sd}`;
   }
 
-  function renderLookaheadChart(rows, score, metric, missingAdjusted) {
+  function renderLookaheadChart(rows, score, metric, missingAdjusted, seedBatch = false, offlineZero = false) {
     const box = $("#laChart"), legend = $("#laLegend"), note = $("#laChartNote");
     const ceiling = rows.find(r => r.unbounded);
     const reference = score(ceiling).mean;
@@ -4490,7 +4651,8 @@
       over += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="${cssVar("--accent")}" `
             + `stroke-width="1.4" stroke-dasharray="5 4" opacity="0.85"/>`
             + `<text x="${W - R - 4}" y="${+y - 5}" text-anchor="end" font-size="10" `
-            + `fill="${cssVar("--accent")}">${ceiling.variant} (unbounded) ${reference.toFixed(digits)}</text>`;
+            + `fill="${cssVar("--accent")}">${ceiling.variant} (unbounded${offlineZero ? ", zero-phase filter" : ""}) `
+            + `${reference.toFixed(digits)}${offlineZero ? `<title>${OFFLINE_ZERO_TIP}</title>` : ""}</text>`;
     }
 
     // The line joins the rungs that are actually a price curve. A rung with no
@@ -4521,15 +4683,15 @@
               + `<line x1="${+x - 3}" y1="${a}" x2="${+x + 3}" y2="${a}" stroke="${cssVar("--accent")}" stroke-width="1.2"/>`
               + `<line x1="${+x - 3}" y1="${b}" x2="${+x + 3}" y2="${b}" stroke="${cssVar("--accent")}" stroke-width="1.2"/>`;
       }
-      over += `<circle cx="${x}" cy="${y}" r="${metric || n > 1 ? 3.2 : 2.4}" `
-            + `fill="${metric || n > 1 ? cssVar("--accent") : cssVar("--bg")}" `
+      over += `<circle cx="${x}" cy="${y}" r="${metric && !seedBatch || n > 1 ? 3.2 : 2.4}" `
+            + `fill="${metric && !seedBatch || n > 1 ? cssVar("--accent") : cssVar("--bg")}" `
             + `stroke="${cssVar("--accent")}" stroke-width="1.4"><title>${r.variant} · ${mean.toFixed(digits)}</title></circle>`;
     }
 
     box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" `
       + `aria-label="${label} vs lookahead latency">${g}${over}</svg>`;
-    legend.innerHTML = `<span class="item"><i style="background:${cssVar("--accent")}"></i>${metric ? "Median over subjects" : "Mean over seeds"}</span>`
-      + (metric ? "" : `<span class="item muted">Whiskers ± 1 SD · hollow point = one seed</span>`)
+    legend.innerHTML = `<span class="item"><i style="background:${cssVar("--accent")}"></i>${metric && !seedBatch ? "Median over subjects" : "Mean over seeds"}</span>`
+      + (metric && !seedBatch ? "" : `<span class="item muted">Whiskers ± 1 SD · hollow point = one seed</span>`)
       + (mirror.length ? `<span class="item muted">✕ = no past left, off the curve</span>` : "");
     const single = metric ? 0 : curve.filter(r => score(r).n === 1).length;
     const parts = [];
@@ -4625,19 +4787,20 @@
           master_seeds: picked.map(r => r.master_seed),
           overwrite: $("#laOverwrite").checked });
       applyStatus(s); selectJob(s.id, { force: true }); showTab("train"); startPolling();
+      noteQueued(s.started || [], s.jobs);
     } catch (e) { banner(e.message); }
   }
 
   function renderLaBatchButton() {
-    const { baseline, loading } = state.la.eegio;
-    $("#btnLaTrainMissing").disabled = state.la.batchBusy || loading || !baseline || !!state.la.error;
+    const { loading, busy } = state.la.eegio;
+    $("#btnLaTrainMissing").disabled = state.la.batchBusy || busy || loading || !laEegioGroup() || !!state.la.error;
   }
 
   async function trainMissingLookahead() {
     if ($("#btnLaTrainMissing").disabled) return;
     const settings = lookaheadSettings();
     if (!settings) return;
-    const spec = { ...settings, baseline: state.la.eegio.baseline };
+    const spec = { ...settings, baseline: laEegioGroup()?.baseline };
     state.la.batchBusy = true;
     renderLaBatchButton();
     try {
@@ -4662,6 +4825,7 @@
         return;
       }
       applyStatus(job); selectJob(job.id, { force: true }); showTab("train"); startPolling();
+      noteQueued([job.id], job.jobs);
     } catch (e) { banner(e.message); }
     finally {
       state.la.batchBusy = false;
@@ -4671,71 +4835,39 @@
 
   const laUsesEegio = () => $("#laDataset").value === "eegio";
   const laEegioZeroPhase = () => $("#laEegioFilter").value === "zero";
+  const laEegioRescale = () => $("#laEegioLevel").value === "rescaled";
+  const laEegioOfflineZero = () => $("#laEegioFilter").value === "causal_offline_zero";
+  const OFFLINE_ZERO_TIP = "Offline reference scored on zero-phase filtered input (its training filter); "
+    + "every causal rung uses the causal filter. Its blink-count threshold still comes from the causal L=0 output.";
 
   function laEegioGroup() {
-    const { baseline } = state.la.eegio;
-    return (state.la.data?.eegio_pairs || []).filter(p => p.runs[0] === baseline);
+    return (state.la.data?.eegio_groups || []).find(g => g.id === state.la.eegio.comparison);
   }
 
   function syncLaEegioSelection() {
-    const s = state.la.eegio;
-    if (state.la.error) return;
-    const pairs = state.la.data?.eegio_pairs || [];
-    const recipe = s.baseline && state.la.meta?.baselines?.[s.baseline];
-    if (!laMatchesSettings(recipe)) {
-      const preferred = pairs.find(p => p.master_seed === 42 && p.lookahead !== null)
-        || pairs.find(p => p.lookahead !== null) || pairs[0];
-      s.baseline = preferred?.runs[0] ?? null;
-      s.rung = null;
-    } else if (!laEegioGroup().some(p => p.runs[1] === s.rung)) {
-      s.rung = null;
-    }
-  }
-
-  function laMatchesSettings(recipe) {
-    const current = state.la.data;
-    return recipe && current?.id === recipe.variant && current.artifact === recipe.artifact
-      && current.hidden_channels === recipe.hidden_channels;
-  }
-
-  function setLaEegioBaseline(name) {
-    const s = state.la.eegio;
-    const recipe = state.la.meta?.baselines?.[name];
-    if (!recipe || s.busy || s.loading) return;
-    if (name !== s.baseline) s.rung = null;
-    s.baseline = name;
-    s.error = null;
-    $("#laVariant").value = recipe.variant;
-    $("#laArtifact").value = recipe.artifact;
-    $("#laWidth").value = recipe.hidden_channels;
-    if (!state.la.error && laMatchesSettings(recipe)) {
-      renderLookahead();
-    } else {
-      void refreshLookahead(true);
-    }
-  }
-
-  function setLaEegioRung(name) {
-    const s = state.la.eegio;
-    if (s.busy || s.loading || (name !== null && !laEegioGroup().some(p => p.runs[1] === name))) return;
-    s.rung = name;
-    s.error = null;
-    renderLookahead();
+    const groups = state.la.data?.eegio_groups || [], s = state.la.eegio;
+    if (!groups.some(g => g.id === s.comparison)) s.comparison = groups[0]?.id ?? null;
   }
 
   function laEegioHistory(group) {
-    if (!group.length) return [];
-    const { runs, target_fs } = group[0], baseline = runs[0];
-    const allowed = new Set([baseline, ...group.map(p => p.runs[1])]);
-    const zeroPhase = laEegioZeroPhase();
-    const matches = item => item.lookahead_comparison && item.zero_phase === zeroPhase &&
-      item.target_fs === target_fs && item.runs[0] === baseline && item.runs.every(run => allowed.has(run));
+    if (!group) return [];
+    const allowed = new Set(group.runs), baselines = new Set(Object.values(group.baselines));
+    const zeroPhase = laEegioZeroPhase(), rescale = laEegioRescale(), offlineZero = laEegioOfflineZero();
+    const matches = item => {
+      const comparison = item.lookahead_comparison;
+      return comparison && item.zero_phase === zeroPhase && Boolean(item.rescale_input) === rescale
+        && Boolean(item.offline_zero_phase) === offlineZero
+        && item.target_fs === group.target_fs
+        && (comparison.schema_version === 2 ? comparison.id === group.id : baselines.has(item.runs[0]))
+        && item.runs.every(run => allowed.has(run));
+    };
     const history = (state.meta?.eegio_tests || []).filter(matches);
     const result = state.la.eegio.result;
     if (result && !history.some(item => item.name === result.name)) {
       const entry = {
         ...result.saved, name: result.name, saved_at: result.saved.at, runs: result.results.map(r => r.run),
         summary: Object.fromEntries(result.results.map(r => [r.run, r.summary])),
+        lookahead_summary: result.lookahead_summary,
       };
       if (matches(entry)) history.unshift(entry);
     }
@@ -4762,53 +4894,57 @@
   }
 
   function renderLaEegio() {
-    renderLaBatchButton();
     $("#laEegio").hidden = !laUsesEegio();
-    const { busy, loading, baseline, rung } = state.la.eegio;
-    const group = state.la.error ? [] : laEegioGroup();
-    const baselineButton = $("#laModelBtn");
-    baselineButton.textContent = baseline || "Choose a run…";
-    const hasBaselines = !!Object.keys(state.la.meta?.baselines || {}).length;
-    baselineButton.disabled = busy || loading || !hasBaselines;
-    $("#laEegioRung").textContent = rung || "All matched rungs";
-    $("#laEegioAllRungs").hidden = !rung;
-    for (const id of ["laEegioRung", "laEegioAllRungs", "laEegioFilter", "laEegioN", "btnLaEegio"]) {
-      $("#" + id).disabled = busy || loading || !group.length;
+    const { busy, loading } = state.la.eegio;
+    const groups = state.la.error ? [] : state.la.data?.eegio_groups || [];
+    const selectSetup = $("#laComparison");
+    selectSetup.replaceChildren(...groups.map(g => new Option(g.label, g.id)));
+    if (!groups.length) selectSetup.appendChild(new Option("No completed matching training setup", ""));
+    selectSetup.value = state.la.eegio.comparison || "";
+    selectSetup.disabled = busy || loading || !groups.length;
+    const group = state.la.error ? null : laEegioGroup();
+    renderLaBatchButton();
+    const rungCount = group?.coverage.filter(r => r.lookahead !== 0).length || 0;
+    $("#laEegioScope").textContent = group
+      ? `All ${group.seeds.length} seeds · ${rungCount} available rungs / references · ${group.runs.length} models`
+      : "All available seeds and rungs";
+    for (const id of ["laDataset", "laVariant", "laArtifact", "laWidth", "btnLaRefresh"]) {
+      $("#" + id).disabled = busy || loading;
+    }
+    for (const id of ["laEegioFilter", "laEegioLevel", "laEegioN", "btnLaEegio"]) {
+      $("#" + id).disabled = busy || loading || !rungCount;
     }
     const history = laEegioHistory(group), select = $("#laEegioSaved"), previous = select.value;
-    select.replaceChildren(...history.map(entry => new Option(
-      (entry.saved_at || "").replace("T", " ") + " · " + entry.n_subjects + " subjects · "
-      + (entry.runs.length - 1) + " tested rungs", entry.name)));
+    select.replaceChildren(...history.map(entry => {
+      const c = entry.lookahead_comparison;
+      const seeds = c.seeds?.length || 1;
+      return new Option((entry.saved_at || "").replace("T", " ") + ` · ${entry.n_subjects} subjects · ${seeds} seeds · ${entry.runs.length} models`
+        + (c.schema_version === 2 ? "" : " · single-seed test"), entry.name);
+    }));
     if (!history.length) select.appendChild(new Option("No saved test for this filter", ""));
-    select.disabled = !history.length;
+    select.disabled = busy || !history.length;
     if (history.some(entry => entry.name === previous)) select.value = previous;
     const saved = history.find(entry => entry.name === select.value);
     $("#laEegioOpen").disabled = !saved;
-    $("#laEegioSetup").textContent = group.length
-      ? "Fp1 · shared offline windows at " + group[0].target_fs + " Hz"
-        + (group[0].input_normalization === "epoch" ? " · input scale fitted per window" : "")
-        + (saved?.offline_window ? " · " + saved.offline_window.samples + " samples per window" : "")
-      : loading || state.la.error ? ""
-      : baseline ? "This baseline has no matching comparison checkpoints."
-      : hasBaselines ? "Choose a baseline with matching checkpoints from the Runs list."
-      : "Train a causal baseline and a lookahead rung with matching seed, width and recipe.";
+    const coverage = group?.coverage.map(r => `${r.lookahead === null ? "offline" : "L=" + r.lookahead}: seeds ${r.seeds.join(", ")}`).join(" · ");
+    $("#laEegioSetup").textContent = group
+      ? `Fp1 · shared offline windows at ${group.target_fs} Hz`
+        + (group.input_normalization === "epoch" ? " · input scale fitted per window" : "")
+        + (saved?.offline_window ? ` · ${saved.offline_window.samples} samples per window` : "")
+        + (saved?.offline_zero_phase ? " · offline reference on zero-phase input, rungs causal" : "")
+        + ` · ${coverage}`
+        + (group.duplicates.length ? ` · ${group.duplicates.length} duplicate seed/rung checkpoints excluded` : "")
+      : loading || state.la.error ? "" : "Choose a model type with completed causal baselines and matching rungs.";
     renderLaEegioProgress();
     return saved;
   }
 
   async function runLaEegio() {
     const group = laEegioGroup(), subjects = $("#laEegioN"), s = state.la.eegio;
-    if (!group.length || $("#btnLaEegio").disabled || !lookaheadSettings() || !subjects.reportValidity()) return;
-    const requested = s.rung;
-    const selected = new Map();
-    for (const pair of group) {
-      if ((!requested || pair.runs[1] === requested) && !selected.has(pair.lookahead)) {
-        selected.set(pair.lookahead, pair.runs[1]);
-      }
-    }
-    const pair = group[0], runs = [pair.runs[0], ...selected.values()];
-    const spec = { variant: pair.variant, artifact: pair.artifact, hidden_channels: pair.hidden_channels,
-      runs, n_subjects: Number(subjects.value), zero_phase: laEegioZeroPhase() };
+    if (!group || $("#btnLaEegio").disabled || !lookaheadSettings() || !subjects.reportValidity()) return;
+    const spec = { ...lookaheadSettings(), comparison_id: group.id,
+      n_subjects: Number(subjects.value), zero_phase: laEegioZeroPhase(),
+      rescale_input: laEegioRescale(), offline_zero_phase: laEegioOfflineZero() };
     Object.assign(s, { busy: true, error: null, progress: null });
     renderLookahead();
     try {
@@ -4861,7 +4997,9 @@
   const EEGIO_LEAD_COL = ["onset_leakage_ms", "lead ms", "correction starts this long before the signal moves", r => r.onset_leakage?.median_ms];
   const eegioUsesLegacy = out => out.metric_protocol !== "eegio_v2" || state.eegio.metricView === "legacy";
   function eegioColumns(out) {
-    const cols = eegioUsesLegacy(out) ? EEGIO_LEGACY_COLS : EEGIO_STANDARD_COLS;
+    const adjusted = out.results.some(r => r.summary?.blink_count_reduction_adjusted_pct);
+    const cols = eegioUsesLegacy(out) ? EEGIO_LEGACY_COLS
+      : adjusted ? LOOKAHEAD_EEGIO_COLS : EEGIO_STANDARD_COLS;
     return out.results.some(r => r.summary?.onset_leakage_ms) ? [...cols, EEGIO_LEAD_COL] : cols;
   }
   const eegioMetricHead = cols => cols.map(([, label, tip]) =>
@@ -5035,12 +5173,17 @@
         ...spec, ssh: ssh.value.trim(), target_fs: 250,
         threads: Number(threads.value || threads.defaultValue),
         cpus: $("#eegioPiCpus").value, remote_dir: $("#eegioPiDir").value,
-        replay_mode: speed.value,
+        replay_mode: speed.value, incremental: $("#eegioPiStep").checked,
       })));
     } else {
       await measureEegio(onProgress => streamEegio({
         ...spec, zero_phase: $("#eegioZero").checked, offline,
+        rescale_input: $("#eegioRescale").checked,
         target_fs: Number($("#eegioRate").value) || undefined,
+        // One blink threshold per subject (from the baseline's output) for the
+        // input and every output: a per-signal threshold scales with that
+        // signal's own blinks and can make the input miss most of them.
+        adjusted_blink_count: true,
       }, onProgress));
     }
   }
@@ -5090,8 +5233,8 @@
       : p.phase === "inference" ? ` · Inference ${Math.floor(100 * fraction)}%` : "";
   }
 
-  function eegioReplayLabel(mode) {
-    return mode === "fast" ? "Fast replay" : "Original speed";
+  function eegioReplayLabel(mode, incremental) {
+    return (mode === "fast" ? "Fast replay" : "Original speed") + (incremental ? " · step graph" : "");
   }
 
   function renderEegioSubjects(model) {
@@ -5206,8 +5349,8 @@
     const want = onPi ? 250 : Number(sel && sel.value) || null;
     $("#eegioRuns").innerHTML = picked.length
       ? picked.map((r, i) => {
-          const badge = !r.train_fs ? '<b class="bad">unavailable</b>' : r.bidirectional ? '<b class="bad">bi</b>'
-            : r.lookahead ? `<b>la${r.lookahead}</b>` : "<span class='muted'>causal</span>";
+          const run = (state.meta.runs || []).find(row => row.name === r.name) || r;
+          const badge = !r.train_fs ? '<b class="bad">unavailable</b>' : runTemporalBadge(run, true);
           const off = want && r.train_fs && r.train_fs !== want;
           return `<span class="eegio-chip${off ? " off" : ""}"
             title="${r.variant} · seed ${r.master_seed} · trained at ${r.train_fs} Hz${
@@ -5220,14 +5363,22 @@
       : '<span class="muted">none chosen — press “Choose models…”</span>';
 
     const wrongRate = picked.filter(r => want && r.train_fs && r.train_fs !== want);
-    const incompatible = onPi && (wrongRate.length || picked.some(r => !r.causal));
+    // A bounded-lookahead rung replays windowed with its outputs emitted L
+    // samples late; only a _bi teacher (no bound at all) cannot run on the Pi.
+    const bounded = r => !r.bidirectional && Number.isInteger(r.lookahead) && r.lookahead > 0;
+    const stepWanted = onPi && $("#eegioPiStep").checked;
+    const stepRefused = stepWanted && picked.some(bounded);
+    const incompatible = onPi && (wrongRate.length || stepRefused
+      || picked.some(r => !r.causal && !bounded(r)));
     const paper = onPi && picked.some(r => r.training_protocol === "paper");
     const wrongHop = paper && Number($("#eegioHop").value || 4) !== 4;
     $("#eegioHopWarn").textContent = offline
       ? "Shared 2-second windows, filter and scoring range"
       : paper ? "Paper checkpoints require hop 4." : "";
-    $("#eegioRateWarn").innerHTML = incompatible
-      ? '<span class="bad">Pi 5 needs completed causal 250 Hz models. Remove incompatible picks and choose eligible models.</span>'
+    $("#eegioRateWarn").innerHTML = stepRefused
+      ? '<span class="bad">The step graph is causal-only. Untick “step graph” to replay the lookahead models windowed, or remove them.</span>'
+      : incompatible
+      ? '<span class="bad">Pi 5 needs completed causal or bounded-lookahead 250 Hz models. Remove incompatible picks and choose eligible models.</span>'
       : wrongRate.length
       ? `<span class="bad">${wrongRate.length} picked model(s) were trained at a
          different rate</span> — ${wrongRate.map(r => `${r.name} at ${r.train_fs} Hz`)
@@ -5246,6 +5397,7 @@
     const c = out.causality;
     const window = out.saved?.offline_window;
     const lookahead = out.saved?.lookahead_comparison;
+    const baselineRuns = new Set(Object.values(lookahead?.baselines || {first: out.baseline}));
     const zeroPhase = out.saved?.zero_phase ?? out.results[0]?.config?.zero_phase;
     const num = v => (v == null || !isFinite(v)) ? "—" : v.toFixed(2);
     const legacy = eegioUsesLegacy(out);
@@ -5257,15 +5409,20 @@
       <p class="hint">${EXPLORATORY_RESULT} GUI EEG-IO comparison for diagnostics.</p>
       ${lookahead ? `<p class="hint"><b>Lookahead comparison</b> · ${lookahead.rungs ? "ladder sweep"
         : lookahead.lookahead === null ? "causal vs unbounded" : "0 vs " + lookahead.lookahead + " samples"}
-        · seed ${lookahead.master_seed} · ${lookahead.latency_ms == null ? "" : fmt(lookahead.latency_ms, 2) + " ms of model lookahead at "}${lookahead.target_fs} Hz.</p>` : ""}
+        · ${lookahead.schema_version === 2 ? "seeds " + lookahead.seeds.join(", ") + " · all available rungs" : "seed " + lookahead.master_seed}
+        · ${lookahead.latency_ms == null ? "" : fmt(lookahead.latency_ms, 2) + " ms of model lookahead at "}${lookahead.target_fs} Hz.</p>` : ""}
       ${window ? `<p class="hint"><b>Full-context offline comparison</b>
         · Shared ${window.samples}-sample windows, retaining interior predictions after
         discarding ${window.left} samples on the left and ${window.right} on the right.
-        All models use the same filter and scoring range.</p>` : ""}
+        ${out.saved?.offline_zero_phase
+          ? `All models share the scoring range. <b>The offline reference (${out.saved.zero_phase_runs.map(escHtml).join(", ")})
+             reads zero-phase filtered input</b>, the filter its training data had; every other model reads
+             the causal filter. Its paired tests therefore compare different inputs.`
+          : "All models use the same filter and scoring range."}</p>` : ""}
       ${out.saved?.non_causal_test_radius ? `<p class="hint"><b>Historical short-window test</b>
         · Each output uses a centered window of ±${out.saved.non_causal_test_radius} preprocessed samples.
         Scoring uses complete windows.</p>` : ""}
-      ${out.saved?.target === "pi5" ? `<p class="hint"><b>Raspberry Pi 5 (SSH) · ${eegioReplayLabel(out.saved.replay_mode)}</b>
+      ${out.saved?.target === "pi5" ? `<p class="hint"><b>Raspberry Pi 5 (SSH) · ${eegioReplayLabel(out.saved.replay_mode, out.saved.incremental)}</b>
         · Subject scores use the ONNX output returned by the Pi.</p>` : ""}
       ${!(out.saved && state.eegio.viewing) ? "" : `<p class="hint">
          <button data-eegio-close title="Clear this result and go back to the settings above">close</button>
@@ -5273,7 +5430,9 @@
          ${out.saved.at.replace("T", " ")} — ${out.saved.models.map(m =>
            `${m.run} trained at ${m.train_fs}Hz`).join(", ")}${window ? "" : `, hop ${out.saved.hop}`},
          ${out.saved.n_subjects} subject(s)${out.saved.zero_phase
-           ? ", zero-phase control" : ""}${out.saved.include_soft
+           ? ", zero-phase control" : ""}${out.saved.offline_zero_phase
+           ? ", offline reference on zero-phase input" : ""}${out.saved.rescale_input
+           ? ", input rescaled to the training level (diagnostic)" : ""}${out.saved.include_soft
            ? ", soft blinks counted" : ""}.</p>`}
       ${!(out.rate_mismatch || []).length ? "" : `<p class="hint bad">
          ${out.rate_mismatch.map(m => `<b>${m.run}</b> was trained at ${m.train_fs} Hz`)
@@ -5297,7 +5456,7 @@
       <div class="eegio-table"><table>
         <tr><th>run</th>${eegioMetricHead(cols)}<th class="num">${legacy ? "blinks kept (total)" : "peaks in → out (total)"}</th></tr>
         ${out.results.map(r => `<tr>
-          <td>${escHtml(r.run)}${batchNormBadge(r.arch?.tcn_norm)}${r.run === out.baseline ? " <span class='muted'>(baseline)</span>" : ""}</td>
+          <td>${escHtml(r.run)}${batchNormBadge(r.arch?.tcn_norm)}${baselineRuns.has(r.run) ? " <span class='muted'>(baseline)</span>" : ""}${(out.saved?.zero_phase_runs || []).includes(r.run) ? " <span class='warn'>(zero-phase filter)</span>" : ""}</td>
           ${eegioMetricCells(cols, out.hop, key => r.summary?.[key]?.median)}
           <td class="num muted">${eegioBlinkCounts(r.rows, legacy)}</td></tr>`).join("")}
       </table></div>
@@ -5334,7 +5493,7 @@
       <div class="row">
         <label class="muted" for="eegioDetailModel">Model</label>
         <select id="eegioDetailModel">${out.results.map(r => `<option value="${escHtml(r.run)}">
-          ${escHtml(r.run)}${r.run === out.baseline ? " (baseline)" : ""}</option>`).join("")}</select>
+          ${escHtml(r.run)}${baselineRuns.has(r.run) ? " (baseline)" : ""}</option>`).join("")}</select>
         <span class="muted">Subject metrics for this model in the saved comparison</span>
       </div>
       <div id="eegioSubjectDetail"></div>`;
@@ -5385,6 +5544,7 @@
   });
   $("#eegioHistoryView").addEventListener("change", renderRuns);
   $("#eegioHop").addEventListener("input", renderEegio);
+  $("#eegioPiStep").addEventListener("change", renderEegio);
   $("#eegioOffline").addEventListener("change", renderEegio);
   $("#eegioRate").addEventListener("change", renderEegio);
 
@@ -5528,10 +5688,12 @@
   $("#btnLaTrain").addEventListener("click", trainLookahead);
   $("#btnLaTrainMissing").addEventListener("click", trainMissingLookahead);
   $("#btnLaEegio").addEventListener("click", runLaEegio);
-  $("#laModelBtn").addEventListener("click", () => openRunPicker("laBaseline"));
-  $("#laEegioRung").addEventListener("click", () => openRunPicker("laRung"));
-  $("#laEegioAllRungs").addEventListener("click", () => setLaEegioRung(null));
-  for (const id of ["laDataset", "laEegioFilter", "laEegioMetric", "laEegioSaved"]) {
+  $("#laComparison").addEventListener("change", () => {
+    state.la.eegio.comparison = $("#laComparison").value;
+    state.la.eegio.error = null;
+    renderLookahead();
+  });
+  for (const id of ["laDataset", "laEegioFilter", "laEegioLevel", "laEegioMetric", "laEegioSaved"]) {
     $("#" + id).addEventListener("change", () => {
       state.la.eegio.error = null;
       renderLookahead();
@@ -5716,7 +5878,10 @@
       try { const saved = localStorage.getItem("trainGui.config"); if (saved && state.meta.configs.includes(saved)) first = saved; } catch (e) {}
       if (first) await loadConfig(first);
       const s = await api("/api/train/status?since=0");
-      if (s.running || s.returncode != null) { applyStatus(s); if (s.running) startPolling(); }
+      const trainWaiting = (s.jobs || []).some(j => j.running || j.queued);
+      if (s.running || s.queued || s.returncode != null || trainWaiting) {
+        applyStatus(s); if (trainWaiting) startPolling();
+      }
       const e = await api("/api/eval/status?since=0");
       if (e.running || e.returncode != null) { applyEvalStatus(e); if (e.running) startEvalPolling(); }
       const p = await api("/api/pi/status?since=0");

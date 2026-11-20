@@ -148,6 +148,12 @@ def list_exports() -> list[dict]:
             "causal": pre.get("causal"),
             "max_abs_diff_vs_torch": ver.get("max_abs_diff_vs_torch"),
             "causality_past_diff": ver.get("causality_past_diff"),
+            # A step graph's sidecar records this instead of the two above.
+            "max_abs_diff_vs_incremental": ver.get("max_abs_diff_vs_incremental"),
+            "n_steps": ver.get("n_steps"),
+            "lookahead_samples": pre.get("lookahead_samples") or 0,
+            "future_wait_ms": pre.get("future_wait_ms"),
+            "observed_future_reach": ver.get("observed_future_reach"),
             "host_latency_ms_median": ver.get("host_latency_ms_median"),
             "test_metrics": ver.get("test_metrics"),
         })
@@ -186,14 +192,16 @@ def list_models() -> list[dict]:
                "artifact": (r or {}).get("artifact") or (e or {}).get("artifact"),
                "params": (e or {}).get("params") or (r or {}).get("params"),
                "bidirectional": bool((r or {}).get("bidirectional")),
-               # A bounded-lookahead rung is not bidirectional, and the
-               # exporter refuses it just the same: it reads samples that have
-               # not arrived. Running one online means delaying the output by
-               # that many samples, and no path here implements that contract.
-               "lookahead": (r or {}).get("lookahead"),
+               # A bounded-lookahead rung reads L samples that have not arrived
+               # yet, so it runs online with each output emitted L samples late.
+               # The exporter verifies that contract and the windowed replay
+               # honours it; only the one-sample step graph is causal-only.
+               "lookahead": (r or {}).get("lookahead") or (e or {}).get("lookahead_samples") or None,
                # The split this model was fitted on, for the test-set pairing
                # check. None for runs trained before the seed was recorded.
                "master_seed": (r or {}).get("master_seed"),
+               # The rate the model runs at; a test set must match it.
+               "train_fs": (r or {}).get("train_fs") or (e or {}).get("sample_rate_hz"),
                # The one-sample graph is a separate artifact from the windowed
                # one, and the Pi needs it to stream: the page has to be able
                # to say whether this model has one yet.
@@ -208,10 +216,9 @@ def list_models() -> list[dict]:
                 pass
         row["needs"] = ("none" if row["exported"] and not row["stale"]
                         else "re-export" if row["exported"] else "export")
-        # Derived from both, and defaulting to exportable when a row says
-        # neither: the gate is "can the exporter take this", which is false
-        # for an unbounded teacher and for a bounded rung alike.
-        row["exportable"] = not row["bidirectional"] and row["lookahead"] is None
+        # The gate is "can the exporter take this": false only for an
+        # unbounded teacher. A bounded rung exports with its L declared.
+        row["exportable"] = not row["bidirectional"]
         row["deployable"] = row["exported"] or (row["run"] and row["exportable"])
         rows.append(row)
     return rows
@@ -283,7 +290,15 @@ def cut_testdata_for(model_name: str, n: int = 100, overwrite: bool = False) -> 
     from deploy.make_testdata import make_testdata
 
     n = int(n)
+    # The sample rate is part of the protocol too: a 250 Hz model refuses a
+    # 256 Hz set on the board. Cutting from the checkpoint restores the whole
+    # recorded protocol (rate, sampling, resampling), and the name carries the
+    # rate the same way make_testdata writes it.
+    ckpt = RUNS_DIR / model_name / "best.pt"
+    fs = model.get("train_fs")
     stem = f"{artifact}_test{n}" + ("" if int(seed) == 42 else f"_s{int(seed)}")
+    if fs and float(fs) != 256.0:
+        stem += f"_{float(fs):g}hz"
     target = TESTDATA_DIR / f"{stem}.npz"
     if target.is_file() and not overwrite:
         return {"name": target.name, "created": False, "artifact": artifact,
@@ -299,8 +314,13 @@ def cut_testdata_for(model_name: str, n: int = 100, overwrite: bool = False) -> 
     # page has nowhere to show a stdout line.
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        path = make_testdata(str(data_dir), artifact, n,
-                             out_dir=TESTDATA_DIR, master_seed=int(seed))
+        if ckpt.is_file():
+            path = make_testdata(str(data_dir), artifact, n, out_dir=TESTDATA_DIR,
+                                 master_seed=int(seed), checkpoint=str(ckpt))
+        else:
+            path = make_testdata(str(data_dir), artifact, n, out_dir=TESTDATA_DIR,
+                                 master_seed=int(seed),
+                                 target_fs=float(fs) if fs else None)
     return {"name": Path(path).name, "created": True, "artifact": artifact,
             "master_seed": int(seed), "n": n, "log": buf.getvalue().strip()}
 
@@ -344,6 +364,12 @@ def split_mismatch(model_name: str, testdata_name: str) -> Optional[dict]:
                         f"are in that model's training set. Cut a matching set: "
                         f"python -m deploy.make_testdata --artifact {t.get('artifact') or artifact} "
                         f"--master_seed {seed}"}
+    fs_model, fs_set = model.get("train_fs"), t.get("fs")
+    if fs_model and fs_set and abs(float(fs_model) - float(fs_set)) > 1e-6:
+        return {"level": "error",
+                "text": f"{model_name} runs at {float(fs_model):g} Hz but {testdata_name} holds "
+                        f"{float(fs_set):g} Hz epochs — the board refuses this pair. Cut a matching set: "
+                        f"python -m deploy.make_testdata --ckpt runs/{model_name}/best.pt"}
     if t.get("artifact") and artifact and t["artifact"] != artifact:
         return {"level": "warn",
                 "text": f"{model_name} was trained on {artifact} but {testdata_name} is "
@@ -388,6 +414,7 @@ def list_traces() -> list[dict]:
                        environment=None if isinstance(data, list) else (data or {}).get("environment"))
         elif isinstance(data, dict):
             row.update(hop=data.get("hop"), n_hops=data.get("n_hops"),
+                       sample_rate_hz=data.get("sample_rate_hz"),
                        median_ms=(data.get("total_ms") or {}).get("median"),
                        deadline_misses=data.get("deadline_misses"),
                        realtime=("e2e_latency_ms" in data),
@@ -500,9 +527,10 @@ def list_deploy_runs() -> list[dict]:
         key = (where, m.group("model"), hop)
         row = groups.setdefault(key, {
             "model": m.group("model"), "where": where, "hop": hop,
-            # 2dp, not 1: hop 8 is 31.25 ms and rounding that to 31.2 would
-            # make the deadline the row is judged against slightly wrong.
-            "budget_ms": round(hop / TRACE_FS * 1000, 2),
+            # Set below from the trace's own sample rate (the model's, for
+            # traces too old to record it): hop 4 is 16 ms at 250 Hz, not the
+            # 15.62 ms a fixed 256 Hz made of it.
+            "budget_ms": None, "sample_rate_hz": None,
             "mtime": 0.0, "traces": [], "duty": None, "realtime": False,
             "median_ms": None, "n_hops": None, "deadline_misses": None,
             "verdict": None, "csv": False, "scores": None,
@@ -513,6 +541,7 @@ def list_deploy_runs() -> list[dict]:
             "inference": None,
         })
         row["mtime"] = max(row["mtime"], t["mtime"])
+        row["sample_rate_hz"] = row["sample_rate_hz"] or t.get("sample_rate_hz")
         row["traces"].append(t["name"])
         if t.get("scores") and not row.get("scores"):
             row["scores"] = {**t["scores"], "source": "trace"}
@@ -564,6 +593,10 @@ def list_deploy_runs() -> list[dict]:
         row.update(variant=mod.get("variant"), artifact=mod.get("artifact"),
                    params=mod.get("params"), master_seed=mod.get("master_seed"),
                    known=bool(mod))
+        fs = float(row["sample_rate_hz"] or mod.get("train_fs") or TRACE_FS)
+        row["sample_rate_hz"] = fs
+        # 2dp, not 1: hop 8 is 31.25 ms at 256 Hz, and 31.2 would be wrong.
+        row["budget_ms"] = round(row["hop"] / fs * 1000, 2)
         if row["median_ms"] is not None and row["budget_ms"]:
             row["duty_cycle"] = round(row["median_ms"] / row["budget_ms"], 4)
             row["realtime_ok"] = row["median_ms"] < row["budget_ms"]
@@ -853,17 +886,16 @@ def _export_step(spec: dict) -> dict:
     ckpt = RUNS_DIR / run / "best.pt"
     if not ckpt.is_file():
         raise FileNotFoundError(f"runs/{run} has no best.pt — nothing to export")
-    # Said here rather than two minutes into the export: a model that reads
-    # ahead is refused by the exporter, and the two kinds are refused for
-    # reasons worth telling apart.
-    blocked = next((m for m in list_models()
-                    if m["name"] == run and not m.get("exportable", not m["bidirectional"])), None)
-    if blocked and blocked.get("lookahead"):
+    # Said here rather than two minutes into the export: a model with an
+    # unbounded future is refused by the exporter. A bounded rung is not.
+    row = next((m for m in list_models() if m["name"] == run), None)
+    blocked = row if row and not row.get("exportable", not row["bidirectional"]) else None
+    if row and row.get("lookahead") and spec.get("incremental"):
+        fs = row.get("train_fs") or 256.0
         raise ValueError(
-            f"{run} is a bounded-lookahead rung: it reads {blocked['lookahead']} samples past "
-            f"the one it emits ({1000 * blocked['lookahead'] / 256:.1f} ms), so the ONNX "
-            f"exporter refuses it. Running one online means delaying the output by that much, "
-            f"and no path here implements that yet")
+            f"{run} reads {row['lookahead']} samples ahead ({1000 * row['lookahead'] / fs:.1f} ms "
+            f"at {fs:g} Hz); the one-sample step graph is causal-only. Untick incremental "
+            f"inference: the windowed path emits each output once its future samples arrive")
     if blocked:
         raise ValueError(f"{run} is non-causal (its attention or its convolutions see "
                          "ahead) — the ONNX exporter refuses it, and it could not be "
@@ -907,6 +939,14 @@ def build_steps(spec: dict) -> list[dict]:
             "has no hop — it emits on every sample, so its duty cycle is the single number "
             "the latency run already reports. Sweep the windowed graph, or measure the step "
             "graph on its own.")
+    if incremental:
+        row = next((m for m in list_models()
+                    if m["name"] == (spec.get("model") or "").strip()), None)
+        if row and row.get("lookahead"):
+            raise ValueError(
+                f"{row['name']} reads {row['lookahead']} samples ahead; the one-sample step graph "
+                f"is causal-only. Untick incremental inference: the windowed path emits each "
+                f"output once its future samples have arrived")
     check_only = bool(spec.get("check_only"))
     extra = shlex.split(spec.get("extra_args") or "")
 
@@ -1121,6 +1161,10 @@ class LogScan:
     BENCH = re.compile(rf"^\[bench\] median ({_N}) ms \| p95 ({_N}) ms \| max ({_N}) ms per "
                        rf"(\d+)-sample window;\s+hop (\d+) = ({_N}) ms budget "
                        rf"-> ({_NN})x real-time headroom")
+    # A step graph advances one sample, so raspi_infer times one step instead.
+    BENCH_STEP = re.compile(rf"^\[bench\] median ({_N}) ms \| p95 ({_N}) ms \| max ({_N}) ms "
+                            rf"per sample;\s+one sample = ({_N}) ms at ({_N}) Hz "
+                            rf"-> ({_NN})x real-time headroom")
     BOARD = re.compile(r"^-->\s+(.*\|\s*Python\s.*)$")
     THERMAL = re.compile(rf"^-->\s+(before|after):\s+({_NN})°C(.*)$")
 
@@ -1212,6 +1256,13 @@ class LogScan:
                           "max_ms": _num(m.group(3)), "window": int(m.group(4)),
                           "hop": int(m.group(5)), "hop_budget_ms": _num(m.group(6)),
                           "realtime_headroom_x": _num(m.group(7))}
+            return True
+        m = self.BENCH_STEP.match(line)
+        if m:
+            self.bench = {"median_ms": _num(m.group(1)), "p95_ms": _num(m.group(2)),
+                          "max_ms": _num(m.group(3)), "per_sample": True, "window": 1,
+                          "hop": 1, "hop_budget_ms": _num(m.group(4)),
+                          "realtime_headroom_x": _num(m.group(6))}
             return True
         m = self.THERMAL.match(line)
         if m:

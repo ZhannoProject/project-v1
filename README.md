@@ -390,10 +390,13 @@ YAML values and explicit CLI flags override the selected profile. Use
 have identical defaults.
 
 When `save_dir` is omitted, the CLI and GUI derive
-`runs/<variant>_<artifact>[_kd]_<rate>hz[_s<seed>]` from the effective training
+`runs/<variant>_<artifact>[_kd]_<rate>hz[_fixed][_s<seed>]` from the effective training
 configuration. An omitted `target_fs` uses the native 256 Hz rate. For seed 67,
 the same TCN-SE model can produce `tcn_se_both_250hz_s67` and
-`tcn_se_both_256hz_s67`.
+`tcn_se_both_256hz_s67` under epoch input scaling. Fixed input scaling adds
+`_fixed`, for example `tcn_se_both_250hz_fixed_s67`, so it can coexist with
+the epoch-scale run at the same rate and seed. An explicit `save_dir` is
+used as written and must identify a separate folder when changing protocols.
 
 Each training session holds an OS lock on its output directory. Concurrent
 writers are rejected even with `--overwrite`; the GUI also checks active
@@ -490,11 +493,19 @@ delay. Only the shared interior predictions enter scoring, and the result
 records the window and margins. Regular replay defaults to hop 4.
 
 In **Lookahead**, choose **Dataset → EEG-IO** to plot blink amplitude ratio,
-background RMSE, or blink count reduction on the same ladder. Test one rung
-or all available rungs that match the baseline's seed and training recipe.
-The sweep uses the checkpoints' training rate and one shared window and
-scoring interval. Saved tests populate the ladder and remain available with
-per-subject results under **Runs → EEG-IO test**.
+background RMSE, or blink count reduction on the same ladder. Choose a
+**Model type** and matched **Training setup**, then **Run all seeds & rungs**.
+One comparison includes every completed matching seed and available rung,
+including causal and offline references. Coverage is shown before running;
+missing checkpoints are not imputed, and duplicate seed/rung checkpoints
+are represented once using deterministic name order, not their scores.
+Different rates, normalization settings and training recipes stay separate.
+All models share an offline window and scoring interval. Blink-count
+reference thresholds and paired tests use each seed's own causal baseline.
+Plots summarize participant medians within each seed, then show the mean
+and sample SD across seeds with the actual coverage of each rung. Saved
+single-seed tests remain readable and are labeled separately. Full results
+remain available under **Runs → EEG-IO test**.
 
 In the GUI, open **EEG-IO test**, set **Run on** to **Raspberry Pi 5
 (SSH)**, and choose causal models trained at 250 Hz. The GUI exports each

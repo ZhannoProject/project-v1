@@ -138,6 +138,8 @@ class EEGDenoiser:
     median but p95 30 ms / max 40 ms from contending with the OS for every core.
     """
 
+    lookahead = 0                    # causal unless the sidecar declares L (set in __init__)
+
     def __init__(self, onnx_path: str | Path, n_threads: int = 2, spin: bool = True):
         onnx_path = Path(onnx_path)
         opts = ort.SessionOptions()
@@ -170,6 +172,11 @@ class EEGDenoiser:
         self.meta = json.loads(sidecar.read_text()) if sidecar.exists() else {}
         self.sample_rate = self.meta.get("preprocessing", {}).get("sample_rate_hz",
                                                                    SAMPLE_RATE_HZ)
+        # Architectural lookahead L: output index t reads inputs up to t+L, so
+        # a stream may only emit it once sample t+L has arrived. 0 = causal.
+        self.lookahead = int(self.meta.get("preprocessing", {}).get("lookahead_samples") or 0)
+        if self.lookahead >= self.window:
+            raise ValueError(f"lookahead {self.lookahead} does not fit a {self.window}-sample window")
 
         self.last_run_s = 0.0        # wall time of the most recent sess.run (read by LatencyMonitor)
 
@@ -197,10 +204,33 @@ class EEGDenoiser:
         """
         Causally denoise a long 1-D signal; output is sample-aligned with the input.
         ``monitor`` (a LatencyMonitor) records the cost of every hop.
+
+        With lookahead L, each hop keeps the outputs that end L samples before
+        the window end -- the newest ones whose L future inputs are real -- so
+        out[t] is exactly what a live loop emits once sample t+L arrives. The
+        final L samples have no such window; they are filled from the last one
+        and lie outside the scored interval.
         """
         signal = np.asarray(signal, dtype=np.float32)
         sigma = normalization_scale(self.meta, sigma=sigma, online=True)
-        T = self.window
+        T, L = self.window, self.lookahead
+        if monitor is not None:
+            monitor.lookahead = L
+        if L and len(signal) >= T:
+            out = np.empty_like(signal)
+            t0 = time.perf_counter()
+            out[:T] = self.denoise_epochs(signal[:T], sigma=sigma)
+            if monitor is not None:
+                monitor.record_first_window(time.perf_counter() - t0)
+            for end in range(T + hop, len(signal) + hop, hop):
+                end = min(end, len(signal))
+                t0 = time.perf_counter()
+                y = self.denoise_epochs(signal[end - T:end], sigma=sigma)
+                out[end - hop - L:end - L] = y[T - hop - L:T - L]
+                out[end - L:end] = y[T - L:]          # provisional; replaced by the next hop
+                if monitor is not None:
+                    monitor.record_hop(self.last_run_s, time.perf_counter() - t0)
+            return out
         if len(signal) < T:
             # Right-pad with zeros: causality guarantees the padding cannot
             # influence the real samples, but normalise on real samples only.
@@ -243,6 +273,8 @@ class IncrementalDenoiser:
     one; the step graph wins as the hop shrinks, and at a hop of one sample it
     is the only one that keeps up.
     """
+
+    lookahead = 0                    # a step graph is causal-only (the exporter refuses L>0)
 
     def __init__(self, onnx_path: str | Path, n_threads: int = 2, spin: bool = True):
         onnx_path = Path(onnx_path)
@@ -359,6 +391,33 @@ class IncrementalDenoiser:
             out[t] = y * sigma
         return out
 
+    def stream_realtime(self, signal: np.ndarray, sigma: float | None = None,
+                        monitor: "LatencyMonitor | None" = None) -> np.ndarray:
+        """
+        Paced replay for the step graph: each sample is fed when it would have
+        been acquired (t0 + (t+1)/fs) and stepped at once, so the monitor's
+        end-to-end figure is acquisition -> estimate for every single sample.
+        There is no window to fill first; the state starts empty.
+        """
+        signal = np.asarray(signal, dtype=np.float32).reshape(-1)
+        sigma = normalization_scale(self.meta, sigma=sigma, online=True)
+        state = self.initial_state()
+        out = np.empty_like(signal)
+        start = time.perf_counter()
+        for t in range(signal.shape[0]):
+            due = start + (t + 1) / self.sample_rate
+            now = time.perf_counter()
+            if due > now:
+                time.sleep(due - now)
+            t0 = time.perf_counter()
+            y, state = self.step(float(signal[t]) / sigma, state)
+            if monitor is not None:
+                monitor.record_hop(self.last_run_s, time.perf_counter() - t0)
+            out[t] = y * sigma
+        if monitor is not None:
+            monitor.attach_schedule(start, 0)
+        return out
+
 
 class LatencyMonitor:
     """
@@ -420,6 +479,10 @@ class LatencyMonitor:
         self.temp_c: list[float] = []
         self.first_window_ms: float | None = None
         self.available_s: np.ndarray | None = None     # set by attach_schedule()
+        # Lookahead L of the model being timed (set by the streaming paths). The
+        # emitted samples of a hop estimate targets L samples older than its
+        # newest input, so their target-to-output latency includes L / fs.
+        self.lookahead = 0
         self.t_start: float | None = None              # start of the first recorded forward pass
         self._thermal_ok = self.THERMAL.exists()
 
@@ -505,6 +568,13 @@ class LatencyMonitor:
         if self.available_s is not None and n:
             e2e = 1e3 * (np.asarray(self.t_s) - self.available_s)
             s["e2e_latency_ms"] = self._stats(e2e)
+            if self.lookahead:
+                # Newest input available -> output emitted is e2e; the newest
+                # emitted *target* was acquired L samples before that input.
+                wait = 1e3 * self.lookahead / self.fs
+                s["lookahead_samples"] = self.lookahead
+                s["lookahead_wait_ms"] = round(wait, 3)
+                s["target_e2e_latency_ms"] = self._stats(e2e + wait)
             # Backlog detector: a loop that cannot keep up emits later and later.
             q = max(1, n // 4)
             s["e2e_drift_ms"] = round(float(np.median(e2e[-q:]) - np.median(e2e[:q])), 3)
@@ -560,6 +630,11 @@ class LatencyMonitor:
             e = s["e2e_latency_ms"]
             print(f"           end-to-end: sample available -> output emitted  median {e['median']} | "
                   f"p95 {e['p95']} | max {e['max']} ms  (drift over run {s['e2e_drift_ms']:+.2f} ms)")
+            if "target_e2e_latency_ms" in s:
+                g = s["target_e2e_latency_ms"]
+                print(f"           lookahead : L = {s['lookahead_samples']} samples, "
+                      f"+{s['lookahead_wait_ms']} ms wait; target acquired -> output emitted  "
+                      f"median {g['median']} | p95 {g['p95']} | p99 {g['p99']} | max {g['max']} ms")
         if "temp_c" in s:
             c = s["temp_c"]
             print(f"           SoC temp  : {c['start']} -> {c['end']} °C (peak {c['max']})")
@@ -599,6 +674,8 @@ class StreamingDenoiser:
     def __init__(self, denoiser: EEGDenoiser, hop: int = 32, monitor: LatencyMonitor | None = None,
                  sigma: float | None = None):
         self.d, self.hop, self.monitor = denoiser, hop, monitor
+        if monitor is not None:
+            monitor.lookahead = denoiser.lookahead
         self.sigma = normalization_scale(denoiser.meta, sigma=sigma, online=True)
         self.buf = np.zeros(denoiser.window, dtype=np.float32)
         self.filled = 0                                   # real samples in buf
@@ -616,7 +693,11 @@ class StreamingDenoiser:
             if self.filled < W:
                 return np.zeros(0, dtype=np.float32)
             t0 = time.perf_counter()
-            out.append(self.d.denoise_epochs(self.buf, sigma=self.sigma))
+            # With lookahead L the newest L outputs still lack their future
+            # inputs, so they wait for the next hop: every emitted sample is
+            # final, and emission trails acquisition by exactly L samples.
+            L = self.d.lookahead
+            out.append(self.d.denoise_epochs(self.buf, sigma=self.sigma)[:W - L])
             if self.monitor is not None:
                 self.monitor.record_first_window(time.perf_counter() - t0)
 
@@ -624,7 +705,8 @@ class StreamingDenoiser:
             t0 = time.perf_counter()
             self.buf = np.roll(self.buf, -self.hop)
             self.buf[-self.hop:], self.pending = self.pending[:self.hop], self.pending[self.hop:]
-            out.append(self.d.denoise_epochs(self.buf, sigma=self.sigma)[-self.hop:])
+            L = self.d.lookahead
+            out.append(self.d.denoise_epochs(self.buf, sigma=self.sigma)[W - self.hop - L:W - L])
             if self.monitor is not None:
                 self.monitor.record_hop(self.d.last_run_s, time.perf_counter() - t0)
         return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
@@ -647,12 +729,21 @@ def stream_realtime(d: EEGDenoiser, signal: np.ndarray, hop: int = 32,
     s = StreamingDenoiser(d, hop, monitor, sigma=sigma)
     out = []
     t0 = time.perf_counter()
-    for i in range(0, len(signal), chunk):
-        due = t0 + min(i + chunk, len(signal)) / d.sample_rate     # last sample of this chunk arrives
+    # Chunk boundaries start at the window, not at sample 0. Cut from 0, a
+    # window that is not a multiple of the hop (500 samples at 250 Hz, against
+    # 16/32/64) left every hop's data waiting for the remainder of a chunk --
+    # 12 samples, 48 ms -- which the e2e figure then reported as latency.
+    W = min(d.window, len(signal))
+    bounds = [0, W] + list(range(W + chunk, len(signal) + chunk, chunk))
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        b = min(b, len(signal))
+        if a >= b:
+            continue
+        due = t0 + b / d.sample_rate                                # last sample of this chunk arrives
         now = time.perf_counter()
         if due > now:
             time.sleep(due - now)
-        out.append(s.push(signal[i:i + chunk]))
+        out.append(s.push(signal[a:b]))
     if monitor is not None:
         monitor.attach_schedule(t0, d.window)
     return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
@@ -709,7 +800,9 @@ def duty_cycle_check(d: EEGDenoiser, signal: np.ndarray, hops=(64, 32, 16, 8, 4)
                "compute_p99_ms": s["total_ms"]["p99"], "compute_max_ms": s["total_ms"]["max"],
                "duty_mean": dc["mean"], "duty_p99": dc["p99"], "e2e_median_ms": e2e["median"],
                "e2e_max_ms": e2e["max"], "e2e_drift_ms": drift, "deadline_misses": s["deadline_misses"],
-               "total_latency_median_ms": round(s["hop_budget_ms"] + e2e["median"], 2),
+               "lookahead_wait_ms": s.get("lookahead_wait_ms", 0.0),
+               "total_latency_median_ms": round(s["hop_budget_ms"] + e2e["median"]
+                                                + s.get("lookahead_wait_ms", 0.0), 2),
                "temp_c": s.get("temp_c"), "verdict": verdict}
         rows.append(row)
         print(f"       {hop:>4d} {row['hop_budget_ms']:>8.2f} {row['hops_per_s']:>6.1f} | "
@@ -720,7 +813,9 @@ def duty_cycle_check(d: EEGDenoiser, signal: np.ndarray, hops=(64, 32, 16, 8, 4)
     if ok:
         best = min(ok, key=lambda r: r["hop"])
         print(f"[duty] smallest hop that is comfortably real-time: {best['hop']} samples = "
-              f"{best['hop_budget_ms']:.1f} ms buffering + {best['e2e_median_ms']:.1f} ms compute "
+              f"{best['hop_budget_ms']:.1f} ms buffering + "
+              + (f"{best['lookahead_wait_ms']:.1f} ms lookahead + " if best.get("lookahead_wait_ms") else "")
+              + f"{best['e2e_median_ms']:.1f} ms compute "
               f"= {best['total_latency_median_ms']:.1f} ms total latency at {100 * best['duty_mean']:.0f}% duty cycle")
     else:
         print("[duty] no hop in the sweep is comfortably real-time on this board")
@@ -778,7 +873,7 @@ def metrics(pred, clean):
 
 
 #: Filenames deploy/make_testdata.py writes: <ARTIFACT>_test<N>[_s<SEED>].npz
-_TESTDATA_NAME = re.compile(r"^(EOG|EMG|BOTH)_test(\d+)(?:_s(\d+))?\.npz$")
+_TESTDATA_NAME = re.compile(r"^(EOG|EMG|BOTH)_test(\d+)(?:_s(\d+))?(?:_[\d.]+hz)?\.npz$")
 
 
 def testdata_provenance(npz_path: str | Path, data=None) -> dict:
@@ -802,7 +897,8 @@ def testdata_provenance(npz_path: str | Path, data=None) -> dict:
                 "split": str(data["split"]) if "split" in keys else "test",
                 "split_ratios": data["split_ratios"].tolist() if "split_ratios" in keys else None,
                 "sampling": str(data["sampling"]) if "sampling" in keys else None,
-                "resampling": str(data["resampling"]) if "resampling" in keys else None}
+                "resampling": str(data["resampling"]) if "resampling" in keys else None,
+                "fs": float(data["fs"]) if "fs" in keys else None}
 
     m = _TESTDATA_NAME.match(path.name)
     if m:
@@ -939,7 +1035,9 @@ def evaluate_testdata(d: EEGDenoiser, npz_path: str | Path, hop: int = 32, per_s
         print("[test] legacy epoch normalization: reporting offline metrics only")
     start = (cfg.get("valid_history_samples") or 1) - 1
     delay = cfg.get("output_delay", 0)
-    stop = T - max(cfg.get("valid_future_samples", 0), delay)
+    # The last L outputs of an epoch read past its end, so no streamed output
+    # for them is ever final; they are excluded from every row alike.
+    stop = T - max(cfg.get("valid_future_samples", 0), delay, getattr(d, "lookahead", 0))
     if start >= stop:
         raise ValueError("No common complete target interval in test data")
     results = {name: metrics(y[..., start + (0 if name.startswith('noisy') else delay):
@@ -1113,7 +1211,9 @@ def main(argv=None):
               f"providers={d.sess.get_providers()}  "
               f"intra_op={d.threads['intra_op']} ({d.threads['workers']} "
               f"worker{'s' if d.threads['workers'] != 1 else ''} + the caller)  "
-              f"spinning={'on' if d.threads['allow_spinning'] else 'off'}")
+              f"spinning={'on' if d.threads['allow_spinning'] else 'off'}"
+              + (f"  lookahead={d.lookahead} ({1000 * d.lookahead / d.sample_rate:g} ms, "
+                 f"outputs emitted {d.lookahead} samples late)" if d.lookahead else ""))
 
     env = None
     if not a.no_preflight:
@@ -1213,7 +1313,9 @@ def main(argv=None):
             m = new_monitor("latency/realtime" if a.realtime else "latency/stream")
             if a.realtime:
                 print(f"[raspi] replaying {x.size / d.sample_rate:.1f} s of signal at {d.sample_rate} Hz ...")
-                y = stream_realtime(d, x.reshape(-1), a.hop, m, sigma=a.sigma)
+                y = (d.stream_realtime(x.reshape(-1), sigma=a.sigma, monitor=m)
+                     if isinstance(d, IncrementalDenoiser)
+                     else stream_realtime(d, x.reshape(-1), a.hop, m, sigma=a.sigma))
             else:
                 if isinstance(d, IncrementalDenoiser):
                     y = d.denoise_stream(x.reshape(-1), sigma=a.sigma, monitor=m)

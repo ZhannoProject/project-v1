@@ -21,7 +21,8 @@ METRICS = ("gt_mse", "rrmse_t", "rrmse_s", "acc")
 SCOPE = "Single-channel EOG/EMG artifact removal; hardware conclusions limited to measured Pi 5 Cortex-A76"
 
 
-def make_plan(out, variants=("tcn", "tcn_se", "tcn_se_bi"), delays=(0, 8, 16, 32), fs=256., data_dir=None):
+def make_plan(out, variants=("tcn", "tcn_se", "tcn_se_bi"), delays=(0, 8, 16, 32), fs=256., data_dir=None,
+              tcn_norm=None):
     from experiment.config import resolve_config
     from experiment.methodology import context, validate_model
     from models.variants import build_model_from_config, variant_is_causal
@@ -34,7 +35,9 @@ def make_plan(out, variants=("tcn", "tcn_se", "tcn_se_bi"), delays=(0, 8, 16, 32
     jobs, built, frozen = [], [], []
     for variant in variants:
         cfg = resolve_config(dict(profile="paper", variant=variant,
-                                  target_fs=None if fs == 256 else fs))
+                                  target_fs=None if fs == 256 else fs,
+                                  # None keeps the paper profile's own default.
+                                  **({"tcn_norm": tcn_norm} if tcn_norm else {})))
         if data_dir:
             cfg["data_dir"] = str(Path(data_dir).resolve())
         model = build_model_from_config(cfg)
@@ -245,6 +248,8 @@ def main(argv=None):
     p.add_argument("--delays", nargs="+", type=int, default=[0, 8, 16, 32])
     p.add_argument("--fs", type=float, choices=[250., 256.], default=256.)
     p.add_argument("--data_dir")
+    p.add_argument("--tcn_norm", choices=["none", "channel"],
+                   help="TCN normalization for every job (default: the paper profile's)")
     for mode in ("train", "evaluate", "report", "real"):
         p = sub.add_parser(mode)
         p.add_argument("--plan", required=True)
@@ -252,7 +257,7 @@ def main(argv=None):
             p.add_argument("--data_dir", required=True)
     args = parser.parse_args(argv)
     if args.mode == "plan":
-        plan = make_plan(args.out, args.variants, args.delays, args.fs, args.data_dir)
+        plan = make_plan(args.out, args.variants, args.delays, args.fs, args.data_dir, args.tcn_norm)
         print(f"Created {len(plan['jobs'])} jobs; target interval {plan['common_target_interval']}; H=4")
         return
     path = Path(args.plan)

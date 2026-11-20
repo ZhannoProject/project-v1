@@ -27,17 +27,27 @@ def build_command(spec: dict) -> list[str]:
         raise ValueError("Choose one or more models to replay on the Pi 5")
     if len(set(runs)) != len(runs):
         raise ValueError("Choose each model at most once")
+    if spec.get("rescale_input"):
+        raise ValueError("Rescaled input is a local diagnostic; the Pi replays the raw recording")
     if spec.get("zero_phase") or spec.get("target_fs", EEGIO_FS) != EEGIO_FS:
         raise ValueError("Pi 5 replay requires native 250 Hz and causal preprocessing")
     replay_mode = spec.get("replay_mode", "paced")
     if replay_mode not in ("paced", "fast"):
         raise ValueError("Pi replay mode must be paced or fast")
     hop = pi._int(spec, "hop", 4, 1, 512)
+    incremental = spec.get("incremental", False)
+    if type(incremental) is not bool:
+        raise ValueError("incremental must be a boolean")
     available = {r["name"]: r for r in eegio_tab.available_runs()}
     for run in runs:
         model = available.get(run)
-        if not model or model["train_fs"] != EEGIO_FS or not model["causal"]:
-            raise ValueError(f"{run} must be a completed causal model trained at 250 Hz")
+        lookahead = _bounded_lookahead(model)
+        if not model or model["train_fs"] != EEGIO_FS or not (model["causal"] or lookahead):
+            raise ValueError(f"{run} must be a completed causal or bounded-lookahead model "
+                             f"trained at 250 Hz")
+        if incremental and lookahead:
+            raise ValueError(f"{run} reads {lookahead} samples ahead; the one-sample step graph "
+                             f"is causal-only. Replay it windowed")
         if model.get("training_protocol") == "paper" and hop != 4:
             raise ValueError(f"{run} uses the paper protocol and requires hop H=4")
     dataset = eegio_tab.dataset_status()
@@ -59,7 +69,11 @@ def build_command(spec: dict) -> list[str]:
 
     validated = {
         "runs": runs, "target_fs": EEGIO_FS, "data_dir": dataset["dir"],
-        "hop": hop,
+        "hop": hop, "incremental": incremental,
+        # One blink threshold per subject, set on the first (baseline) run's
+        # output and applied to the input and every output, so a model that
+        # changes the background level cannot move its own detection cutoff.
+        "adjusted_blink_count": True,
         "replay_mode": replay_mode,
         "n_subjects": pi._int(spec, "n_subjects", eegio_tab.DEFAULT_N_SUBJECTS, 1, 20),
         "include_soft": bool(spec.get("include_soft")),
@@ -68,13 +82,22 @@ def build_command(spec: dict) -> list[str]:
     return [sys.executable, "-u", "-m", "gui.eegio_pi", json.dumps(validated)]
 
 
+def _bounded_lookahead(model) -> int:
+    """L for a finite-lookahead rung, 0 for anything else (a _bi teacher has no bound)."""
+    if not model or model.get("bidirectional"):
+        return 0
+    value = model.get("lookahead")
+    return value if type(value) is int and value > 0 else 0
+
+
 def check_stopped():
     stop_file = os.environ.get("EEG_GUI_STOP_FILE")
     if stop_file and Path(stop_file).exists():
         raise KeyboardInterrupt
 
 
-def evaluate_model(spec, data_dir, run, subjects, cfg, *, on_progress=None):
+def evaluate_model(spec, data_dir, run, subjects, cfg, *, on_progress=None,
+                   reference_thresholds_uv=None):
     import numpy as np
 
     import eegio_eval as E
@@ -89,9 +112,12 @@ def evaluate_model(spec, data_dir, run, subjects, cfg, *, on_progress=None):
         raise ValueError(f"No checkpoint found inside runs/ for {run}")
     digest = fingerprint(checkpoint)
     protocol = read_checkpoint(checkpoint)["run_config"]
-    incremental = protocol.get("protocol") == "paper"
+    # The paper protocol always replays its step graph; any other causal run
+    # does when the page asks for it.
+    paper = protocol.get("protocol") == "paper"
+    incremental = paper or bool(spec.get("incremental"))
     replay_mode = spec.get("replay_mode", "paced")
-    if incremental and cfg.hop != 4:
+    if paper and cfg.hop != 4:
         raise ValueError(f"{run} uses the paper protocol and requires hop H=4")
 
     with TemporaryDirectory(prefix="eegio-pi-") as directory:
@@ -99,9 +125,10 @@ def evaluate_model(spec, data_dir, run, subjects, cfg, *, on_progress=None):
         sidecar = export_checkpoint(checkpoint, local, name="model", seq_len=cfg.win,
                                     incremental=incremental,
                                     fast_replay_hop=cfg.hop if replay_mode == "fast" and not incremental else None)
+        lookahead = int(sidecar["preprocessing"].get("lookahead_samples") or 0)
         if (sidecar["preprocessing"]["sample_rate_hz"] != E.EEGIO_FS
-                or not variant_is_causal(sidecar["model"]["variant"])):
-            raise ValueError(f"{run} must be a causal model trained at 250 Hz")
+                or not (variant_is_causal(sidecar["model"]["variant"]) or lookahead)):
+            raise ValueError(f"{run} must be a causal or bounded-lookahead model trained at 250 Hz")
         graph = local / ("model_step.onnx" if incremental else "model.onnx")
         tail = sidecar.get("fast_replay")
         remote = Remote(spec["ssh"], spec["remote_dir"], uuid4().hex, collection="eegio_replays")
@@ -131,6 +158,7 @@ def evaluate_model(spec, data_dir, run, subjects, cfg, *, on_progress=None):
                         or report.get("hop_samples") != cfg.hop
                         or report.get("paced") is not (replay_mode == "paced")
                         or report.get("backend") != ("onnx_step" if incremental else "onnx_windowed")
+                        or report.get("lookahead_samples") != lookahead
                         or report.get("inference_window_samples") != (tail["input_samples"] if tail else None)):
                     raise RuntimeError(f"Incomplete or incompatible Pi replay for {rec.subject}")
                 return traces["filtered"], traces["output"], report
@@ -146,7 +174,8 @@ def evaluate_model(spec, data_dir, run, subjects, cfg, *, on_progress=None):
             if tail:
                 remote.upload(local / tail["file"], tail["file"])
             result = E.evaluate_subjects(data_dir, run, subjects, cfg,
-                                         on_progress=on_progress, replay_fn=replay)
+                                         on_progress=on_progress, replay_fn=replay,
+                                         reference_thresholds_uv=reference_thresholds_uv)
         finally:
             remote.stop(remove_workspace=True)
 

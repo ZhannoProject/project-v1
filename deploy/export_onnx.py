@@ -258,12 +258,16 @@ def _torch_forward(model: torch.nn.Module, x: np.ndarray) -> np.ndarray:
 def verify_onnx(model: torch.nn.Module, onnx_path: str | Path, seq_len: int = 512,
                 dynamic_batch: bool = True, atol: float = 1e-4, data_dir: str | None = None,
                 master_seed: int = None,
-                artifact: str = "EOG", max_batches: int | None = None, seed: int = 0) -> dict:
+                artifact: str = "EOG", max_batches: int | None = None, seed: int = 0,
+                lookahead: int = 0) -> dict:
     """
     Check the ONNX graph against the PyTorch model.
 
       agreement  max |onnx - torch| on random windows (batch 1, and 3 if dynamic)
-      causality  perturbing sample T/2 must not change any output before T/2
+      causality  perturbing sample T/2 must not change any output before T/2 - L,
+                 where L is the declared lookahead (0 for a causal model): the
+                 bounded-dependence contract that lets an L-sample rung run
+                 online with its output delayed by L samples
       latency    onnxruntime batch-1 wall time on THIS machine (not the Pi)
       metrics    RRMSE_t / RRMSE_f / CC of both backends on the real test
                  split, when data_dir is given
@@ -290,11 +294,19 @@ def verify_onnx(model: torch.nn.Module, onnx_path: str | Path, seq_len: int = 51
     x2 = x1.copy()
     x2[0, 0, t0] += 10.0
     y1, y2 = run(x1), run(x2)
-    past = float(np.abs(y1[..., :t0] - y2[..., :t0]).max())
-    future = float(np.abs(y1[..., t0:] - y2[..., t0:]).max())
+    edge = t0 - int(lookahead)
+    past = float(np.abs(y1[..., :edge] - y2[..., :edge]).max())
+    future = float(np.abs(y1[..., edge:] - y2[..., edge:]).max())
     report["causality_past_diff"] = past
     report["causality_future_diff"] = future
-    assert past < 1e-5, f"Causality violated in ONNX graph: past_diff = {past:.3e}"
+    report["lookahead_samples"] = int(lookahead)
+    if lookahead:
+        # Report the reach actually observed, so a sidecar shows the graph uses
+        # its whole declared horizon rather than only staying inside it.
+        changed = np.flatnonzero(np.abs(y1 - y2)[0, 0] > 1e-6)
+        report["observed_future_reach"] = int(t0 - changed[0]) if changed.size else 0
+    assert past < 1e-5, (f"Causality violated in ONNX graph: an output more than {lookahead} "
+                         f"samples before a perturbed input moved by {past:.3e}")
 
     # ---- latency (host) ----
     x = rng.standard_normal((1, 1, seq_len), dtype=np.float32)
@@ -359,7 +371,23 @@ def evaluate_backends(backends: dict, data_dir: str, artifact: str = "EOG",
 # ============================================================
 # 4. One-call pipeline + CLI
 # ============================================================
-def _preprocessing(raw, window, artifact, streaming):
+def _lookahead(model, arch) -> int:
+    """
+    The model-level future horizon L in samples: 0 for a causal model, the
+    architectural extent for a bounded-lookahead rung. Read from the modules,
+    and required to agree with the label, so a sidecar cannot under-declare it.
+    """
+    if not arch.get("lookahead"):
+        return 0
+    from experiment.methodology import context
+    future = int(context(model, windowed=True)[1])
+    if future != int(arch["lookahead"]):
+        raise ValueError(f"model is labelled lookahead={arch['lookahead']} but its layers "
+                         f"read {future} samples ahead; refusing to declare either")
+    return future
+
+
+def _preprocessing(raw, window, artifact, streaming, lookahead=0):
     from data.protocol import normalization_config
     cfg = raw.get("run_config") or {}
     norm = normalization_config(cfg)
@@ -374,7 +402,25 @@ def _preprocessing(raw, window, artifact, streaming):
                 output_semantics="output at acquisition t estimates target t-output_delay_samples",
                 valid_history_samples=cfg.get("valid_history_samples"),
                 valid_future_samples=cfg.get("valid_future_samples", 0),
-                latency_budget=latency(cfg, cfg.get("target_fs") or SAMPLE_RATE_HZ))
+                # Architectural lookahead, kept apart from output_delay (a
+                # delayed-target design): the graph's output index is the target
+                # index, and a value is final once L further samples have arrived.
+                lookahead_samples=int(lookahead),
+                lookahead_semantics=("output index t estimates target t and reads inputs <= t+L; "
+                                     "emit it once sample t+L has been acquired"),
+                future_wait_ms=1000 * int(lookahead) / (cfg.get("target_fs") or SAMPLE_RATE_HZ),
+                latency_budget=_with_lookahead(latency(cfg, cfg.get("target_fs") or SAMPLE_RATE_HZ),
+                                               int(lookahead)))
+
+
+def _with_lookahead(budget: dict, lookahead: int) -> dict:
+    """Add the L/fs wait to the (H + delay)/fs budget; nothing changes for L=0."""
+    if not lookahead:
+        return budget
+    fs = budget["sample_rate_hz"]
+    return {**budget, "lookahead_samples": lookahead,
+            "lookahead_wait_ms": 1000 * lookahead / fs,
+            "algorithmic_budget_ms": budget["algorithmic_budget_ms"] + 1000 * lookahead / fs}
 
 
 def _export_step_checkpoint(model, arch, raw, ckpt, out_dir, name, artifact, opset,
@@ -527,7 +573,17 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
     print(f"[export] architecture: {arch}")
     print(f"[export] params      : {sum(p.numel() for p in model.parameters()):,}")
 
+    lookahead = _lookahead(model, arch)
+    if lookahead:
+        print(f"[export] lookahead   : L = {lookahead} samples "
+              f"({1000 * lookahead / (cfg.get('target_fs') or SAMPLE_RATE_HZ):.1f} ms); "
+              f"outputs are emitted {lookahead} samples late")
+
     if incremental:
+        if lookahead:
+            raise ValueError(f"{name} reads {lookahead} samples ahead; the one-sample step graph "
+                             f"is causal-only. Use the windowed export, which emits each output "
+                             f"once its {lookahead} future samples have arrived")
         return _export_step_checkpoint(model, arch, raw, ckpt, out_dir, name,
                                        artifact, opset, trained_artifact)
 
@@ -539,7 +595,8 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
     print("[verify] onnxruntime vs PyTorch ...")
     fp32_report = verify_onnx(model, fp32_path, seq_len, dynamic_batch,
                               data_dir=data_dir, artifact=artifact,
-                              master_seed=master_seed, max_batches=max_batches)
+                              master_seed=master_seed, max_batches=max_batches,
+                              lookahead=lookahead)
     _print_report(fp32_report)
 
     sidecar = {
@@ -563,7 +620,11 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
                     "checked against it and is scored with a warning",
         },
         "preprocessing": _preprocessing(raw, seq_len, artifact,
-                                        "feed the latest window_samples samples, keep the newest hop outputs"),
+                                        ("feed the latest window_samples samples, keep the newest hop outputs"
+                                         if not lookahead else
+                                         f"feed the latest window_samples samples, keep the hop outputs "
+                                         f"that end {lookahead} samples before the window end"),
+                                        lookahead=lookahead),
         "verification": fp32_report,
     }
 
@@ -580,7 +641,9 @@ def export_checkpoint(ckpt: str | Path, out_dir: str | Path = PROJECT_ROOT / "de
 
 def _print_report(r: dict) -> None:
     print(f"         max|onnx-torch| = {r['max_abs_diff_vs_torch']:.2e}   "
-          f"causality past/future = {r['causality_past_diff']:.1e} / {r['causality_future_diff']:.2e}   "
+          + (f"bounded dependence (L={r['lookahead_samples']}, reach {r.get('observed_future_reach')}) "
+             if r.get("lookahead_samples") else "causality ")
+          + f"past/future = {r['causality_past_diff']:.1e} / {r['causality_future_diff']:.2e}   "
           f"host latency = {r['host_latency_ms_median']} ms")
     if "test_metrics" in r:
         for name, m in r["test_metrics"].items():

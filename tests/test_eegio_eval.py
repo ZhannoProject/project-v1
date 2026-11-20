@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
@@ -209,6 +210,28 @@ class TestStandardMetrics(unittest.TestCase):
                          {**reference, "output_blink_count": 0})
         self.assertEqual(reference["input_blink_count"], 2)
         self.assertEqual(E.summarise([result])[E.ADJUSTED_BLINK_COUNT]["median"], 100)
+
+    def test_wide_blinks_raise_the_inputs_own_threshold_over_them(self):
+        # EEG-IO S05 on the Pi: blinks inflate the input's mean amplitude, so
+        # its own 6x-mean threshold sits above most of its blinks (4 of 25
+        # counted) while the cleaner output's threshold falls below what is
+        # left of them -- a "negative reduction" from the threshold alone.
+        # One threshold for both signals counts what the model actually did.
+        fs = 100
+        x = np.tile([-1., 1.], 1500)
+        centers = np.arange(150, 3000, 300)
+        for i, c in enumerate(centers):
+            x[c - 30:c + 30] += np.hanning(60) * (100 if i % 2 else 300)
+        y = x * 0.1
+        y[centers] = x[centers] * 0.45           # residual blinks, background removed
+        valid = np.ones(len(x), dtype=bool)
+        m = E.standard_metrics(x, y, fs, centers, centers, valid, .25, adjusted_blink_count=True)
+        support = m["metric_support"]
+        self.assertLess(support["input_blink_count"], support["output_blink_count"])
+        self.assertLess(m["blink_count_reduction_pct"], 0)
+        adjusted = support["adjusted_blink_count"]
+        self.assertEqual(adjusted["input_blink_count"], len(centers))
+        self.assertGreaterEqual(m[E.ADJUSTED_BLINK_COUNT], 0)
 
     def test_known_blinks_and_background_gain(self):
         fs = 100
@@ -631,6 +654,84 @@ class TestSavedResults(unittest.TestCase):
 # ============================================================
 # The tab's glue
 # ============================================================
+class TestInputRescale(unittest.TestCase):
+    """
+    The rescaled diagnostic: each recording reaches a fixed-scale model at the
+    level of its training EEG, and is scored back in microvolts.
+    """
+
+    SCALE = 200.0
+
+    def _apply(self, seen, fn=lambda x: x):
+        def apply(x):
+            seen.append(np.asarray(x).copy())
+            return fn(np.asarray(x))
+        apply.run_config = {"normalization": "fixed", "normalization_scale": self.SCALE}
+        return apply
+
+    def test_robust_level_ignores_sparse_large_events(self):
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal(20000) * 25.0
+        x[::40] += 400.0                                   # 2.5% blink-sized spikes
+        valid = np.ones(len(x), dtype=bool)
+        self.assertAlmostEqual(E.robust_level_uv(x, valid), 25.0, delta=1.5)
+        self.assertGreater(np.sqrt(np.mean(x ** 2)), 60.0)  # plain RMS would not
+
+    def test_an_identity_model_scores_exactly_as_without_rescaling(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = write_synthetic_recording(d, "S00", duration_s=12.0, n_blinks=4,
+                                            n_soft=0, seed=5, amplitude=60.0, drift=0.0)
+            cfg = E.EvalConfig(target_fs=E.EEGIO_FS)
+            seen = []
+            plain = E.evaluate_recording(rec, self._apply([]), cfg)
+            scaled = E.evaluate_recording(rec, self._apply(seen), replace(cfg, rescale_input=True))
+        info = scaled["input_rescale"]
+        self.assertAlmostEqual(info["gain"], self.SCALE / info["background_level_uv"])
+        # The model saw the background at its training level ...
+        settled = np.arange(len(seen[0])) >= int(E.SCORE_WARMUP_S * E.EEGIO_FS)
+        self.assertAlmostEqual(E.robust_level_uv(seen[0], settled), self.SCALE, delta=1e-6 * self.SCALE)
+        # ... and the scores, in microvolts, are unchanged for a level-free model.
+        for metric in ("blink_amplitude_ratio", "background_rmse_uv", "blink_count_reduction_pct"):
+            np.testing.assert_allclose(scaled[metric], plain[metric], rtol=1e-9, atol=1e-6, equal_nan=True)
+
+    def test_a_level_dependent_model_is_scored_at_the_training_level(self):
+        # A hard clip at 150 (model units) leaves microvolt-scale input alone
+        # but bites once the input is brought up to the training level.
+        clip = lambda x: np.clip(x, -150.0, 150.0)
+        with tempfile.TemporaryDirectory() as d:
+            rec = write_synthetic_recording(d, "S00", duration_s=12.0, n_blinks=4,
+                                            n_soft=0, seed=5, amplitude=60.0, drift=0.0)
+            cfg = E.EvalConfig(target_fs=E.EEGIO_FS)
+            plain = E.evaluate_recording(rec, self._apply([], clip), cfg)
+            scaled = E.evaluate_recording(rec, self._apply([], clip), replace(cfg, rescale_input=True))
+        self.assertNotIn("input_rescale", plain)
+        self.assertNotAlmostEqual(scaled["background_rmse_uv"], plain["background_rmse_uv"], places=3)
+
+    def test_a_per_window_normalized_model_is_left_at_gain_one(self):
+        info = E.input_rescale(np.ones(100) * np.arange(100), np.ones(100, bool),
+                               {"normalization": "epoch"})
+        self.assertEqual(info["gain"], 1.0)
+
+    def test_pi_replays_cannot_be_rescaled(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = write_synthetic_recording(d, "S00", duration_s=8.0, n_blinks=2, n_soft=0, seed=1)
+            n = rec.n_samples
+            with self.assertRaisesRegex(ValueError, "local diagnostic"):
+                E.evaluate_recording(rec, self._apply([]), E.EvalConfig(target_fs=E.EEGIO_FS, rescale_input=True),
+                                     replay_result=(np.zeros(n), np.zeros(n), {}))
+
+    def test_the_tab_and_the_lookahead_spec_carry_the_flag(self):
+        from gui import eegio_tab
+        from gui.lookahead import _rescale_flag
+
+        self.assertTrue(_rescale_flag({"rescale_input": True}))
+        self.assertFalse(_rescale_flag({}))
+        with self.assertRaises(ValueError):
+            _rescale_flag({"rescale_input": "yes"})
+        with self.assertRaises(ValueError):
+            eegio_tab.evaluate({"runs": ["x"], "rescale_input": 1})
+
+
 class TestTabGlue(unittest.TestCase):
 
     def test_non_finite_numbers_are_nulled_so_the_json_stays_parseable(self):

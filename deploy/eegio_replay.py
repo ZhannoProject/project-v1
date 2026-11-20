@@ -14,7 +14,8 @@ from deploy.preprocessing import CausalFilter
 FAST_WINDOW_BATCH = 16
 
 
-def _result(filtered, output, fs, hop, *, backend, paced, elapsed, processing_ms=None, misses=None):
+def _result(filtered, output, fs, hop, *, backend, paced, elapsed, processing_ms=None, misses=None,
+            lookahead=0):
     if not np.isfinite(filtered).all() or not np.isfinite(output).all():
         raise RuntimeError("Pi replay produced a non-finite signal")
     report = {
@@ -25,23 +26,42 @@ def _result(filtered, output, fs, hop, *, backend, paced, elapsed, processing_ms
         "processing_p99_ms": float(np.percentile(processing_ms, 99)) if processing_ms else None,
         "deadline_misses": misses if paced else None,
         "hop_budget_ms": 1000. * hop / fs if paced else None,
+        # Bounded lookahead L: each output is emitted once sample t+L has
+        # arrived, so output[t] is still aligned with input[t] but is
+        # available L/fs later.
+        "lookahead_samples": lookahead,
+        "lookahead_wait_ms": 1000. * lookahead / fs,
     }
     return filtered, output, report
 
 
-def _fast_windows(model, tail, signal, fs, hop, input_filter, progress):
+def _fast_windows(model, tail, signal, fs, hop, input_filter, progress, lookahead=0):
+    """
+    Unpaced windowed replay, batched. ``tail`` is a verified short graph, or
+    the model itself when no short graph is valid (a cumulative SE reads the
+    whole window, so nothing shorter reproduces it): the outputs are then
+    exactly those of the hop-by-hop loop, only computed FAST_WINDOW_BATCH
+    windows per call. With lookahead L the retained hop ends L samples before
+    the window end, and the last window flushes the final L samples.
+    """
     from deploy.raspi_infer import normalization_scale
 
+    L = lookahead
     start = last_update = time.perf_counter()
     filtered = input_filter.process(signal)
     win, n = model.window, len(filtered)
+    if tail.window < hop + L:
+        raise ValueError("The replay graph is shorter than one hop plus the lookahead")
     output = np.empty_like(filtered)
     first_end = min(win, n)
     first = filtered[:first_end]
     if first_end < win:
         first = np.pad(first, (win - first_end, 0))
-    output[:first_end] = model.denoise_epochs(first)[-first_end:]
+    head = first_end if n <= win else first_end - L
+    off = win - first_end
+    output[:head] = model.denoise_epochs(first)[off:off + head]
 
+    prev_end = first_end
     if n > win:
         windows = np.lib.stride_tricks.sliding_window_view(filtered, win)
         ends = np.minimum(np.arange(win + hop, n + hop, hop), n)
@@ -52,10 +72,16 @@ def _fast_windows(model, tail, signal, fs, hop, input_filter, progress):
             # uses the full original window, independently for every hop.
             scale = normalization_scale(model.meta, full_windows)
             normalized = full_windows[:, -tail.window:] / scale
-            predictions = tail._run(normalized[:, None, :])[:, 0, -hop:] * scale
+            predictions = tail._run(normalized[:, None, :])[:, 0, -(hop + L):] * scale
             for end, values in zip(group, predictions):
-                keep = min(hop, end - win)
-                output[end - keep:end] = values[-keep:]
+                # Causal: the historical overlap on a short last hop. With a
+                # lookahead, exactly the samples not yet emitted, as paced.
+                keep = end - prev_end if L else min(hop, end - win)
+                prev_end = end
+                if end == n:            # last window: flush the lookahead tail too
+                    output[end - L - keep:end] = values[hop - keep:]
+                else:
+                    output[end - L - keep:end - L] = values[hop - keep:hop]
             now = time.perf_counter()
             if progress and group[-1] < n and now - last_update >= 2.:
                 progress(int(group[-1]), n)
@@ -64,8 +90,11 @@ def _fast_windows(model, tail, signal, fs, hop, input_filter, progress):
     if progress:
         progress(n, n)
     filtered, output, report = _result(filtered, output, fs, hop, backend="onnx_windowed",
-                                       paced=False, elapsed=elapsed)
-    report.update(inference_window_samples=tail.window, window_batch_size=FAST_WINDOW_BATCH)
+                                       paced=False, elapsed=elapsed, lookahead=L)
+    # Only a short graph changes what each call reads; full batched windows
+    # are the same computation as the paced loop.
+    report.update(inference_window_samples=tail.window if tail is not model else None,
+                  window_batch_size=FAST_WINDOW_BATCH)
     return filtered, output, report
 
 
@@ -80,8 +109,13 @@ def replay(model, signal, hop, band, notch_hz, *, incremental, paced=True, progr
     fs = float(model.sample_rate)
     if fs != 250:
         raise ValueError("EEG-IO Pi replay requires a model trained at 250 Hz")
-    if hop < 1 or (incremental and hop != 4) or (not incremental and hop > model.window):
-        raise ValueError("Use H=4 for stateful replay or a hop within the model window")
+    L = int(getattr(model, "lookahead", 0) or 0)
+    if incremental and L:
+        raise ValueError("The one-sample step graph is causal-only; replay a lookahead model windowed")
+    # The paper protocol's H=4 is enforced where the run is chosen; a step
+    # graph itself can be fed any number of samples per hop.
+    if hop < 1 or (not incremental and hop + L > model.window):
+        raise ValueError("Use a hop that, with the lookahead, fits inside the model window")
     protocol = model.meta.get("data_protocol") or {}
     delay = int(protocol.get("output_delay", 0)) if incremental else 0
     score_start = max(3 * int(fs), (protocol.get("valid_history_samples") or 1) - 1)
@@ -89,7 +123,11 @@ def replay(model, signal, hop, band, notch_hz, *, incremental, paced=True, progr
     if tail_model is not None:
         if paced or incremental or not hop <= tail_model.window < model.window:
             raise ValueError("The short graph requires fast windowed replay")
-        return _fast_windows(model, tail_model, signal, fs, hop, input_filter, progress)
+        if L:
+            raise ValueError("The short graph is verified for causal models only")
+    if not paced and not incremental:
+        return _fast_windows(model, tail_model or model, signal, fs, hop, input_filter,
+                             progress, lookahead=L)
 
     filtered = np.empty_like(signal)
     output = np.empty_like(signal)
@@ -102,7 +140,8 @@ def replay(model, signal, hop, band, notch_hz, *, incremental, paced=True, progr
     ends = chain(range(first_end, len(signal), hop), (len(signal),))
     clock_start = time.perf_counter()
     last_update = clock_start
-    start = 0
+    start = emitted_to = 0
+    n = len(signal)
     for end in ends:
         if paced:
             available = clock_start + end / fs
@@ -117,10 +156,19 @@ def replay(model, signal, hop, band, notch_hz, *, incremental, paced=True, progr
             window = filtered[max(0, end - model.window):end]
             if len(window) < model.window:
                 window = np.pad(window, (model.window - len(window), 0))
-            # Match the historical scorer, which retains up to a full hop
-            # from the last window even when it overlaps the preceding hop.
-            keep = end if start == 0 else min(hop, end - model.window)
-            output[end - keep:end] = model.denoise_epochs(window)[-keep:]
+            y = model.denoise_epochs(window)
+            if L:
+                # Emit up to end-L (everything on the last window); y[i]
+                # belongs to sample end - window + i.
+                lo, hi = emitted_to, (n if end == n else end - L)
+                if hi > lo:
+                    output[lo:hi] = y[lo - end + model.window:hi - end + model.window]
+                emitted_to = max(emitted_to, hi)
+            else:
+                # Match the historical scorer, which retains up to a full hop
+                # from the last window even when it overlaps the preceding hop.
+                keep = end if start == 0 else min(hop, end - model.window)
+                output[end - keep:end] = y[-keep:]
         emitted = time.perf_counter()
         if start - delay >= score_start and end - start == hop:
             processing_ms.append((emitted - begin) * 1000.)
@@ -133,7 +181,7 @@ def replay(model, signal, hop, band, notch_hz, *, incremental, paced=True, progr
     return _result(filtered, output, fs, hop,
                    backend="onnx_step" if incremental else "onnx_windowed",
                    paced=paced, elapsed=emitted - clock_start,
-                   processing_ms=processing_ms, misses=misses)
+                   processing_ms=processing_ms, misses=misses, lookahead=L)
 
 
 def main(argv=None):

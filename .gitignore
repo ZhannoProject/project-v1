@@ -38,3 +38,6 @@ figures/gui_eval_*/
 # describe recordings that are not redistributable, and they are
 # reproducible from the runs they name.
 eegio_tests/
+
+# Stray session-id file written to the project root by a tool run.
+:memory:*

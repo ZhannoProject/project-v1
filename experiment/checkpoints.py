@@ -172,9 +172,14 @@ def load_model(source, config=None, overrides=None, device="cpu", for_export=Fal
         raise ValueError("Explicit variant differs from checkpoint variant")
     cfg.update(changes)
     if for_export:
-        if not variant_is_causal(cfg["variant"]):
-            raise ValueError(f"{source} is a bidirectional teacher or lookahead model "
-                             f"({cfg['variant']}); it cannot run online. Export a causal student instead.")
+        # A bounded-lookahead rung is deployable as a causal system whose output
+        # is delayed by its L samples; the exporter verifies that contract. Only
+        # an unbounded (bidirectional) model cannot run online at all.
+        bounded = isinstance(cfg.get("lookahead"), int) and cfg["lookahead"] > 0
+        if not variant_is_causal(cfg["variant"]) and not bounded:
+            raise ValueError(f"{source} is a bidirectional teacher "
+                             f"({cfg['variant']}); it cannot run online. Export a causal student "
+                             f"or a bounded-lookahead model instead.")
         cfg["turboquant"] = False
     model = build_model_from_config(cfg)
     model.load_state_dict(sd, strict=True)

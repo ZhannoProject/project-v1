@@ -284,6 +284,23 @@ trap 'kill "$SAMPLER" 2>/dev/null || true; rm -f "$PEAK_FILE"' EXIT
 # Nothing is lost by deleting them; they were copied back when they were made.
 rm -f "$LATENCY_STEM".json "$LATENCY_STEM".csv "$LATENCY_STEM"_*.json "$LATENCY_STEM"_*.csv
 
+# The lock check refuses a 1-min load >= 1.0, and the load average lags: a
+# long stream test (83 s at hop 4) leaves it near 1.5 for a minute after it
+# has exited, so the next locked step was refused for this run's own work.
+# Wait it out (up to 3 min) instead; the check itself is unchanged.
+settle() {
+  [[ -n "$REQUIRE_LOCKED" ]] || return 0
+  local i load
+  for i in $(seq 1 36); do
+    load="$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)"
+    awk -v l="$load" 'BEGIN{exit !(l < 1.0)}' && return 0
+    (( i == 1 )) && echo "--> waiting for the 1-min load ($load) to fall below 1.0 before measuring"
+    sleep 5
+  done
+  echo "--> load still $(cut -d' ' -f1 /proc/loadavg) after 3 min; the lock check will decide"
+}
+
+settle
 echo "--> before: $(temp)°C  $(clock)  throttled=$(thr)"
 
 env/bin/python raspi_infer.py "$GRAPH.onnx" --threads "$THREADS" --hop "$HOP" \
@@ -301,6 +318,7 @@ sig = d["noisy"].reshape(-1)[:n].astype(np.float32)
 np.save("realtime_rec.npy", sig)
 print(f"--> realtime replay: {len(sig)} samples = {len(sig) / fs:.1f} s at {fs} Hz")
 PY
+  settle
   echo "--> $(temp)°C  $(clock) before paced replay"
   env/bin/python raspi_infer.py "$GRAPH.onnx" --threads "$THREADS" --hop "$HOP" \
     "${STEP_ARGS[@]+"${STEP_ARGS[@]}"}" "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}" \
@@ -309,6 +327,7 @@ PY
 fi
 
 if [[ -n "$DUTY_HOPS" ]]; then
+  settle
   echo "--> $(temp)°C  $(clock) before duty-cycle sweep"
   env/bin/python raspi_infer.py "$GRAPH.onnx" --threads "$THREADS" \
     "${STEP_ARGS[@]+"${STEP_ARGS[@]}"}" "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}" --testdata "$TESTDATA" \

@@ -103,7 +103,7 @@ def make_testdata(data_dir: str, artifact: str = "EOG", n: int = 100,
                         sampling=ds.sampling,
                         split_ratios=np.asarray(split_ratios, dtype=np.float32))
     levels = sorted(set(np.round(snr, 2)))
-    print(f"[testdata] wrote {path}  ({path.stat().st_size / 1024:.0f} KB): {n} epochs x 512 samples, "
+    print(f"[testdata] wrote {path}  ({path.stat().st_size / 1024:.0f} KB): {n} epochs x {len(noisy[0])} samples, "
           f"{artifact} test split at master_seed {master_seed}, "
           f"SNR levels {levels[0]:+.1f} .. {levels[-1]:+.1f} dB "
           f"({len(levels)} levels, {n // len(levels)} epochs each)")

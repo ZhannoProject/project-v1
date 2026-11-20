@@ -151,6 +151,67 @@ class DefaultSaveDirTests(unittest.TestCase):
                          "./runs/tcn_mla_eog_kd_256hz_s7")
 
 
+class InputScaleIsolationTests(unittest.TestCase):
+    """Changing input scaling must preserve the existing training artifacts."""
+
+    def test_fixed_can_start_beside_each_existing_epoch_seed(self):
+        from experiment.config import resolve_config, resolve_save_dir
+        from gui.server import training_command_config
+        for seed in (42, 54, 67):
+            with self.subTest(seed=seed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                values = dict(variant="tcn_se", artifact="BOTH", target_fs=250,
+                              master_seed=seed, normalization="epoch")
+                old = resolve_save_dir(resolve_config(values), root)
+                old_dir = root / old["save_dir"]
+                old_dir.mkdir(parents=True)
+                history = old_dir / "history.json"
+                history.write_text(json.dumps({"config": old}))
+                before = history.read_bytes()
+                # Exercise GUI preflight and the CLI's shared resolver without
+                # launching a training process or loading the EEG dataset.
+                command = [sys.executable, "-m", "trainer", "--variant", "tcn_se",
+                           "--artifact", "BOTH", "--target_fs", "250",
+                           "--master_seed", str(seed), "--normalization", "fixed"]
+                fixed, output = training_command_config(command, root)
+                ensure_writable(output, seed)
+                self.assertNotEqual(output, old_dir)
+                self.assertIn("250hz_fixed", output.name)
+                self.assertEqual(fixed["normalization"], "fixed")
+                self.assertIsNone(fixed["normalization_scale"])
+                self.assertEqual(history.read_bytes(), before)
+                self.assertFalse(output.exists())
+
+    def test_existing_fixed_run_is_still_protected(self):
+        from experiment.config import resolve_config, resolve_save_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            values = dict(variant="tcn_se", artifact="BOTH", target_fs=250,
+                          master_seed=54, normalization="fixed")
+            cfg = resolve_save_dir(resolve_config(values), root)
+            output = root / cfg["save_dir"]
+            output.mkdir(parents=True)
+            history = output / "history.json"
+            history.write_text(json.dumps({"config": cfg}))
+            before = history.read_bytes()
+            repeat = resolve_save_dir(resolve_config(values), root)
+            with self.assertRaisesRegex(FileExistsError, "already holds"):
+                ensure_writable(root / repeat["save_dir"], 54)
+            self.assertEqual(history.read_bytes(), before)
+
+    def test_explicit_epoch_folder_is_not_silently_redirected(self):
+        from experiment.config import resolve_config, resolve_save_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = _run_dir(root, "runs/chosen", seed=54)
+            cfg = resolve_save_dir(resolve_config(dict(
+                variant="tcn_se", normalization="fixed", master_seed=54,
+                save_dir="runs/chosen")), root)
+            self.assertEqual(root / cfg["save_dir"], output)
+            with self.assertRaisesRegex(FileExistsError, "already holds"):
+                ensure_writable(output, 54)
+
+
 class DefaultSeedFindsAFreeFolderTests(unittest.TestCase):
     """
     The default seed keeps the bare name only while the bare name is its own.

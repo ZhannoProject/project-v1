@@ -6,7 +6,7 @@
 # ============================================================
 
 # --- Model (base, rank overridden per run) ---
-variant: "tcn"
+variant: "tcn_se"
 hidden_channels: 64
 n_heads: 2
 n_attn_layers: 4
@@ -20,11 +20,11 @@ max_seq_len: 512
 rank_sweep: [4, 8, 16, 32]
 
 # --- Data ---
-artifact: "BOTH"
+artifact: "EOG"
 data_dir: "./data/EEGdenoisenet/data/"
 batch_size: 32
 snr_range_db: [-7.0, 2.0]
-master_seed: 42
+master_seed: 88
 
 # --- Training ---
 learning_rate: 5.0e-4
@@ -60,4 +60,4 @@ kd_feature_weight: 0.3
 target_fs: 250.0
 
 # --- Data (added by the training GUI) ---
-normalization: "epoch"
+normalization: "fixed"
