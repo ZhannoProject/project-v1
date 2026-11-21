@@ -974,6 +974,19 @@ def evaluate_recording(rec: Recording, apply_fn: Callable[[np.ndarray], np.ndarr
     }
 
 
+def result_config(cfg: EvalConfig) -> dict:
+    """The settings a result records, and the ones a saved result must match to be reused."""
+    offline = cfg.offline_window
+    return {"band_hz": list(cfg.band), "notch_hz": cfg.notch_hz,
+            "zero_phase": cfg.zero_phase, "target_fs": cfg.target_fs,
+            "rescale_input": cfg.rescale_input,
+            "win": offline.samples if offline else cfg.win,
+            "hop": None if offline else cfg.hop, "detect_k": cfg.detect_k,
+            **({"offline_window": asdict(offline)} if offline else {}),
+            "guard_s": cfg.guard_s, "include_soft": cfg.include_soft,
+            "drop_corrupt": cfg.drop_corrupt, "score_warmup_s": SCORE_WARMUP_S}
+
+
 def evaluate_subjects(data_dir: str, run: str, subjects: Optional[Sequence[str]] = None,
                       cfg: EvalConfig = EvalConfig(),
                       apply_fn: Optional[Callable] = None, *,
@@ -1029,14 +1042,7 @@ def evaluate_subjects(data_dir: str, run: str, subjects: Optional[Sequence[str]]
         "run": run, "arch": arch, "subjects": subs, "rows": rows,
         "metric_protocol": METRIC_PROTOCOL,
         "inference_checks": checks,
-        "config": {"band_hz": list(cfg.band), "notch_hz": cfg.notch_hz,
-                   "zero_phase": cfg.zero_phase, "target_fs": cfg.target_fs,
-                   "rescale_input": cfg.rescale_input,
-                   "win": offline.samples if offline else cfg.win,
-                   "hop": None if offline else cfg.hop, "detect_k": cfg.detect_k,
-                   **({"offline_window": asdict(offline)} if offline else {}),
-                   "guard_s": cfg.guard_s, "include_soft": cfg.include_soft,
-                   "drop_corrupt": cfg.drop_corrupt, "score_warmup_s": SCORE_WARMUP_S},
+        "config": result_config(cfg),
         "independent_unit": "subject",
         "causality": preprocess_is_causal(float(cfg.target_fs or EEGIO_FS),
                                           band=cfg.band, notch_hz=cfg.notch_hz,

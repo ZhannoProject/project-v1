@@ -309,6 +309,57 @@ def _offline_reference_runs(comparison: dict, runs: List[str]) -> List[str]:
     return [run for run in runs if run in offline]
 
 
+def _reusable_results(runs, expected_config, subjects, data_dir, baseline_by_run) -> dict:
+    """
+    Saved per-model results that can stand in for a fresh evaluation, by run.
+
+    "Run new seeds & rungs" scores only what has not been scored, so a result
+    is reused only when nothing about it could differ from a fresh run: same
+    recordings and subjects, same metric protocol, the identical per-model
+    config (filter, input level, and the shared offline window, which widens
+    if a new checkpoint needs more context), the same causal baseline setting
+    its adjusted blink threshold, and a checkpoint not rewritten since the
+    test was saved. Newest saved test wins. A rung is reused only alongside
+    its baseline, since the baseline's thresholds feed the rung's score.
+    """
+    import json
+    from datetime import datetime
+    import eegio_eval as E
+
+    wanted, found = set(runs), {}
+    if not RESULTS_DIR.is_dir():
+        return found
+    for f in sorted(RESULTS_DIR.glob("eegio_*.json"), reverse=True):
+        if wanted <= found.keys():
+            break
+        try:
+            out = json.loads(f.read_text())
+            saved = out["saved"]
+            comparison = saved.get("lookahead_comparison") or {}
+            saved_at = datetime.fromisoformat(saved["at"]).timestamp()
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if (comparison.get("schema_version") != 2 or saved.get("target", "host") != "host"
+                or out.get("metric_protocol") != E.METRIC_PROTOCOL
+                or saved.get("data_dir") != data_dir or out.get("subjects") != list(subjects)):
+            continue
+        old_baselines = comparison.get("baseline_by_run") or {}
+        for result in out.get("results") or []:
+            run = result.get("run")
+            if run not in wanted or run in found:
+                continue
+            if old_baselines.get(run) != baseline_by_run.get(run) or result.get("config") != expected_config(run):
+                continue
+            checkpoint = E.PROJECT_ROOT / "runs" / run / "best.pt"
+            try:
+                if checkpoint.stat().st_mtime > saved_at:
+                    continue
+            except OSError:
+                continue
+            found[run] = {**result, "_source": f.name}
+    return {run: r for run, r in found.items() if baseline_by_run.get(run) in found}
+
+
 def evaluate(spec: dict, *, on_progress: Optional[Callable[[dict], None]] = None,
              evaluate_model: Optional[Callable] = None, target: str = "host",
              lookahead_comparison: Optional[dict] = None) -> dict:
@@ -382,6 +433,18 @@ def evaluate(spec: dict, *, on_progress: Optional[Callable[[dict], None]] = None
         if r in by_name and by_name[r]["train_fs"] != cfg.target_fs
     ]
 
+    batch = bool(lookahead_comparison and lookahead_comparison.get("schema_version") == 2)
+    baseline_by_run = lookahead_comparison.get("baseline_by_run", {}) if batch else {}
+    reused = {}
+    if _flag(spec, "reuse_saved"):
+        if not batch:
+            raise ValueError("reuse_saved applies to the all-seeds Lookahead comparison only")
+        reused = _reusable_results(
+            runs, lambda run: E.result_config(zero_phase_cfg if run in zero_phase_runs else cfg),
+            subjects, data_dir, baseline_by_run)
+        if len(reused) == len(runs):
+            raise ValueError("Nothing new to test: every model already has a saved score with these settings.")
+
     subject_count = len(subjects)
     total = len(runs) * subject_count
 
@@ -393,22 +456,24 @@ def evaluate(spec: dict, *, on_progress: Optional[Callable[[dict], None]] = None
 
     results = []
     reference_thresholds_uv = None
-    batch = bool(lookahead_comparison and lookahead_comparison.get("schema_version") == 2)
-    baseline_by_run = lookahead_comparison.get("baseline_by_run", {}) if batch else {}
     threshold_by_baseline = {}
     for index, run in enumerate(runs):
-        report({"phase": "loading_model"})
         if batch:
             baseline = baseline_by_run[run]
             if baseline != run and baseline not in threshold_by_baseline:
                 raise ValueError("Evaluate each seed's causal baseline before its lookahead rungs")
             reference_thresholds_uv = threshold_by_baseline.get(baseline)
-        results.append(evaluate_model(data_dir, run, subjects,
-                                      zero_phase_cfg if run in zero_phase_runs else cfg,
-                                      on_progress=report if on_progress else None,
-                                      **({"checkpoint": checkpoints[run]} if offline else {}),
-                                      **({"reference_thresholds_uv": reference_thresholds_uv}
-                                         if reference_thresholds_uv is not None else {})))
+        if run in reused:
+            report({"phase": "reused", "completed_subjects": subject_count})
+            results.append({k: v for k, v in reused[run].items() if k != "_source"})
+        else:
+            report({"phase": "loading_model"})
+            results.append(evaluate_model(data_dir, run, subjects,
+                                          zero_phase_cfg if run in zero_phase_runs else cfg,
+                                          on_progress=report if on_progress else None,
+                                          **({"checkpoint": checkpoints[run]} if offline else {}),
+                                          **({"reference_thresholds_uv": reference_thresholds_uv}
+                                             if reference_thresholds_uv is not None else {})))
         if cfg.adjusted_blink_count and (index == 0 or batch and baseline_by_run[run] == run):
             reference_thresholds_uv = {
                 row["subject"]: row["metric_support"]["adjusted_blink_count"]["threshold_uv"]
@@ -451,6 +516,9 @@ def evaluate(spec: dict, *, on_progress: Optional[Callable[[dict], None]] = None
             "zero_phase": cfg.zero_phase, "notch_hz": cfg.notch_hz,
             "rescale_input": cfg.rescale_input,
             **({"offline_zero_phase": True, "zero_phase_runs": zero_phase_runs} if zero_phase_runs else {}),
+            # Which scores were carried over from earlier saved tests rather
+            # than recomputed, and from which file.
+            **({"reused": {run: r["_source"] for run, r in reused.items()}} if reused else {}),
             "include_soft": cfg.include_soft, "detect_k": cfg.detect_k,
             "band_hz": list(cfg.band),
             # Each model with the rate it trained at, which the run rows do

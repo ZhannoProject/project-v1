@@ -468,10 +468,14 @@ def eegio_spec(spec: dict) -> tuple[dict, dict]:
                       "master_seed": None, "lookahead": None, "latency_ms": None,
                       "rungs": {m["run"]: m["lookahead"] for m in selected["members"]},
                       "baseline_by_run": {m["run"]: m["baseline"] for m in selected["members"]}}
+        reuse = spec.get("reuse_saved", False)
+        if type(reuse) is not bool:
+            raise ValueError("reuse_saved must be a boolean")
         return {"runs": selected["runs"], "offline": True, "target_fs": selected["target_fs"],
                 "n_subjects": n, "zero_phase": zero_phase,
                 "rescale_input": _rescale_flag(spec),
-                "offline_zero_phase": _offline_zero_phase_flag(spec, zero_phase)}, comparison
+                "offline_zero_phase": _offline_zero_phase_flag(spec, zero_phase),
+                **({"reuse_saved": True} if reuse else {})}, comparison
     if (not isinstance(runs, list) or len(runs) < 2
             or any(not isinstance(run, str) for run in runs) or len(set(runs)) != len(runs)):
         raise ValueError("Choose a causal baseline and at least one distinct lookahead rung")

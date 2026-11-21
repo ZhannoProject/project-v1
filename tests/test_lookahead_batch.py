@@ -252,3 +252,122 @@ vm.runInNewContext(['laEegioGroup','syncLaEegioSelection','laEegioHistory','runL
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunNewSeedsAndRungsTests(unittest.TestCase):
+    """"Run new seeds & rungs" scores only what has no saved score at these settings."""
+
+    def setUp(self):
+        import os
+        import tempfile
+        import time
+        from pathlib import Path
+        import eegio_eval as E
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        for seed in (42, 54):
+            for name in (f"base{seed}", f"rung{seed}"):
+                ckpt = root / "runs" / name / "best.pt"
+                ckpt.parent.mkdir(parents=True)
+                ckpt.write_bytes(b"")
+                os.utime(ckpt, (time.time() - 1000,) * 2)
+        self.root = root
+        self.evaluated = []
+        self.received = {}
+        for p in (patch.object(eegio_tab, "RESULTS_DIR", root / "eegio_tests"),
+                  patch.object(E, "PROJECT_ROOT", root),
+                  patch.object(eegio_tab, "dataset_status", return_value={"present": True, "subjects": ["S00"]}),
+                  patch.object(eegio_tab, "available_runs", return_value=[]),
+                  patch.object(E, "prepare_offline", side_effect=self.prepare),
+                  patch.object(E, "compare", return_value=[])):
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def prepare(runs, cfg):
+        from dataclasses import replace
+        import eegio_eval as E
+        return replace(cfg, offline_window=E.OfflineWindow(500, 125, 186)), dict.fromkeys(runs)
+
+    def evaluate_model(self, data_dir, name, subjects, cfg, **kwargs):
+        import eegio_eval as E
+        self.evaluated.append(name)
+        self.received[name] = kwargs.get("reference_thresholds_uv")
+        threshold = float(name[-2:])
+        return dict(run=name, rows=[{"subject": "S00", "metric_support": {
+            "adjusted_blink_count": {"threshold_uv": threshold}}}],
+            summary={"metric": {"median": threshold, "n": 1}},
+            config=E.result_config(cfg), causality={})
+
+    def run_batch(self, seeds, **spec):
+        names = [n for s in seeds for n in (f"base{s}", f"rung{s}")]
+        members = [{"run": n, "master_seed": int(n[-2:]), "lookahead": 0 if n.startswith("base") else 8}
+                   for n in names]
+        comparison = {"schema_version": 2, "members": members,
+                      "baselines": {str(s): f"base{s}" for s in seeds},
+                      "baseline_by_run": {n: "base" + n[-2:] for n in names}}
+        self.evaluated.clear()
+        return eegio_tab.evaluate({"runs": names, "offline": True, "target_fs": 250,
+                                   "data_dir": "/data", **spec},
+                                  evaluate_model=self.evaluate_model, lookahead_comparison=comparison)
+
+    def add_seed(self, seed):
+        ckpt = self.root / "runs" / f"base{seed}" / "best.pt"
+        for name in (f"base{seed}", f"rung{seed}"):
+            (self.root / "runs" / name).mkdir(parents=True, exist_ok=True)
+            (self.root / "runs" / name / "best.pt").write_bytes(b"")
+        return ckpt
+
+    def test_only_the_new_seed_is_scored_and_the_rest_is_carried_over(self):
+        import os, time
+        self.run_batch([42])
+        self.add_seed(54)
+        for name in ("base54", "rung54"):
+            os.utime(self.root / "runs" / name / "best.pt", (time.time() - 500,) * 2)
+        out = self.run_batch([42, 54], reuse_saved=True)
+        self.assertEqual(self.evaluated, ["base54", "rung54"])
+        self.assertEqual(set(out["saved"]["reused"]), {"base42", "rung42"})
+        self.assertEqual([r["run"] for r in out["results"]], ["base42", "rung42", "base54", "rung54"])
+        self.assertNotIn("_source", out["results"][0])
+        self.assertEqual(self.received["rung54"], {"S00": 54.})
+        self.assertEqual({row["lookahead"] for row in out["lookahead_summary"]}, {0, 8})
+        # Everything is now on disk: nothing left to score.
+        with self.assertRaisesRegex(ValueError, "Nothing new"):
+            self.run_batch([42, 54], reuse_saved=True)
+
+    def test_a_rewritten_checkpoint_is_scored_again_with_its_baseline_thresholds(self):
+        import os, time
+        self.run_batch([42])
+        os.utime(self.root / "runs" / "rung42" / "best.pt", (time.time() + 100,) * 2)
+        out = self.run_batch([42], reuse_saved=True)
+        self.assertEqual(self.evaluated, ["rung42"])
+        self.assertEqual(self.received["rung42"], {"S00": 42.}, "thresholds come from the reused baseline")
+        self.assertEqual(set(out["saved"]["reused"]), {"base42"})
+
+    def test_a_rung_is_not_reused_without_its_baseline(self):
+        import os, time
+        self.run_batch([42])
+        os.utime(self.root / "runs" / "base42" / "best.pt", (time.time() + 100,) * 2)
+        self.run_batch([42], reuse_saved=True)
+        self.assertEqual(self.evaluated, ["base42", "rung42"])
+
+    def test_other_settings_are_not_reused(self):
+        self.run_batch([42])
+        out = self.run_batch([42], reuse_saved=True, rescale_input=True)
+        self.assertEqual(self.evaluated, ["base42", "rung42"])
+        self.assertNotIn("reused", out["saved"])
+
+    def test_a_plain_run_all_ignores_saved_scores(self):
+        self.run_batch([42])
+        out = self.run_batch([42])
+        self.assertEqual(self.evaluated, ["base42", "rung42"])
+        self.assertNotIn("reused", out["saved"])
+
+    def test_the_flag_reaches_the_evaluation_and_the_page_has_the_button(self):
+        from pathlib import Path
+        page = (Path(eegio_tab.__file__).parent / "static" / "index.html").read_text()
+        self.assertIn('id="btnLaEegioNew"', page)
+        self.assertIn("reuse_saved: true", page)
+        self.assertIn("runLaEegio(true)", page)

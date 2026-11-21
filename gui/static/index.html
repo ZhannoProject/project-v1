@@ -888,6 +888,7 @@
           <label class="muted" for="laEegioN">Subjects</label>
           <input id="laEegioN" type="number" min="1" max="20" value="20" required style="width:60px">
           <button id="btnLaEegio" class="primary" disabled>Run all seeds &amp; rungs</button>
+          <button id="btnLaEegioNew" disabled title="Score only the models with no saved score at these settings (filter, input level, subjects, offline window, unchanged checkpoint), and reuse the saved scores for the rest. Saves one combined test, like Run all.">Run new seeds &amp; rungs</button>
         </div>
         <div class="row">
           <label class="muted" for="laEegioMetric">Plot</label>
@@ -4922,6 +4923,15 @@
     return history;
   }
 
+  function laEegioUntested(group, history) {
+    if (!group) return [];
+    const n = Number($("#laEegioN").value);
+    const tested = new Set(history
+      .filter(entry => entry.lookahead_comparison?.schema_version === 2 && entry.n_subjects === n)
+      .flatMap(entry => entry.runs));
+    return group.runs.filter(run => !tested.has(run));
+  }
+
   function renderLaEegioProgress() {
     const { busy, loading, progress, error } = state.la.eegio;
     const bar = $("#laEegioProgress");
@@ -4935,7 +4945,9 @@
     let message = loading ? "Finding matched checkpoints…" : "";
     if (busy) message = "Preparing EEG-IO recordings…";
     if (busy && progress?.total) {
-      const detail = progress.phase === "saving" ? "Saving…" : [progress.model, progress.subject].filter(Boolean).join(" · ");
+      const detail = progress.phase === "saving" ? "Saving…"
+        : progress.phase === "reused" ? `${progress.model} · saved score reused`
+        : [progress.model, progress.subject].filter(Boolean).join(" · ");
       message = `${progress.completed}/${progress.total} model–subject pairs · ${detail}`;
     }
     note.textContent = error || message;
@@ -4963,6 +4975,13 @@
       $("#" + id).disabled = busy || loading || !rungCount;
     }
     const history = laEegioHistory(group), select = $("#laEegioSaved"), previous = select.value;
+    // An estimate: the server makes the final call and also re-scores a
+    // checkpoint rewritten since its test was saved.
+    const fresh = laEegioUntested(group, history);
+    const btnNew = $("#btnLaEegioNew");
+    btnNew.disabled = busy || loading || !rungCount || !fresh.length;
+    btnNew.textContent = group && rungCount
+      ? (fresh.length ? `Run new seeds & rungs (${fresh.length})` : "No new seeds or rungs") : "Run new seeds & rungs";
     select.replaceChildren(...history.map(entry => {
       const c = entry.lookahead_comparison;
       const seeds = c.seeds?.length || 1;
@@ -4987,12 +5006,14 @@
     return saved;
   }
 
-  async function runLaEegio() {
+  async function runLaEegio(reuse = false) {
     const group = laEegioGroup(), subjects = $("#laEegioN"), s = state.la.eegio;
-    if (!group || $("#btnLaEegio").disabled || !lookaheadSettings() || !subjects.reportValidity()) return;
+    const button = $(reuse ? "#btnLaEegioNew" : "#btnLaEegio");
+    if (!group || button.disabled || !lookaheadSettings() || !subjects.reportValidity()) return;
     const spec = { ...lookaheadSettings(), comparison_id: group.id,
       n_subjects: Number(subjects.value), zero_phase: laEegioZeroPhase(),
-      rescale_input: laEegioRescale(), offline_zero_phase: laEegioOfflineZero() };
+      rescale_input: laEegioRescale(), offline_zero_phase: laEegioOfflineZero(),
+      ...(reuse ? { reuse_saved: true } : {}) };
     Object.assign(s, { busy: true, error: null, progress: null });
     renderLookahead();
     try {
@@ -5003,6 +5024,9 @@
       await refreshEegioHistory();
       renderLaEegio();
       $("#laEegioSaved").value = s.result.name;
+      const carried = Object.keys(s.result.saved?.reused || {}).length;
+      if (carried) banner(`Scored ${s.result.results.length - carried} new models and reused `
+        + `${carried} saved scores; the combined test is saved.`, "info");
     } catch (e) { s.error = e.message; }
     finally {
       s.busy = false;
@@ -5735,7 +5759,9 @@
   $("#laOverwrite").addEventListener("change", () => previewLookahead(false));
   $("#btnLaTrain").addEventListener("click", trainLookahead);
   $("#btnLaTrainMissing").addEventListener("click", trainMissingLookahead);
-  $("#btnLaEegio").addEventListener("click", runLaEegio);
+  $("#btnLaEegio").addEventListener("click", () => runLaEegio(false));
+  $("#btnLaEegioNew").addEventListener("click", () => runLaEegio(true));
+  $("#laEegioN").addEventListener("input", () => renderLaEegio());
   $("#laComparison").addEventListener("change", () => {
     state.la.eegio.comparison = $("#laComparison").value;
     state.la.eegio.error = null;
