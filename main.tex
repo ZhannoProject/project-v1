@@ -31,7 +31,7 @@
 
 \maketitle
 \begin{abstract}
-EEG denoising on an edge device must suppress artifacts and preserve background activity within a declared output delay. Short network execution alone is insufficient when preprocessing or reconstruction requires a complete window. This letter characterizes bounded lookahead for streaming single-channel artifact removal. A temporal convolutional network with channel normalization and squeeze-and-excitation gating estimates each clean sample using a specified horizon of future observations. A lookahead curve and matched results relate reconstruction quality to future-sample waiting time under shared training and scoring conditions. Evaluation combines paired synthetic mixtures with clean references, blink-annotated recordings from a wearable frontal EEG headset, and sample-paced replay of those recordings on a Raspberry Pi 5. For an illustrative future-sample waiting time of \TBD{time} milliseconds, temporal reconstruction error changes from \TBD{baseline} to \TBD{lookahead}, recovering \TBD{fraction} percent of the causal-to-offline gap. Representative device replay yields an end-to-end 99th-percentile latency of \TBD{latency} milliseconds, a deadline-miss rate of \TBD{rate} percent, and an incremental board power of \TBD{power} milliwatts. These measurements support horizon selection according to application deadlines and signal-preservation requirements.
+EEG denoising on an edge device must suppress artifacts and preserve background activity within a declared output delay. Short network execution alone is insufficient when preprocessing or reconstruction requires a complete window. This letter characterizes bounded lookahead for streaming single-channel artifact removal. A temporal convolutional network with channel normalization and squeeze-and-excitation gating estimates each clean sample using a specified horizon of future observations. A lookahead curve and matched results relate reconstruction quality to future-sample waiting time under shared training and scoring conditions. Evaluation combines paired synthetic mixtures with clean references, blink-annotated recordings from a wearable frontal EEG headset, and sample-paced replay of those recordings on a Raspberry Pi 5. For an illustrative future-sample waiting time of 32 milliseconds, temporal reconstruction error changes from 0.737 to 0.679, recovering 52 percent of the causal-to-offline gap. Representative device replay yields a maximum end-to-end processing latency of 7.6 milliseconds, a deadline-miss rate of 0 percent, and an incremental board power of \TBD{power} milliwatts. These measurements support horizon selection according to application deadlines and signal-preservation requirements.
 \end{abstract}
 \begin{IEEEkeywords}
 Electroencephalography, artifact removal, bounded lookahead, edge computing, streaming signal processing.
@@ -44,7 +44,7 @@ EEGdenoiseNet supplies paired synthetic mixtures \cite{EEGdenoiseNet}, while EEG
 
 Bindra and Panwar \cite{bindra2026capacity} report a 365-parameter TCN with EOG/EMG correlation coefficients of 0.849/0.797 and a controlled width sweep showing early saturation around 3--6.5 thousand parameters. This motivates examining temporal information alongside model capacity; their single-artifact scores are not directly comparable to the joint mixtures here.
 
-This letter treats the future horizon as a design parameter of the EEG sensing system. Its contribution is a measured basis for choosing that horizon under a device output deadline: one backbone is evaluated under causal, bounded-lookahead, and offline temporal support; the resulting accuracy--waiting curve (Fig.~\ref{fig:tradeoff}, Table~\ref{tab:accuracy}) is checked for signal preservation on real wearable recordings; and representative settings are measured for timing, memory, and power on an edge board. Receptive-field and attention controls price the alternative of spending computation instead of latency.
+This letter treats the future horizon as a design parameter of the EEG sensing system. Its contribution is a measured basis for choosing that horizon under a device output deadline: one backbone is evaluated under causal, bounded-lookahead, and offline temporal support; the resulting accuracy--waiting curve (Fig.~\ref{fig:tradeoff}, Table~\ref{tab:accuracy}) is checked for signal preservation on real wearable recordings; and representative settings are measured for timing, memory, and power on an edge board. An attention control prices the alternative of spending computation instead of latency.
 
 \begin{figure}[t]
 \centering
@@ -97,38 +97,40 @@ State persists between hops with matched initialization and resets. Beyond-horiz
 \end{figure*}
 
 \begin{table*}[t]
-\caption{Architectural quantities and pending test scores (mean $\pm$ sample SD over three runs). Budgets are calculated at 250 Hz, $H=4$, excluding execution. Conv. spans exclude SE pooling; $L$ includes all future access. Dashes denote unfilled results.}
+\caption{Architectural quantities and test scores on the common valid target interval (mean $\pm$ sample SD over five seeds; $^a$seeds 67, 72, 88; $^b$no past samples). Budgets at 250 Hz, $H=4$, excluding execution; conv.\ spans exclude SE pooling; $L$ includes all future access.}
 \label{tab:accuracy}
 \centering\footnotesize
 \begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccc@{}}
 \toprule
 Model & $L$ (samples) & Conv. past/future & Budget (ms) & Params & RRMSE$_t$ & RRMSE$_f$ & CC & Gap recovered (\%)\\
 \midrule
-TCN & 0 & 124/0 & 16 & 117,068 & \blank & \blank & \blank & \blank\\
-TCN+SE & 0 & 124/0 & 16 & 122,548 & \blank & \blank & \blank & \blank\\
-TCN+SE & 8 & 118/6 & 48 & 122,548 & \blank & \blank & \blank & \blank\\
-TCN+SE & 16 & 113/11 & 80 & 122,548 & \blank & \blank & \blank & \blank\\
-TCN+SE & 32 & 102/22 & 144 & 122,548 & \blank & \blank & \blank & \blank\\
-TCN+SE offline & -- & 62/62 & -- & 122,548 & \blank & \blank & \blank & \blank\\
-TCN expanded & 0 & \blank & 16 & \blank & \blank & \blank & \blank & \blank\\
-TCN+attention & 0 & \blank & 16 & \blank & \blank & \blank & \blank & \blank\\
+TCN & 0 & 124/0 & 16 & 117,068 & $0.751{\pm}0.009$ & $0.704{\pm}0.013$ & $0.669{\pm}0.008$ & $-12.6{\pm}2.3$\\
+TCN+SE & 0 & 124/0 & 16 & 122,548 & $0.737{\pm}0.007$ & $0.686{\pm}0.009$ & $0.682{\pm}0.008$ & 0\\
+TCN+SE & 8 & 118/6 & 48 & 122,548 & $0.679{\pm}0.009$ & $0.645{\pm}0.007$ & $0.737{\pm}0.007$ & $51.9{\pm}1.8$\\
+TCN+SE & 16 & 113/11 & 80 & 122,548 & $0.650{\pm}0.010$ & $0.624{\pm}0.007$ & $0.759{\pm}0.008$ & $77.8{\pm}2.7$\\
+TCN+SE & 32 & 102/22 & 144 & 122,548 & $0.637{\pm}0.008$ & $0.609{\pm}0.008$ & $0.768{\pm}0.007$ & $89.7{\pm}1.9$\\
+TCN+SE & 62 & 82/42 & 264 & 122,548 & $0.629{\pm}0.008$ & $0.601{\pm}0.007$ & $0.773{\pm}0.007$ & $97.1{\pm}1.6$\\
+TCN+SE$^b$ & 186 & 0/124 & 760 & 122,548 & $0.701{\pm}0.006$ & $0.653{\pm}0.006$ & $0.708{\pm}0.006$ & $32.2{\pm}1.5$\\
+TCN+SE offline & -- & 62/62 & -- & 122,548 & $0.626{\pm}0.007$ & $0.591{\pm}0.007$ & $0.776{\pm}0.006$ & --\\
+TCN+attention$^a$ & 0 & 124/0 & 16 & 127,839 & $0.736{\pm}0.007$ & $0.689{\pm}0.010$ & $0.682{\pm}0.006$ & $0.6{\pm}1.7$\\
 \bottomrule
+% Source: project v1/paper_results/table1_test_scores.json (score_table1.py, table1_summary.py common), 2026-11-21. Test split, 510 segments per seed, target samples [272, 438) of 500 = 252-sample attention past + 20 resampling warm-up, 62-sample offline future. Runs need all 200 epochs. Plain TCN: tcn_both_channelnorm_250hz_s42..s88 (trained 2026-11-21; older tcn_both_250hz_fixed_s72/s88 not used). Gap per seed, anchored on that seed's TCN+SE L=0 and offline runs: TCN -9.8/-10.7/-15.4/-13.4/-13.9 (s42..s88), attention -0.9/+2.4/+0.5 (s67/s72/s88); offline is 100 by definition, shown as a dash. L=62: 99.7/95.6/97.4/96.2/96.7; L=186 (all taps ahead, no past): 32.6/33.5/33.6/30.6/30.6; L=124 (not shown) 96.5 +- 0.7. Attention: tcn_mla_r16 (52 ch, kv rank 16), seeds 67/72/88; paired with TCN+SE L=0 at the same seeds, RRMSE_t difference -0.0007 +- 0.0019 (s67 +0.0010, s72 -0.0028, s88 -0.0005), vs -0.0215 for L=1. Full-window scores are ~0.02 lower in RRMSE_t with the same ranking and gaps within 2 points.
 \end{tabular*}
 \end{table*}
 
 \subsection{Data and Matched Comparisons}
 EEGdenoiseNet \cite{EEGdenoiseNet} clean and artifact epochs are partitioned into disjoint training, validation, and test pools (70/15/15). The split is at epoch level; BOTH sampling yields 2,380/510/510 training/validation/test pairs per seed. Joint EOG+EMG mixtures use component SNRs from $-7$ to 2 dB. Training draws them independently; validation/test assign the same grid SNR to both components. Offline polyphase resampling converts 256-Hz, 512-sample source epochs to 250 Hz and 500 samples before mixing; it is not an online timing measurement.
 
-Within each seed, settings share source pools, evaluation mixtures, and a common valid target interval. Seeds 42, 54, and 67 control the split, mixture generation, and training randomness. Models use 200 epochs of AdamW \cite{loshchilov2019adamw}, batch size 32, learning rate $5\times10^{-4}$, zero weight decay, dropout 0.1, five warmup epochs, and cosine decay to $10^{-6}$. Validation ground-truth mean squared error selects checkpoints; the held-out test partition supplies final scores.
+Within each seed, settings share source pools, evaluation mixtures, and a common valid target interval. Seeds 42, 54, 67, 72, and 88 control the split, mixture generation, and training randomness. Models use 200 epochs of AdamW \cite{loshchilov2019adamw}, batch size 32, learning rate $5\times10^{-4}$, zero weight decay, dropout 0.1, five warmup epochs, and cosine decay to $10^{-6}$. Validation ground-truth mean squared error selects checkpoints; the held-out test partition supplies final scores.
 
-The primary comparison varies the future horizon within the SE family. Plain convolutional models with matched channel normalization provide a gating control. Receptive-field expansion and causal attention are supporting capacity controls \cite{vaswani2017attention}; latent key--value compression is evaluated only for configurations with recorded settings \cite{deepseekai2024deepseekv2}. These comparisons use matched training and scoring conditions. A depth-changing receptive-field sweep is not treated as an isolated test of context length.
+The primary comparison varies the future horizon within the SE family. Plain convolutional models with matched channel normalization provide a gating control. Causal attention is a supporting capacity control \cite{vaswani2017attention}; latent key--value compression is evaluated only for configurations with recorded settings \cite{deepseekai2024deepseekv2}. These comparisons use matched training and scoring conditions.
 
 Temporal and spectral relative root-mean-square errors (RRMSE$_t$, RRMSE$_f$) and Pearson correlation (CC) follow EEGdenoiseNet definitions \cite{EEGdenoiseNet}; spectral errors use squared rFFT magnitudes over 0--125 Hz. Clean-input preservation is an additional test. For seed $s$, we define recovery of the SE family's causal-to-offline error gap as
 \begin{equation}
  G_s(L)=\frac{E_s(0)-E_s(L)}{E_s(0)-E_s(\mathrm{off})},
  \label{eq:gap}
 \end{equation}
-where $E$ denotes test RRMSE$_t$ and the denominator must be positive. Gap recovery is defined within the SE family; capacity controls are compared through paired absolute errors. Ratios are calculated within seed before aggregation. Means and sample standard deviations use training runs as the repeat unit; test segments are not counted as independent training repeats.
+where $E$ denotes test RRMSE$_t$ and the denominator must be positive. Plain TCN and attention use the same seed's SE anchors, so Eq.~\eqref{eq:gap} places them on one scale. Ratios are calculated within seed before aggregation. Means and sample standard deviations use training runs as the repeat unit; test segments are not counted as independent training repeats.
 
 \subsection{Real Recordings and Device Measurements}
 EEG-IO provides blink-annotated frontal recordings from 20 participants, acquired with a wearable OpenBCI board at 250 Hz \cite{agarwal2019blink}. The preliminary Fp1 test uses forward 1--80-Hz filtering, a 60-Hz notch, hard blink labels, and 3-s scoring warmup. SE resets within each 512-sample inference window (hop 4). Blink ratios use $\pm2$-s epochs and a central $\pm0.5$-s interval; background scoring excludes $\pm0.5$ s around all blink labels. Matched-lookahead settings remain \TBD{final real-data settings}.
@@ -145,35 +147,41 @@ On a Raspberry Pi 5, these recordings are fed to the final model exports one sam
 \end{figure}
 
 \begin{table}[t]
-\caption{Representative Raspberry Pi 5 replay with final weights; SE example denotes the nonzero horizon specified in the text. Entries summarize per-repeat percentiles as mean $\pm$ sample SD over three complete repeats. Power is measured with an external meter.}
+\caption{Raspberry Pi 5 paced replay of the FP32 exports at $H=4$, 250 Hz: one locked run per model (performance governor, CPUs 2--3, two threads), 1,125 hops. Dashes denote measurements not yet taken.}
 \label{tab:device}
 \centering\footnotesize
 \begin{tabular}{@{}lcccc@{}}
 \toprule
-Quantity & TCN & SE $L=0$ & SE example & Attn.\\
+Quantity & TCN & SE $L=0$ & SE $L=8$ & Attn.\\
 \midrule
-Precision & \blank & \blank & \blank & \blank\\
-Hop / rate (samples/Hz) & \blank & \blank & \blank & \blank\\
-Hop p50 / p99 (ms) & \blank & \blank & \blank & \blank\\
-End-to-end p99 (ms) & \blank & \blank & \blank & \blank\\
-Missed deadlines (\%) & \blank & \blank & \blank & \blank\\
-Processing duty (\%) & \blank & \blank & \blank & \blank\\
+Precision & \blank & FP32 & FP32 & FP32\\
+Hop/rate (samples/Hz) & \blank & 4/250 & 4/250 & 4/250\\
+Hop p50/p99 (ms) & \blank & 6.1/6.3 & 6.6/6.9 & 17.1/17.5\\
+E2E p50/max (ms) & \blank & 6.1/7.0 & 6.7/7.6 & 792/1540\\
+Missed deadlines (\%) & \blank & 0 & 0 & 100\\
+Processing duty (\%) & \blank & 37.8 & 41.4 & 107\\
 Peak process RAM (MB) & \blank & \blank & \blank & \blank\\
 Idle board power (W) & \blank & \blank & \blank & \blank\\
 Incr.\ energy / hop (mJ) & \blank & \blank & \blank & \blank\\
 \bottomrule
+% Source: project v1/deploy/artifacts/pi_latency/latency_{tcn_se_both_250hz_fixed (s42), tcn_se_la8_both_channelnorm_250hz_s42}_hop4_duty.json and latency_tcn_mla_r16_both_250hz_fixed_s88_hop32_duty.json, row hop=4 (paced replay, 2026-11-20/21). Attention falls behind: e2e drifts +1141 ms over the run.
 \end{tabular}
 \end{table}
 
 \section{Results and Discussion}
 \subsection{Accuracy Versus Waiting Time}
-Figure~\ref{fig:tradeoff} and Table~\ref{tab:accuracy} relate reconstruction quality to the declared future horizon. For illustration, at $L=\TBD{horizon}$, RRMSE$_t$ changes from \TBD{causal error} to \TBD{lookahead error}, with a recovered gap of \TBD{mean and SD}. The corresponding extra future-sample wait is \TBD{time} ms. The largest marginal improvement occurs over \TBD{interval}; the results beyond that interval show \TBD{measured trend}. Application deadlines and preservation requirements determine which configurations are acceptable.
+Figure~\ref{fig:tradeoff} and Table~\ref{tab:accuracy} relate reconstruction quality to the declared future horizon. For illustration, at $L=8$, RRMSE$_t$ changes from 0.737 to 0.679, with a recovered gap of $51.9\pm1.8$\%. The corresponding extra future-sample wait is 32 ms. Returns diminish with horizon on synthetic and recorded data, with the largest gain per millisecond over the first few future samples.
+% Shape (test RRMSE_t, common interval, 5 seeds; paper_results/table1_test_scores.json): L=0 0.737, 8 0.679, 16 0.650, 32 0.637, 62 0.629, 124 0.629; offline 0.626; L=186 (no past, 4 seeds) 0.700. Gain per ms: 0-8 1.8e-3, 8-16 9e-4, 16-62 1.1e-4, 62-124 ~0.
+Application deadlines and preservation requirements determine which configurations are acceptable.
 
-The capacity controls in Table~\ref{tab:accuracy} change RRMSE$_t$ by \TBD{paired differences}, with costs in Table~\ref{tab:device}. Feasible configurations must meet execution, memory, and output-delay constraints, verified by measurement rather than parameter count.
+The attention control matches TCN+SE accuracy (Table~\ref{tab:accuracy}) at about three times the per-hop computation (Table~\ref{tab:device}); on the recordings it altered background activity more for every seed, while its blink suppression varied with seed.
+% Attention vs TCN+SE L=0, seeds 67/72/88. Synthetic: paired RRMSE_t -0.0007 +- 0.0019 (paper_results/table1_test_scores.json). EEG-IO paired tests (causal, as recorded, H=4, 20 participants, SE sets the blink threshold; paper_results/eegio_mla_vs_se.py): eegio_20261121_221040_571455_2d2cca83.json (s67), eegio_20261121_222230_099323_4cf8e478.json (s72), eegio_20261121_223439_340264_04a142bf.json (s88). Background RMSE MLA-SE median +2.9/+2.0/+1.2 uV, MLA lower for 0/20, 0/20, 1/20 participants. Suppression +2.5/-1.8/+2.9 dB; blink amplitude ratio 7.13->4.37, 8.21->7.80, 5.64->7.66. Host MLA equals the Pi 5 runs to 4 decimals.
+Feasible configurations must meet execution, memory, and output-delay constraints, verified by measurement rather than parameter count.
 
 \subsection{Artifact Suppression and Signal Preservation}
 A preliminary fixed-scale $L=0$ test (seed 67, 20 participants) yielded median blink amplitude ratio 7.132, background input--output RMSE 18.538 $\mu$V, and blink-count reduction 0.0\% (single model, not a paired comparison).
 
+% EEG-IO 2026-11-21 (eegio_20261121_175806_618540_a3c589f4.json, causal rungs, offline ref zero-phase, rescaled input, 20 participants; matched seeds 42/54/67/72, seed-median mean): blink amplitude ratio L=0 5.15, 8 3.85, 62 3.34, 124 3.42; per ms 0-8 -0.041, 8-62 -0.0024. Background RMSE 20.57 -> 20.19 (L=8) -> 19.85 (L=124). Adjusted blink count flat beyond L=8. Seed 88 rungs L>=32 not yet in this test.
 The matched-lookahead changes in blink amplitude ratio, background RMSE, and event counts are \TBD{paired lookahead results}; corrected participant-level statistics and threshold sensitivity are \TBD{paired statistics and count sensitivity}. Figure~\ref{fig:real} relates blink suppression to background alteration.
 
 Clean-input RRMSE is \TBD{preservation result}. Suppression and preservation are read jointly, since global attenuation can cut artifact counts while altering background activity; recordings that informed development are reported as exploratory.
@@ -189,7 +197,7 @@ Clean-input RRMSE is \TBD{preservation result}. Suppression and preservation are
 % Seeds also differ in input scaling. Text kept qualitative on purpose (author's decision).
 
 \subsection{Measured Edge Performance}
-Table~\ref{tab:device} reports the final-weight replay measurements. At a representative horizon of \TBD{device horizon} samples, hop p99 is \TBD{hop p99} ms against a \TBD{hop deadline} ms processing budget. Measured end-to-end p99 is \TBD{end-to-end p99} ms, with \TBD{miss rate}\% missed hop deadlines. The final-pipeline parity error is \TBD{maximum error}. A saved model-input check for the $L=0$, seed-67 model gave maximum error $2.98\times10^{-7}$ at tolerance $10^{-4}$; it excludes filtering and finite-lookahead deployment. Incremental board power is \TBD{incremental power} mW, or \TBD{energy} mJ per hop; Fig.~\ref{fig:tradeoff}(b) compares it across horizons and inference paths.
+Table~\ref{tab:device} reports the final-weight replay measurements. At a representative horizon of 8 samples, hop p99 is 6.9 ms against a 16 ms processing budget. Measured end-to-end latency peaks at 7.6 ms, with no missed hop deadlines. The final-pipeline parity error is \TBD{maximum error}. A saved model-input check for the $L=0$, seed-67 model gave maximum error $2.98\times10^{-7}$ at tolerance $10^{-4}$; it excludes filtering and finite-lookahead deployment. Incremental board power is \TBD{incremental power} mW, or \TBD{energy} mJ per hop; Fig.~\ref{fig:tradeoff}(b) compares it across horizons and inference paths.
 
 The highest replicated-stream load meeting the timing criterion is \TBD{stream count and criterion}; queue growth and missed deadlines, not average inference time, identify overload.
 
@@ -199,7 +207,7 @@ The curve is specific to the tested artifact mixture, preprocessing, and padding
 Epoch-level synthetic splits and replayed recordings do not establish generalization to new participants, other acquisition hardware, or acquisition-driver timing.
 
 \section{Conclusion}
-Figure~\ref{fig:tradeoff} and Table~\ref{tab:accuracy} describe how reconstruction quality varies with future-sample waiting time. Matched tests show \TBD{accuracy--delay result} and \TBD{preservation result}. Representative device replay yields \TBD{timing and power result}. Together, these measurements let a sensing system choose its future horizon from its output deadline and signal-preservation requirement.
+Figure~\ref{fig:tradeoff} and Table~\ref{tab:accuracy} describe how reconstruction quality varies with future-sample waiting time. Matched tests show that eight samples of lookahead recover about half of the causal-to-offline gap, with diminishing returns beyond, and \TBD{preservation result}. Representative device replay at that horizon meets every 16 ms hop deadline at 41\% processing duty; board power is \TBD{power result}. Together, these measurements let a sensing system choose its future horizon from its output deadline and signal-preservation requirement.
 
 \section*{Acknowledgment}
 % Preserve the original AI-assistance disclosure without asserting a completed review.

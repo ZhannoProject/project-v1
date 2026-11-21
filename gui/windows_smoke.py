@@ -1,4 +1,4 @@
-"""Run inside the shipped ARM64 Python on a Windows device or CI runner."""
+"""Run inside the shipped Python (ARM64 or x64) on a Windows device or CI runner."""
 
 import json
 import os
@@ -13,7 +13,13 @@ import urllib.request
 
 def check(bundle=None):
     assert sys.platform == 'win32', 'Run the device check on Windows'
-    assert platform.machine().lower() in ('arm64','aarch64'), 'Expected native ARM64 Python'
+    machine=platform.machine().lower()
+    assert machine in ('arm64','aarch64','amd64','x86_64'), f'Unexpected Windows architecture: {machine}'
+    manifest=Path(__file__).resolve().parents[2]/'manifest.json'
+    if manifest.is_file():
+        built=json.loads(manifest.read_text(encoding='utf-8')).get('arch','arm64')
+        native='arm64' if machine in ('arm64','aarch64') else 'x64'
+        assert built==native, f'This is the {built} package running under {native} Python'
     import numpy as np
     import torch
     import scipy.signal

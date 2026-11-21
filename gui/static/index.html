@@ -3170,10 +3170,10 @@
   function piDutySource() {
     const t = state.pi.loaded.duty;
     if (t) return { rows: t.rows || [], source: t.path, file: true,
-                    environment: t.environment || null };
+                    environment: t.environment || null, memory: t.memory || null };
     const d = (state.pi.parsed || {}).duty || {};
     return { rows: d.rows || [], source: "this run's log", file: false, setup: d.setup,
-             environment: (state.pi.parsed || {}).environment || null };
+             environment: (state.pi.parsed || {}).environment || null, memory: d.memory || null };
   }
 
   // ---- the conditions the numbers were taken under ----
@@ -3358,6 +3358,15 @@
              `${ms(s.hop_budget_ms, 1)} ms buffering + ${ms(compute)} ms compute`);
       }
       if (s.temp_c) tile(`${ms(s.temp_c.end, 1)} °C`, "SoC at the end", `peak ${ms(s.temp_c.max, 1)}`);
+      // The process high-water mark (getrusage), read on the board as the
+      // trace was written: what the deployment needs resident, all included.
+      const mem = s.memory || {};
+      if (mem.peak_rss_mib != null) {
+        tile(`${ms(mem.peak_rss_mib, 1)} MiB`, "peak process RAM",
+             mem.added_by_session_mib != null
+               ? `${ms(mem.added_by_session_mib, 1)} MiB above the ${ms(mem.rss_before_session_mib, 1)} MiB before the model session`
+               : "process high-water mark");
+      }
     }
     $("#piStats").innerHTML = tiles.join("");
   }
@@ -3552,7 +3561,13 @@
         + `= <b>${ms(best.hop_budget_ms + best.e2e_median_ms, 1)} ms</b> total latency at ${fmtPct(best.duty_mean, 0)} duty cycle.`
       : "No hop size in this sweep is comfortably real-time on this board.")
       + ` Each hop costs one full-window forward pass, so halving the hop doubles the duty cycle.`
-      + ` The bar is the mean, the cap the p99. From ${escHtml(d.source || "")}.`;
+      + ` The bar is the mean, the cap the p99.`
+      + ((d.memory || {}).peak_rss_mib != null
+        ? ` Peak process RAM over the sweep: <b>${ms(d.memory.peak_rss_mib, 1)} MiB</b>`
+          + (d.memory.added_by_session_mib != null
+            ? ` (${ms(d.memory.added_by_session_mib, 1)} MiB above the process before the model session).` : ".")
+        : "")
+      + ` From ${escHtml(d.source || "")}.`;
   }
 
   function renderPiTables() {
@@ -3744,6 +3759,7 @@
     const vcls = v === "locked" ? "ok" : v === "unknown" ? "muted" : "warn";
     const extras = [r.duty ? `duty sweep${r.duty.best_hop != null ? ` · safe from hop ${r.duty.best_hop}` : ""}` : null,
                     r.realtime ? "real-time replay" : null,
+                    r.peak_rss_mib != null ? `peak RAM ${r.peak_rss_mib.toFixed(0)} MiB` : null,
                     r.csv ? "csv" : null].filter(Boolean).join(" · ");
     // Accuracy from the same run as the timing. "epoch mode" is the batched
     // score and the one to compare across rows; the streaming figure is a
@@ -3877,7 +3893,9 @@
     const badges = runTemporalBadge(r)
       + (r.kd ? '<span class="badge kd">kd</span>' : "")
       + (r.status === "stale" ? '<span class="badge stale" title="history.json and the weights beside it come from different runs — this directory was re-used">stale</span>' : "")
-      + (r.status === "interrupted" ? '<span class="badge partial" title="no history.json: the run did not finish">partial</span>' : "")
+      + (r.status === "interrupted" ? `<span class="badge partial" title="${r.epochs && r.planned_epochs
+          ? `stopped at epoch ${r.epochs} of ${r.planned_epochs}, or still training: left out of seed averages`
+          : "no history.json: the run did not finish"}">partial${r.epochs && r.planned_epochs ? ` ${r.epochs}/${r.planned_epochs}` : ""}</span>` : "")
       + (r.optimizer
           ? `<span class="badge optim" title="${r.optimizer.replace(/"/g, "&quot;")} — read from the optimizer and scheduler state in the checkpoint">${(r.optimizer_detail || {}).family || "opt"}</span>`
           : "")
@@ -3904,7 +3922,7 @@
       : "";
     // "tab": the Runs tab's own actions.  "pick": the run picker, where those
     // would navigate away mid-choice, so the row itself is the control.
-    const plot = (mode === "tab" && r.status !== "interrupted")
+    const plot = (mode === "tab" && (r.status !== "interrupted" || r.epochs))
       ? ` <button class="link" data-hist="${r.name}" title="Plot this run's curve in the Train tab">curve</button>` : "";
     const action = mode === "pick"
       ? `<td><button class="primary" data-pick="${r.name}">Select</button></td>`

@@ -444,6 +444,33 @@ class RunsListingTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    @unittest.skipIf(torch is None, "needs a last.pt that sits at the history's last epoch")
+    def test_a_run_short_of_its_planned_epochs_is_not_complete(self):
+        """history.json and last.pt are rewritten every epoch, so a run that
+        stopped at epoch 3 of 200 agrees with itself and used to read as
+        complete -- and then joined a rung's average beside its own _retry2."""
+        tmp = Path(tempfile.mkdtemp(prefix="gui_short_"))
+        runs = tmp / "runs"; runs.mkdir()
+        for name, done in (("tcn_se_la32_both_s88", 3), ("tcn_se_la32_both_s88_retry2", 5),
+                           ("tcn_se_both_legacy", 3)):
+            d = self._run_dir(runs, name, hist_epochs=done, last_epoch=done,
+                              model_config={"variant": "tcn_se"})
+            if name != "tcn_se_both_legacy":       # an old run that never recorded a plan
+                h = json.loads((d / "history.json").read_text())
+                h["config"] = {"max_epochs": 5, "artifact": "BOTH"}
+                (d / "history.json").write_text(json.dumps(h))
+        try:
+            with mock.patch.object(config_io, "RUNS_DIR", runs):
+                rows = {r["name"]: r for r in config_io.list_runs()}
+            short, full = rows["tcn_se_la32_both_s88"], rows["tcn_se_la32_both_s88_retry2"]
+            self.assertEqual((short["status"], short["epochs"], short["planned_epochs"]), ("interrupted", 3, 5))
+            self.assertEqual((full["status"], full["planned_epochs"]), ("complete", 5))
+            self.assertEqual(rows["tcn_se_both_legacy"]["status"], "complete", "no plan recorded: left as it was")
+            page = (ROOT / "gui" / "static" / "index.html").read_text()
+            self.assertIn("stopped at epoch ${r.epochs} of ${r.planned_epochs}", page)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_loss_is_recorded_recovered_or_unknown(self):
         """Where each run's loss_fn comes from, and that an unverified one is never claimed."""
         tmp = Path(tempfile.mkdtemp(prefix="gui_loss_"))

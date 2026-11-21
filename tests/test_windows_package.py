@@ -42,6 +42,40 @@ class WindowsPackageTests(unittest.TestCase):
         config=json.loads((self.root/'runtime/gui.runtimeconfig.json').read_text())
         self.assertEqual(config['runtimeOptions']['framework']['name'],'Microsoft.WindowsDesktop.App')
 
+    def test_both_targets_pin_the_same_runtimes_and_package_versions(self):
+        """x64 and ARM64 differ only in platform builds, never in versions."""
+        import re
+        locks={a:json.loads((ROOT/'packaging/windows'/spec['runtime_lock']).read_text())
+               for a,spec in make_windows.ARCHES.items()}
+        self.assertEqual(locks['arm64']['python'],locks['x64']['python'])
+        self.assertEqual(locks['arm64']['dotnet'],locks['x64']['dotnet'])
+        for arch,lock in locks.items():
+            names={a['name'] for a in lock['assets']}
+            self.assertEqual(names,{'python','dotnet','desktop','vcredist'},arch)
+            tag='arm64' if arch=='arm64' else ('x64','amd64')
+            for asset in lock['assets']:
+                self.assertRegex(asset['sha256'],'^[0-9a-f]{64}$')
+                self.assertTrue(any(t in asset['filename'].lower() for t in ((tag,) if isinstance(tag,str) else tag)),
+                                f"{arch} lock holds {asset['filename']}")
+        pins={a:dict(re.findall(r'^([a-z0-9_.-]+)==(\S+)',(ROOT/'packaging/windows'/spec['requirements']).read_text(),re.M))
+              for a,spec in make_windows.ARCHES.items()}
+        self.assertGreater(len(pins['arm64']),20)
+        self.assertEqual(pins['arm64'],pins['x64'])
+        self.assertIn('win_amd64',(ROOT/'packaging/windows/requirements-x64.lock').read_text())
+        self.assertNotIn('win_arm64',(ROOT/'packaging/windows/requirements-x64.lock').read_text())
+
+    def test_each_target_names_its_own_runtime_installer(self):
+        for arch,spec in make_windows.ARCHES.items():
+            with self.subTest(arch=arch):
+                package=self.root/arch;(package/'runtime').mkdir(parents=True)
+                make_windows.write_launch_files(package,'3.13.9','10.0.14',arch)
+                readme=(package/'README Windows.txt').read_text(encoding='utf-8')
+                self.assertIn(spec['vcredist'],readme)
+                self.assertIn(spec['platform'],readme)
+        self.assertEqual(make_windows.ARCHES['x64']['pe_machine'],0x8664)
+        self.assertEqual(make_windows.ARCHES['arm64']['pe_machine'],0xaa64)
+        self.assertNotEqual(make_windows.ARCHES['x64']['package'],make_windows.ARCHES['arm64']['package'])
+
     def test_pe_header_distinguishes_arm64_from_x64(self):
         path=self.root/'app.exe'
         header=bytearray(256);header[:2]=b'MZ';struct.pack_into('<I',header,0x3c,64)

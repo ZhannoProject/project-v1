@@ -608,6 +608,7 @@ class LatencyMonitor:
             s["environment"] = self.environment
         if self.scores is not None:
             s["scores"] = self.scores
+        s["memory"] = memory_block()
         return s
 
     def print_summary(self) -> dict:
@@ -638,6 +639,11 @@ class LatencyMonitor:
         if "temp_c" in s:
             c = s["temp_c"]
             print(f"           SoC temp  : {c['start']} -> {c['end']} °C (peak {c['max']})")
+        mem = s.get("memory") or {}
+        if mem.get("peak_rss_mib") is not None:
+            print(f"           memory    : peak {mem['peak_rss_mib']} MiB resident"
+                  + (f" ({mem['added_by_session_mib']} MiB above the {mem['rss_before_session_mib']} MiB"
+                     f" before the session)" if mem.get("added_by_session_mib") is not None else ""))
         return s
 
     def save(self, stem: str | Path) -> tuple[Path, Path]:
@@ -803,7 +809,7 @@ def duty_cycle_check(d: EEGDenoiser, signal: np.ndarray, hops=(64, 32, 16, 8, 4)
                "lookahead_wait_ms": s.get("lookahead_wait_ms", 0.0),
                "total_latency_median_ms": round(s["hop_budget_ms"] + e2e["median"]
                                                 + s.get("lookahead_wait_ms", 0.0), 2),
-               "temp_c": s.get("temp_c"), "verdict": verdict}
+               "temp_c": s.get("temp_c"), "peak_rss_mib": peak_rss_mib(), "verdict": verdict}
         rows.append(row)
         print(f"       {hop:>4d} {row['hop_budget_ms']:>8.2f} {row['hops_per_s']:>6.1f} | "
               f"{row['compute_median_ms']:>6.2f} {row['compute_p99_ms']:>6.2f} {row['compute_max_ms']:>6.2f} | "
@@ -819,6 +825,9 @@ def duty_cycle_check(d: EEGDenoiser, signal: np.ndarray, hops=(64, 32, 16, 8, 4)
               f"= {best['total_latency_median_ms']:.1f} ms total latency at {100 * best['duty_mean']:.0f}% duty cycle")
     else:
         print("[duty] no hop in the sweep is comfortably real-time on this board")
+    mem = memory_block()
+    if mem["peak_rss_mib"] is not None:
+        print(f"[duty] peak process memory {mem['peak_rss_mib']} MiB resident over the sweep")
     return rows
 
 
@@ -834,11 +843,62 @@ def save_duty_rows(rows: list[dict], stem: str | Path,
     stem = Path(stem)
     stem.parent.mkdir(parents=True, exist_ok=True)
     js, csv = stem.with_suffix(".json"), stem.with_suffix(".csv")
-    js.write_text(json.dumps({"rows": rows, "environment": environment}, indent=2))
+    js.write_text(json.dumps({"rows": rows, "environment": environment, "memory": memory_block()},
+                             indent=2))
     keys = [k for k in rows[0] if k != "temp_c"] if rows else []
     lines = [",".join(keys)] + [",".join(str(r[k]) for k in keys) for r in rows]
     csv.write_text("\n".join(lines) + "\n")
     return js, csv
+
+
+# ============================================================
+# Process memory
+# ============================================================
+#: Resident memory just before the onnxruntime session is built, set by main().
+#: The interpreter, numpy and onnxruntime are already loaded by then, so peak
+#: minus this is what the session, the model and the replayed signal added.
+_RSS_BEFORE_SESSION_MIB: float | None = None
+_RSS_AFTER_SESSION_MIB: float | None = None
+
+
+def rss_now_mib() -> float | None:
+    """Current resident set size (Linux /proc/self/status VmRSS); None elsewhere."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)        # kB -> MiB
+    except OSError:
+        pass
+    return None
+
+
+def peak_rss_mib() -> float | None:
+    """
+    Peak resident set size of this process over its whole life, in MiB.
+
+    getrusage's ru_maxrss: kilobytes on Linux, bytes on macOS. It is the
+    kernel's high-water mark, so it catches a transient peak between two
+    samples that polling would miss, and it never goes down.
+    """
+    try:
+        import resource
+    except ImportError:                                  # Windows
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return round(peak / (1024 * 1024 if sys.platform == "darwin" else 1024), 1)
+
+
+def memory_block() -> dict:
+    """What a trace records about memory, read at the moment it is written."""
+    peak = peak_rss_mib()
+    before = _RSS_BEFORE_SESSION_MIB
+    return {"peak_rss_mib": peak,
+            "rss_before_session_mib": before,
+            "rss_after_session_mib": _RSS_AFTER_SESSION_MIB,
+            "added_by_session_mib": (round(peak - before, 1)
+                                     if peak is not None and before is not None else None),
+            "source": "getrusage ru_maxrss (process high-water mark, MiB)"}
 
 
 # ============================================================
@@ -1193,6 +1253,8 @@ def main(argv=None):
         except (ValueError, RuntimeError) as e:
             p.error(f"--cpus {a.cpus}: {e}")
 
+    global _RSS_BEFORE_SESSION_MIB, _RSS_AFTER_SESSION_MIB
+    _RSS_BEFORE_SESSION_MIB = rss_now_mib()
     if a.incremental:
         d = IncrementalDenoiser(a.onnx, a.threads, spin=not a.no_spin)
         # Same shape as the windowed line above, deliberately: the GUI's log
@@ -1214,6 +1276,8 @@ def main(argv=None):
               f"spinning={'on' if d.threads['allow_spinning'] else 'off'}"
               + (f"  lookahead={d.lookahead} ({1000 * d.lookahead / d.sample_rate:g} ms, "
                  f"outputs emitted {d.lookahead} samples late)" if d.lookahead else ""))
+
+    _RSS_AFTER_SESSION_MIB = rss_now_mib()
 
     env = None
     if not a.no_preflight:

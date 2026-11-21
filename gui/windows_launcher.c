@@ -8,7 +8,7 @@
 #include <wchar.h>
 #include <stdio.h>
 
-/* A relocatable ARM64 launcher. Python remains a real interpreter, so the
+/* A relocatable launcher, compiled for ARM64 or x64 by gui/make_windows.py. Python remains a real interpreter, so the
  * GUI's training/evaluation subprocesses continue to work normally. */
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show) {
     wchar_t root[32768], python[32768], project[32768], command[65536];

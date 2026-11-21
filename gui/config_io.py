@@ -738,7 +738,8 @@ def list_runs() -> List[dict]:
       stale        history.json exists but last.pt is at a different epoch — the
                    directory was re-used, so the metrics shown describe weights
                    that have been overwritten
-      interrupted  no history.json: the run never reached _finish()
+      interrupted  no history.json, or fewer epochs than the run's own max_epochs:
+                   it never reached _finish() (or is still training)
 
     ``kind`` groups runs that are the same experiment (variant x artifact).
     """
@@ -846,6 +847,16 @@ def list_runs() -> List[dict]:
         row["loss_fn"], row["loss_source"] = _loss_of(d, h)
         recorded = dict((h or {}).get("config") or {})
         recorded.update(run_config)
+        # history.json and last.pt are rewritten every epoch, so a run that
+        # died (or is still going) at epoch 3 matches the test above and would
+        # read as complete -- and then join a rung's average beside its own
+        # 200-epoch _retry2. Training has no early stopping, so a finished run
+        # always holds max_epochs entries; anything shorter did not finish.
+        planned = recorded.get("max_epochs")
+        if (row["status"] == "complete" and isinstance(planned, int) and not isinstance(planned, bool)
+                and row["epochs"] is not None and row["epochs"] < planned):
+            row["status"] = "interrupted"
+        row["planned_epochs"] = planned if isinstance(planned, int) else None
         row["input_normalization"] = recorded.get("normalization") or "epoch"
         row["category"] = run_category(variant, mc, recorded, kd=row["kd"])
         row["output_delay"] = recorded.get("output_delay", 0)

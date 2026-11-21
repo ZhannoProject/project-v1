@@ -1,4 +1,4 @@
-"""Entry point of the relocatable Windows ARM64 distribution."""
+"""Entry point of the relocatable Windows distribution (ARM64 or x64)."""
 
 import argparse
 import ctypes
@@ -13,7 +13,8 @@ def startup_error_message(error,detail):
     if isinstance(error,ModuleNotFoundError):
         message+=f'程序包缺少模块：{error.name or "未知模块"}。请使用修复后的完整程序包。\n'
     elif isinstance(error,OSError) and getattr(error,'winerror',None)==126:
-        message+='Windows 运行库加载失败。可先运行 dependencies\\VC_redist.arm64.exe，随后执行 Check installation.cmd。\n'
+        installer='VC_redist.arm64.exe' if 'arm' in (os.environ.get('PROCESSOR_ARCHITECTURE','')).lower() else 'VC_redist.x64.exe'
+        message+=f'Windows 运行库加载失败。可先运行 dependencies\\{installer}，随后执行 Check installation.cmd。\n'
     else:
         message+='可运行 Check installation.cmd 检查；原生窗口不可用时，可运行 Start in browser.cmd。\n'
     return message+'\n'+detail[-1800:]
@@ -46,7 +47,7 @@ def load_desktop_runtime(bundle):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='EEG Training GUI for Windows ARM64')
+    parser = argparse.ArgumentParser(description='EEG Training GUI for Windows')
     parser.add_argument('--check', action='store_true', help='run a local installation self-check')
     parser.add_argument('--browser', action='store_true', help='use the default browser if WebView2 is unavailable')
     args = parser.parse_args(argv)

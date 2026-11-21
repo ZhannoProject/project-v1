@@ -921,6 +921,88 @@ class TraceTests(unittest.TestCase):
                     pi.read_trace(bad)
 
 
+class PeakMemoryTests(unittest.TestCase):
+    """Peak process RAM: measured on the board by raspi_infer.py, carried by
+    the trace files, read back by the tab -- and parsed from the live log."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(ROOT / "deploy"))
+        try:
+            import raspi_infer
+        except ImportError:                      # numpy / onnxruntime not installed
+            raise unittest.SkipTest("deploy/raspi_infer.py cannot be imported here")
+        finally:
+            sys.path.pop(0)
+        cls.ri = raspi_infer
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.patch = mock.patch.object(pi, "TRACE_DIR", self.tmp)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_the_peak_is_the_process_high_water_mark(self):
+        peak = self.ri.peak_rss_mib()
+        self.assertIsNotNone(peak)
+        self.assertGreater(peak, 10, "a Python process with numpy and onnxruntime is not under 10 MiB")
+        before = peak
+        hold = bytearray(64 * 1024 * 1024)       # touch 64 MiB, then let it go
+        hold[::4096] = b"x" * len(hold[::4096])
+        del hold
+        self.assertGreaterEqual(self.ri.peak_rss_mib(), before + 32, "the high-water mark did not rise")
+
+    def test_a_latency_trace_carries_the_block_and_the_tab_lists_it(self):
+        m = self.ri.LatencyMonitor(hop=32, sample_rate=250, label="latency/stream")
+        m.record_first_window(0.003)
+        for _ in range(10):
+            m.record_hop(0.0028, 0.0030)
+        js, _ = m.save(self.tmp / "latency_demo_hop32")
+        mem = json.loads(js.read_text())["memory"]
+        self.assertGreater(mem["peak_rss_mib"], 0)
+        self.assertIn("ru_maxrss", mem["source"])
+        rows = {r["name"]: r for r in pi.list_traces()}
+        self.assertEqual(rows["latency_demo_hop32.json"]["peak_rss_mib"], mem["peak_rss_mib"])
+        self.assertEqual(pi.read_trace("latency_demo_hop32.json")["summary"]["memory"], mem)
+
+    def test_a_duty_sweep_file_carries_the_block(self):
+        self.ri.save_duty_rows([{"hop": 4, "verdict": "OK", "temp_c": None}],
+                               self.tmp / "latency_demo_hop4_duty", environment=None)
+        t = pi.read_trace("latency_demo_hop4_duty.json")
+        self.assertGreater(t["memory"]["peak_rss_mib"], 0)
+
+    def test_an_old_trace_without_it_reads_as_unknown(self):
+        (self.tmp / "latency_old_hop32.json").write_text(json.dumps({"hop": 32, "n_hops": 1}))
+        rows = {r["name"]: r for r in pi.list_traces()}
+        self.assertIsNone(rows["latency_old_hop32.json"]["peak_rss_mib"])
+
+    def test_the_live_log_lines_are_parsed(self):
+        m = self.ri.LatencyMonitor(hop=32, sample_rate=250, label="latency/stream")
+        m.record_first_window(0.003)
+        for _ in range(10):
+            m.record_hop(0.0028, 0.0030)
+        buf = io.StringIO()
+        with mock.patch.object(self.ri, "_RSS_BEFORE_SESSION_MIB", 40.0), \
+             contextlib.redirect_stdout(buf):
+            summary = m.print_summary()
+            print(f"[duty] peak process memory {summary['memory']['peak_rss_mib']} MiB resident over the sweep")
+        st = scan(buf.getvalue())
+        got = st["latency"][-1]["memory"]
+        self.assertEqual(got["peak_rss_mib"], summary["memory"]["peak_rss_mib"])
+        self.assertEqual(got["rss_before_session_mib"], 40.0)
+        self.assertEqual(got["added_by_session_mib"], summary["memory"]["added_by_session_mib"])
+        self.assertEqual(st["duty"]["memory"]["peak_rss_mib"], summary["memory"]["peak_rss_mib"])
+
+    def test_the_page_shows_it(self):
+        page = (ROOT / "gui" / "static" / "index.html").read_text()
+        self.assertIn('"peak process RAM"', page)
+        self.assertIn("Peak process RAM over the sweep", page)
+        self.assertIn("r.peak_rss_mib", page)
+
+
 class StepSequenceTests(unittest.TestCase):
     """A deploy run is several commands but one job: one log to read, and a
     step that fails stops the ones after it."""
@@ -1450,9 +1532,10 @@ class PageTests(unittest.TestCase):
 
     def test_the_switcher_is_a_queue_not_a_history(self):
         """Finished runs leave it — their logs and curves are still in the
-        Runs tab — except the one being read, which must not vanish mid-read."""
+        Runs tab — except the one being read, which must not vanish mid-read.
+        Queued runs stay: they are what is waiting."""
         block = self.PAGE[self.PAGE.index("function renderJobTabs("):][:1400]
-        self.assertIn("j.running || j.id === state.jobId", block)
+        self.assertIn("j.running || j.queued || j.id === state.jobId", block)
 
     def test_stopping_means_the_run_you_are_looking_at(self):
         block = self.PAGE[self.PAGE.index("async function stop()"):][:400]

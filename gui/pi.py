@@ -421,6 +421,10 @@ def list_traces() -> list[dict]:
                        environment=data.get("environment"),
                        scores=data.get("scores"),
                        inference=data.get("inference"))
+        # Peak resident memory of the process that took the trace; absent (None)
+        # on traces written before raspi_infer.py recorded it.
+        if isinstance(data, dict):
+            row["peak_rss_mib"] = (data.get("memory") or {}).get("peak_rss_mib")
         # The verdict the dropdown shows: a trace from before this was recorded
         # says "unknown", which is not the same as "unlocked" and must not read
         # as it.
@@ -538,7 +542,7 @@ def list_deploy_runs() -> list[dict]:
             # fallback for traces written before it was recorded, which is
             # what every one of them was.
             "mode": "incremental" if prefix == "incremental" else "windowed",
-            "inference": None,
+            "inference": None, "peak_rss_mib": None,
         })
         row["mtime"] = max(row["mtime"], t["mtime"])
         row["sample_rate_hz"] = row["sample_rate_hz"] or t.get("sample_rate_hz")
@@ -549,6 +553,9 @@ def list_deploy_runs() -> list[dict]:
             row["inference"] = t["inference"]
             row["mode"] = t["inference"].get("mode", row["mode"])
         row["csv"] = row["csv"] or bool(t.get("csv"))
+        # One process takes all of a run's traces, so the largest is the run's peak.
+        if t.get("peak_rss_mib") is not None:
+            row["peak_rss_mib"] = max(row["peak_rss_mib"] or 0, t["peak_rss_mib"])
         # A verdict from any of a run's traces describes the same run; prefer
         # one that exists over the None of an older sibling.
         row["verdict"] = row["verdict"] or t.get("verdict")
@@ -702,6 +709,7 @@ def read_trace(name: str, max_points: int = 900) -> dict:
         elif isinstance(data, dict) and isinstance(data.get("rows"), list):
             out["rows"] = data["rows"]
             out["environment"] = data.get("environment")
+            out["memory"] = data.get("memory")
         else:
             raise ValueError(f"{name} does not hold duty-cycle rows")
         return out
@@ -1186,6 +1194,9 @@ class LogScan:
     LAT_E2E = re.compile(rf"end-to-end:.*?median ({_N}) \| p95 ({_N}) \| max ({_N}) ms"
                          rf"\s+\(drift over run ({_N}) ms\)")
     LAT_TEMP = re.compile(rf"SoC temp\s*: ({_N}) -> ({_N}) °C \(peak ({_N})\)")
+    #   "           memory    : peak 112.4 MiB resident (61.0 MiB above the 51.4 MiB before the session)"
+    LAT_MEM = re.compile(rf"memory\s*: peak ({_N}) MiB resident"
+                         rf"(?: \(({_N}) MiB above the ({_N}) MiB before the session\))?")
     #   "[latency/testdata] hop    800 | last 2.86 ms (run 2.83) | ... | misses 0/800 of 125.0 ms budget"
     PROGRESS = re.compile(rf"^\[([^\]]+)\] hop\s+(\d+) \| last\s+({_N}) ms \(run\s+({_N})\)"
                           rf".*?misses (\d+)/(\d+) of ({_N}) ms budget(?:\s*\|\s*({_N})°C)?")
@@ -1195,6 +1206,7 @@ class LogScan:
 
     DUTY_HEAD = re.compile(rf"^\[duty\] ({_N}) s paced replay per hop at ({_N}) Hz, window (\d+), "
                            rf"(\d+) onnxruntime threads")
+    DUTY_MEM = re.compile(rf"^\[duty\] peak process memory ({_N}) MiB resident")
     DUTY_VERDICT = re.compile(r"^\[duty\] (smallest hop that is comfortably real-time:.*"
                               r"|no hop in the sweep is comfortably real-time.*)$")
     VERDICTS = ("OK", "MARGINAL", "FAIL")
@@ -1327,6 +1339,11 @@ class LogScan:
             cur["temp_c"] = {"start": _num(m.group(1)), "end": _num(m.group(2)),
                              "max": _num(m.group(3))}
             return True
+        m = self.LAT_MEM.search(line)
+        if m:
+            cur["memory"] = {"peak_rss_mib": _num(m.group(1)), "added_by_session_mib": _num(m.group(2)),
+                             "rss_before_session_mib": _num(m.group(3))}
+            return True
         return False
 
     def _duty(self, line: str) -> bool:
@@ -1339,6 +1356,10 @@ class LogScan:
         m = self.DUTY_VERDICT.match(line)
         if m:
             self.duty["verdict"] = m.group(1).strip()
+            return True
+        m = self.DUTY_MEM.match(line)
+        if m:
+            self.duty["memory"] = {"peak_rss_mib": _num(m.group(1))}
             return True
         row = self._duty_row(line)
         if row:
@@ -1423,5 +1444,6 @@ class LogScan:
                 "bench": self.bench, "test": self.test, "latency": list(self.latency),
                 "progress": self.progress,
                 "duty": {"rows": sorted(self.duty["rows"], key=lambda r: -r["hop"]),
-                         "verdict": self.duty["verdict"], "setup": self.duty["setup"]},
+                         "verdict": self.duty["verdict"], "setup": self.duty["setup"],
+                         "memory": self.duty.get("memory")},
                 "traces": list(self.traces)}

@@ -1,6 +1,7 @@
-"""Build a relocatable Windows ARM64 app, including its own Python and .NET.
+"""Build a relocatable Windows app (ARM64 or x64), including its own Python and .NET.
 
-python -m gui.make_windows --uv /path/to/uv --zig /path/to/zig --include-runs --include-data
+python -m gui.make_windows --arch x64 --include-runs --include-data
+python -m gui.make_windows --arch both --include-runs --include-data
 No Windows binaries are executed when this builder runs on macOS or Linux.
 """
 
@@ -22,7 +23,19 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_NAME = 'EEGTrainingGUI-Windows-ARM64'
+#: Everything that differs between the two Windows targets. The application,
+#: Python version, .NET version and package versions are the same on both.
+ARCHES = {
+    'arm64': dict(package='EEGTrainingGUI-Windows-ARM64', label='ARM64', platform='Windows 11 ARM64',
+                  runtime_lock='runtime-lock.json', requirements='requirements.lock',
+                  uv_platform='aarch64-pc-windows-msvc', zig_target='aarch64-windows-gnu',
+                  pe_machine=0xaa64, vcredist='VC_redist.arm64.exe'),
+    'x64': dict(package='EEGTrainingGUI-Windows-x64', label='x64', platform='Windows 10/11 x64 (Intel/AMD)',
+                runtime_lock='runtime-lock-x64.json', requirements='requirements-x64.lock',
+                uv_platform='x86_64-pc-windows-msvc', zig_target='x86_64-windows-gnu',
+                pe_machine=0x8664, vcredist='VC_redist.x64.exe'),
+}
+PACKAGE_NAME = ARCHES['arm64']['package']
 SOURCE_DIRS = ('gui','models','trainer','configs','data','utils','experiment','deploy')
 SOURCE_FILES = ('eval.py','eegio_eval.py','metrics.py','requirements.txt','README.md','LICENSE')
 IGNORED = {'__pycache__','.git','.DS_Store','artifacts','testdata','EEGdenoisenet','EEG-IO','EEG-EyeBlinks'}
@@ -109,7 +122,8 @@ def copy_sources(root,app,include_runs=False,include_data=False):
     return dict(runs=copied,active_runs_skipped=skipped,training_data_included=include_data)
 
 
-def write_launch_files(package,python_version,dotnet_version):
+def write_launch_files(package,python_version,dotnet_version,arch='arm64'):
+    spec=ARCHES[arch]
     runtime=package/'runtime'
     minor=''.join(python_version.split('.')[:2])
     (runtime/f'python{minor}._pth').write_text(f'python{minor}.zip\n.\nsite-packages\n../app\nimport site\n',encoding='utf-8')
@@ -126,16 +140,17 @@ def write_launch_files(package,python_version,dotnet_version):
         (package/name).write_bytes(content.encode('ascii'))
     for name in ('logs','cache','dependencies'):(package/name).mkdir(exist_ok=True)
     (package/'README Windows.txt').write_text(
-        'EEG Training GUI — Windows 11 ARM64 便携版\n\n'
+        f'EEG Training GUI — {spec["platform"]} 便携版\n\n'
         '1. 解压整个 ZIP 到可写目录，例如 C:\\EEG-GUI；不要在压缩包内直接运行。\n'
         '2. 双击 EEG Training GUI.exe。无需安装 Python，Python/.NET 随包提供。\n'
-        '3. 若提示缺少 DLL，运行 dependencies\\VC_redist.arm64.exe 安装微软运行库。\n'
+        f'3. 若提示缺少 DLL，运行 dependencies\\{spec["vcredist"]} 安装微软运行库。\n'
         '4. 原生窗口需要 Microsoft Edge WebView2；不可用时运行 Start in browser.cmd。\n'
         '5. 双击 Check installation.cmd 可检查训练算子、ONNX、GUI 接口和任务停止。\n\n'
         '数据与记录：app\\configs、app\\runs、app\\data、app\\deploy\\artifacts。\n'
         '请保留整个目录结构；可整体移动。原有记录中的设备条件继续保留原平台信息。\n'
         '运行日志：logs\\launcher.log；各任务日志在 app\\runs 中。\n'
-        '训练和推理默认使用 ARM64 CPU；本包不启用 Qualcomm NPU/GPU 加速。\n'
+        f'训练和推理默认使用 {spec["label"]} CPU；本包不启用 GPU/NPU 加速。\n'
+        f'本包仅适用于 {spec["label"]} 版 Windows（设置 > 系统 > 关于 > 系统类型）。\n'
         'EEG channels 的 Pi 测量使用 Windows OpenSSH（ssh/scp）及已配置的密钥。\n'
         '旧 Deploy 页的 Pi 脚本另需 Git for Windows 的 Git Bash。\n'
         '关闭窗口时会询问是否停止仍在运行的任务。浏览器备用模式结束后，请关闭其控制台。\n\n'
@@ -207,7 +222,8 @@ def archive_bundle(package):
     return target
 
 
-def validate_bundle(package):
+def validate_bundle(package,arch='arm64'):
+    spec=ARCHES[arch]
     required=['EEG Training GUI.exe','runtime/python.exe','runtime/pythonw.exe','runtime/python313.dll',
               'runtime/dotnet/dotnet.exe','runtime/dotnet/shared/Microsoft.WindowsDesktop.App',
               'app/gui/static/index.html','app/gui/windows_start.py','app/gui/windows_dialog.py',
@@ -219,27 +235,28 @@ def validate_bundle(package):
               package/'runtime/python313.dll',package/'runtime/dotnet/dotnet.exe']
     binaries.extend((package/'runtime').rglob('*.pyd'))
     for path in binaries:
-        if pe_machine(path)!=0xaa64:raise ValueError(f'Expected a native ARM64 binary: {path}')
+        if pe_machine(path)!=spec['pe_machine']:raise ValueError(f"Expected a native {spec['label']} binary: {path}")
     if pe_subsystem(package/'EEG Training GUI.exe')!=2:
         raise ValueError('The launcher must use the Windows GUI subsystem')
     deps={d.metadata['Name']:d.version for d in importlib.metadata.distributions(path=[str(package/'runtime/site-packages')])}
     for name in ('torch','numpy','scipy','onnx','onnxruntime','pywebview','pythonnet'):
         if name not in deps:raise ValueError(f'Missing dependency: {name}')
-    return dict(native_arm64_binaries_checked=len(binaries),launcher_subsystem='Windows GUI',
+    return dict(arch=arch,native_binaries_checked=len(binaries),launcher_subsystem='Windows GUI',
                 project_imports=project_imports,dependencies=deps,
                 pywebview_coreclr_adapter='# EEG_GUI_CORECLR_FOLDER_DIALOG' in (package/'runtime/site-packages/webview/platforms/winforms.py').read_text(encoding='utf-8'),
                 windows_device_tested=False)
 
 
-def build(out,cache,uv,zig,include_runs=False,include_data=False,root=ROOT,offline=False):
+def build(out,cache,uv,zig,include_runs=False,include_data=False,root=ROOT,offline=False,arch='arm64'):
+    spec=ARCHES[arch]
     out,cache,root=Path(out).resolve(),Path(cache).resolve(),Path(root).resolve()
     out.mkdir(parents=True,exist_ok=True);cache.mkdir(parents=True,exist_ok=True)
-    final=out/PACKAGE_NAME
+    final=out/spec['package']
     if final.exists() or final.with_suffix('.zip').exists():
         raise FileExistsError('Output already exists; choose a fresh --out directory to preserve its runs/data')
-    lock=json.loads((root/'packaging/windows/runtime-lock.json').read_text(encoding='utf-8'))
+    lock=json.loads((root/'packaging/windows'/spec['runtime_lock']).read_text(encoding='utf-8'))
     with tempfile.TemporaryDirectory(prefix='windows-stage-',dir=out) as temp:
-        package=Path(temp)/PACKAGE_NAME;package.mkdir()
+        package=Path(temp)/spec['package'];package.mkdir()
         runtime=package/'runtime';runtime.mkdir()
         for asset in lock['assets']:
             print('[windows] runtime:',asset['name'],flush=True)
@@ -249,35 +266,35 @@ def build(out,cache,uv,zig,include_runs=False,include_data=False,root=ROOT,offli
             else:
                 (package/'dependencies').mkdir(exist_ok=True)
                 shutil.copy2(path,package/'dependencies'/asset['filename'])
-        print('[windows] install the locked ARM64 wheels',flush=True)
-        subprocess.run([str(uv),'pip','install','--python-platform','aarch64-pc-windows-msvc',
+        print(f"[windows] install the locked {spec['label']} wheels",flush=True)
+        subprocess.run([str(uv),'pip','install','--python-platform',spec['uv_platform'],
                         '--python-version',lock['python'],'--target',str(runtime/'site-packages'),
                         '--require-hashes','--no-compile-bytecode','--cache-dir',str(cache.parent/'uv-cache'),
                         *(['--offline'] if offline else []),
-                        '-r',str(root/'packaging/windows/requirements.lock')],check=True)
+                        '-r',str(root/'packaging/windows'/spec['requirements'])],check=True)
         # C++ development headers are not used by the training/ONNX workflows.
         headers=runtime/'site-packages/torch/include'
         if headers.is_dir():shutil.rmtree(headers)
         print('[windows] copy application, configuration and selected records',flush=True)
         content=copy_sources(root,package/'app',include_runs,include_data)
-        write_launch_files(package,lock['python'],lock['dotnet'])
+        write_launch_files(package,lock['python'],lock['dotnet'],arch)
         patch_pywebview_coreclr(package)
-        print('[windows] compile the native ARM64 launcher',flush=True)
-        subprocess.run([str(zig),'cc','-target','aarch64-windows-gnu','-municode','-Wl,--subsystem,windows','-O2','-s',
+        print(f"[windows] compile the native {spec['label']} launcher",flush=True)
+        subprocess.run([str(zig),'cc','-target',spec['zig_target'],'-municode','-Wl,--subsystem,windows','-O2','-s',
                         str(root/'gui/windows_launcher.c'),'-o',str(package/'EEG Training GUI.exe'),
                         '-lkernel32','-luser32'],check=True,
                        env={**os.environ,'ZIG_GLOBAL_CACHE_DIR':str(cache.parent/'zig-cache')})
-        validation=validate_bundle(package)
-        manifest=dict(name=PACKAGE_NAME,built_at=datetime.now().isoformat(timespec='seconds'),
-                      platform='Windows 11 ARM64',python=lock['python'],dotnet=lock['dotnet'],
-                      requirements_sha256=digest(root/'packaging/windows/requirements.lock'),
+        validation=validate_bundle(package,arch)
+        manifest=dict(name=spec['package'],arch=arch,built_at=datetime.now().isoformat(timespec='seconds'),
+                      platform=spec['platform'],python=lock['python'],dotnet=lock['dotnet'],
+                      requirements_sha256=digest(root/'packaging/windows'/spec['requirements']),
                       runtime_assets=lock['assets'],content=content,validation=validation)
         (package/'manifest.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
         package.rename(final)
     print('[windows] compress the portable folder',flush=True)
     archive=archive_bundle(final)
     print(f'[windows] ready: {archive} ({archive.stat().st_size/2**20:.1f} MiB)',flush=True)
-    print(f'[windows] {len(content["runs"])} model directories; {validation["native_arm64_binaries_checked"]} native binaries checked',flush=True)
+    print(f'[windows] {len(content["runs"])} model directories; {validation["native_binaries_checked"]} native {spec["label"]} binaries checked',flush=True)
     return archive
 
 
@@ -290,8 +307,12 @@ def main(argv=None):
     parser.add_argument('--include-runs',action='store_true')
     parser.add_argument('--include-data',action='store_true')
     parser.add_argument('--offline',action='store_true',help='use cached wheels and runtimes')
+    parser.add_argument('--arch',choices=(*ARCHES,'both'),default='arm64',
+                        help='arm64 (Snapdragon / Windows on ARM), x64 (Intel/AMD), or both')
     args=parser.parse_args(argv)
-    build(args.out,args.cache,args.uv,args.zig,args.include_runs,args.include_data,offline=args.offline)
+    for arch in (tuple(ARCHES) if args.arch=='both' else (args.arch,)):
+        build(args.out,args.cache,args.uv,args.zig,args.include_runs,args.include_data,
+              offline=args.offline,arch=arch)
 
 
 if __name__=='__main__':main()
