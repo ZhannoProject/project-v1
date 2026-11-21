@@ -410,7 +410,7 @@ class TestTheTabsNumbers(unittest.TestCase):
         with patch.object(lookahead, "list_runs", return_value=[baseline, complete, old_rate, interrupted]), \
              patch.object(lookahead, "_checkpoint_info", side_effect=checkpoint):
             plan = lookahead.missing_train_plan({"baseline": "base"})
-        self.assertEqual(plan["seeds"], [42, 54, 67])
+        self.assertEqual(plan["seeds"], [42, 54, 67, 72, 88])
         self.assertEqual(plan["completed"], 2)
         pairs = {(run["lookahead"], run["master_seed"]) for run in plan["runs"]}
         self.assertEqual(pairs, {(n, seed) for n in (0, *LOOKAHEAD_LADDER, None)
@@ -937,21 +937,25 @@ class WindowIsSlidNotWidenedTests(unittest.TestCase):
         # of them behind t while it is causal.
         self.assertEqual(backward_taps(build_model("tcn_rf5")), capacity([1]))
 
-    def test_the_budget_is_a_share_of_the_licence_and_the_top_rungs_are_thirds(self):
+    def test_the_rung_label_is_the_window_split_not_a_share_of_the_licence(self):
         """
-        "la186" on a 124-tap window is an arithmetic that does not work out
-        until the denominator is named: capacity is 124 taps the convolutions
-        can move plus 62 the gates can peek. Against that the ladder's top
-        three rungs are exactly the thirds, which is why they are the rungs.
+        "la186" sits on a 125-sample convolution window; 186 is the forward
+        licence (124 conv taps plus 62 the SE gates peek). A fraction of the
+        licence ("1/1") read as the whole window, so the label is the split in
+        taps -- and it must agree with what the built model reports.
         """
-        from gui.lookahead import share_label
-        total = capacity([1, 2, 4, 8, 16], se=True)
-        self.assertEqual(share_label(62, total), "1/3")
-        self.assertEqual(share_label(124, total), "2/3")
-        self.assertEqual(share_label(186, total), "1/1", "reads as the last of the thirds")
-        self.assertEqual(share_label(16, total), "9%")
-        self.assertEqual(share_label(1, total), "0.5%")
-        self.assertEqual(share_label(0, total), "", "the causal end is not a share of anything")
+        from gui.lookahead import conv_ahead
+        from models.lookahead import backward_taps
+        d = [1, 2, 4, 8, 16]
+        self.assertEqual(conv_ahead(62, d, se=True), 42)
+        self.assertEqual(conv_ahead(124, d, se=True), 83)
+        self.assertEqual(conv_ahead(186, d, se=True), 124, "the full licence puts every tap ahead")
+        self.assertEqual(conv_ahead(62, d), 62, "without SE gates the licence is all convolution")
+        self.assertEqual(conv_ahead(0, d, se=True), 0)
+        for budget in (4, 62, 124, 186):
+            with self.subTest(budget=budget):
+                model = TCNWithSE(hidden_channels=8, causal=False, lookahead=budget)
+                self.assertEqual(conv_ahead(budget, d, se=True), 124 - backward_taps(model))
 
     def test_the_names_on_disk_are_left_alone(self):
         """
@@ -969,7 +973,7 @@ class WindowIsSlidNotWidenedTests(unittest.TestCase):
         rows = {r["variant"]: r for r in measure({"artifact": "BOTH"})["rows"]}
         self.assertEqual((rows["tcn_se"]["past"], rows["tcn_se"]["ahead"]), (124, 0))
         self.assertEqual((rows["tcn_se_la186"]["past"], rows["tcn_se_la186"]["ahead"]), (0, 124))
-        self.assertEqual(rows["tcn_se_la124"]["share"], "2/3")
+        self.assertEqual((rows["tcn_se_la124"]["past"], rows["tcn_se_la124"]["ahead"]), (41, 83))
         for r in rows.values():
             if r["past"] is not None:
                 self.assertEqual(r["past"] + r["ahead"], r["window"])

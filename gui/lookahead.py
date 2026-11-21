@@ -46,8 +46,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from gui.config_io import _checkpoint_info, list_runs
-from models.lookahead import (LOOKAHEAD_LADDER, TCN_LOOKAHEAD_LADDER, SAMPLE_RATE_HZ, architectural, backward_taps,
-                              capacity, forward_receptive_field, ms)
+from models.lookahead import (LOOKAHEAD_LADDER, TCN_LOOKAHEAD_LADDER, SAMPLE_RATE_HZ, allocate, architectural,
+                              backward_taps, capacity, forward_receptive_field, ms)
 from models.receptive_field import DEFAULT_DILATIONS
 from models.variants import (LOOKAHEAD_VARIANTS, TCN_LOOKAHEAD_VARIANTS, TCNOnly, TCNWithSE,
                              VARIANT_REGISTRY, build_model, pinned_kwargs, variant_is_causal)
@@ -69,7 +69,9 @@ UNBOUNDED_VARIANT = "tcn_se_bi"
 
 #: Width every rung is built and measured at: the one the SE repeats used.
 DEFAULT_HIDDEN = 64
-LADDER_SEEDS = (42, 54, 67)
+#: Five seeds: 72 and 88 already hold causal-baseline and offline runs, so
+#: adding them pairs those references with every rung instead of leaving them aside.
+LADDER_SEEDS = (42, 54, 67, 72, 88)
 
 #: Measuring the whole ladder is two forward passes per rung, but a request
 #: should still not be able to ask for thousands.
@@ -157,7 +159,7 @@ def _family_meta(variant, recipe=PLAIN_TCN_RECIPE, recorded_budgets=()):
         "variants": {"causal": variant, "unbounded": UNBOUNDED_VARIANT if with_se else None,
                      "rungs": list(LOOKAHEAD_VARIANTS if with_se else TCN_LOOKAHEAD_VARIANTS)},
         "config": LADDER_CONFIG if with_se else "tcn_both.yaml",
-        "shares": {str(n): share_label(n, total) for n in ladder},
+        "ahead": {str(n): conv_ahead(n, dilations, se=with_se) for n in train_budgets if n},
     }
 
 
@@ -531,35 +533,24 @@ def _fresh(factory, *args, **kwargs):
     return factory(*args, **kwargs).eval()
 
 
-def share_label(budget: Optional[int], total: int) -> str:
+def conv_ahead(budget: Optional[int], dilations, kernel_size: int = 3, *, se: bool = False) -> Optional[int]:
     """
-    A budget as a share of the licence, which is what the number is.
+    How many of the convolution window's taps a budget moves ahead of t.
 
-    ``tcn_se_la186`` reads as 186 of something, and the obvious something --
-    the convolution window -- is 124 taps, so the name invites an arithmetic
-    that does not work out. The denominator is capacity: 124 taps the
-    convolutions can move plus 62 the SE gates can peek, which the gates have
-    and the window does not. As a share it comes out exactly, and the top
-    three rungs are the thirds: 62, 124 and 186 are 1/3, 2/3 and all of it.
-
-    Simple fractions are named as fractions and the rest as a percentage,
-    because "3/124 of the licence" is not an improvement on "la4". The full
-    budget is "1/1" rather than "all", so that it reads as the last of the
-    thirds in a column that already holds 1/3 and 2/3.
-
-    One short token, because it goes in two places -- the rung picker and the
-    rung column -- and they have to agree.
+    The rung number is not a window. ``tcn_se_la186`` sits on a 125-sample
+    convolution window (124 taps plus t); 186 is the forward licence, 124 taps
+    the convolutions can move plus 62 the SE gates can peek, and it can exceed
+    the window because the gates' reach is not part of it. A fraction of the
+    licence ("1/1", "2/3") was tried here and read as a fraction of the window,
+    which it is not -- so the label is the split itself, in taps, against the
+    window it is a split of. Same allocation the model is built with
+    (``TCN_backbone``: two conv sites per block, then one SE site per block).
     """
-    from fractions import Fraction
-
-    if not budget or not total:
-        return ""
-    share = Fraction(int(budget), int(total))
-    if share >= 1:
-        return "1/1"
-    return (f"{share.numerator}/{share.denominator}" if share.denominator <= 4
-            else f"{100.0 * share:.0f}%" if share >= Fraction(1, 50)
-            else f"{100.0 * share:.1f}%")
+    if budget is None:
+        return None
+    per_conv = [(kernel_size - 1) * d for d in dilations]
+    sites = [p for d in per_conv for p in (d, d)] + (per_conv if se else [])
+    return sum(allocate(sites, int(budget))[: 2 * len(per_conv)])
 
 
 def why_excluded(run: dict, hidden_channels: int, loss_fn: str = LADDER_LOSS) -> Optional[str]:
@@ -732,7 +723,6 @@ def measure(spec: dict | None = None) -> dict:
             "past": past,
             "ahead": conv - past,
             "window": conv,
-            "share": share_label(budget, total),
             "one_sided": past == 0,
             "exercised": (None if not licensed or measured is None
                           else round(100.0 * measured / licensed, 1)),

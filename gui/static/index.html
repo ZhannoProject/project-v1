@@ -926,7 +926,7 @@
           <input type="checkbox" id="laOverwrite"> overwrite</label>
         <button id="btnLaTrain" class="primary">Train this rung</button>
         <button id="btnLaTrainMissing" type="button" disabled
-                title="Copy the baseline's training settings and fill missing models for seeds 42, 54 and 67.">Train all missing models</button>
+                title="Copy the baseline's training settings and fill missing models for every seed listed here.">Train all missing models</button>
         <span class="grow"></span>
         <span class="muted" id="laTrainNote"></span>
       </div>
@@ -4452,10 +4452,12 @@
     }
     const family = state.la.meta.families[settings.variant];
     const rung = $("#laRung"), selected = rung.value;
-    const variant = family.variant, shares = family.shares;
+    const variant = family.variant, ahead = family.ahead || {}, conv = family.capacity.conv;
     rung.replaceChildren(...family.train_budgets.map(n => {
       if (!n) return new Option(`0 — ${variant} (causal)`, "0");
-      const tail = shares[String(n)] ? ` · ${shares[String(n)]} ahead` : "";
+      // The rung number is the forward licence, not a window: say how much of
+      // the convolution window it actually moves ahead of t.
+      const tail = ahead[String(n)] != null ? ` · ${ahead[String(n)]} of ${conv} taps ahead` : "";
       return new Option(`${n} — ${variant}_la${n}${tail}`, String(n));
     }));
     rung.disabled = !family.train_budgets.length;
@@ -4549,7 +4551,7 @@
         + `<div class="d">${priced.length || eegio ? "" : "train one to start the curve"}</div></div>`
       + `</div>`;
 
-    const head = `<tr><th>rung</th><th class="num" title="What the graph is licensed to read past the sample it emits. This is the figure that sets the output delay, whether or not the weights use all of it.">licensed</th>`
+    const head = `<tr><th>rung</th><th class="num" title="What the graph is licensed to read past the sample it emits: convolution taps moved ahead plus what the SE gates may peek. It is not a window size, and can exceed the 125-sample convolution window because the gates are not part of it. This is the figure that sets the output delay, whether or not the weights use all of it.">licensed</th>`
       + `<th class="num" title="Licensed samples divided by the sample rate">latency</th>`
       + `<th class="num" title="How far the weights actually reach, by perturbing one input sample and finding how far back the output moves. Can fall short of licensed: a dead ReLU in an SE gate drops a licensed dependence to exactly zero.">measured</th>`
       + `<th class="num">used</th>`
@@ -4559,16 +4561,15 @@
         : `<th class="num">RRMSE_t</th><th class="num">RRMSE_f</th><th class="num">CC</th>`) + `<th></th></tr>`;
 
     const body = rows.map(r => {
-      // The share rides along with the name here too: the column is where the
-      // numbers are compared, so it is where "186 of what?" gets asked.
-      const share = r.share
-        ? ` <span class="muted" title="${r.lookahead} of ${d.capacity.conv_and_se} licensed future samples">${r.share}</span>` : "";
+      // No fraction beside the name: "1/1" of the 186-sample licence read as
+      // the whole window, which is 125 samples. The window column carries the
+      // real split; a rung with no past left is flagged by name.
       const label = r.unbounded
         ? `${r.variant} <span class="muted" title="Its convolutions are centred: 62 taps either `
           + `side, the same 125-sample window as every rung. Unbounded refers to the SE gate, `
           + `which pools globally.">unbounded</span> <span class="muted">centred</span>`
           + (eegio && saved?.offline_zero_phase ? ` <span class="warn" title="${OFFLINE_ZERO_TIP}">zero-phase filter</span>` : "")
-        : r.variant ? r.variant + share + (r.one_sided ? ` <span class="warn">mirror</span>` : "")
+        : r.variant ? r.variant + (r.one_sided ? ` <span class="warn" title="Every convolution tap is ahead of t: no past at all, the anti-causal mirror of the causal baseline">no past</span>` : "")
         : `<span class="muted">la${r.lookahead} (unregistered)</span>`;
       const lat = r.unbounded ? `<span class="muted">—</span>`
         : `${r.latency_ms.toFixed(1)} ms`;
@@ -4586,8 +4587,7 @@
         + `<td class="num${r.one_sided ? " warn" : ""}"`
           + ` title="${r.one_sided ? "no past: every convolution is padded entirely on the right, "
             + "so this rung sees nothing before the sample it emits"
-            : `${r.past} of the ${r.window}-tap window behind t, ${r.ahead} ahead`
-              + (r.share ? ` · licence ${r.share}` : "")}">`
+            : `${r.past} of the ${r.window}-tap window behind t, ${r.ahead} ahead`}">`
           + `${r.past == null ? "—" : `${r.past} / ${r.ahead}`}</td>`
         + `<td class="num">${fmtK(r.params)}</td>`
         + `<td class="num">${eegio ? (batch ? seedSummary.get(r.lookahead)?.seeds.join(" ") || "—"
@@ -4839,6 +4839,11 @@
     $("#btnLaTrainMissing").disabled = state.la.batchBusy || busy || loading || !laEegioGroup() || !!state.la.error;
   }
 
+  const laSeedList = () => {
+    const seeds = (state.la.meta?.seeds || []).map(String);
+    return seeds.length > 1 ? `${seeds.slice(0, -1).join(", ")} and ${seeds.at(-1)}` : seeds.join("");
+  };
+
   async function trainMissingLookahead() {
     if ($("#btnLaTrainMissing").disabled) return;
     const settings = lookaheadSettings();
@@ -4849,7 +4854,7 @@
     try {
       const { planned } = await api("/api/lookahead/missing/preview", spec);
       if (!planned.runs.length) {
-        banner("All Lookahead models for seeds 42, 54 and 67 are complete.", "info");
+        banner(`All Lookahead models for seeds ${laSeedList()} are complete.`, "info");
         return;
       }
       const counts = planned.seeds.map(seed =>
@@ -4864,7 +4869,7 @@
       if (!confirmed) return;
       const job = await api("/api/lookahead/missing/train", spec);
       if (!job.id) {
-        banner("All Lookahead models for seeds 42, 54 and 67 are complete.", "info");
+        banner(`All Lookahead models for seeds ${laSeedList()} are complete.`, "info");
         return;
       }
       applyStatus(job); selectJob(job.id, { force: true }); showTab("train"); startPolling();

@@ -1420,18 +1420,17 @@ class LookaheadPageTests(unittest.TestCase):
         self.assertIn(">window</th>", self.PAGE)
         self.assertIn("${r.past} / ${r.ahead}", self.PAGE)
 
-    def test_the_share_rides_with_the_name_in_both_places(self):
+    def test_the_rung_label_does_not_read_as_a_share_of_the_window(self):
         """
-        `la186` on a 124-tap window invites an arithmetic that does not work
-        out. The picker is where a rung is chosen and the table is where the
-        rungs are compared, so both carry the share — one is not enough, and
-        two spellings of it would be worse than none.
+        "1/1" beside la186 read as the whole window, which is 125 samples, not
+        186. The picker names the taps ahead against the window; the table
+        leaves the split to its window column.
         """
-        self.assertIn("family.shares", self.PAGE)
-        self.assertIn("${n} — ${variant}_la${n}${tail}", self.PAGE)
+        self.assertNotIn("family.shares", self.PAGE)
+        self.assertIn("of ${conv} taps ahead", self.PAGE)
         label = re.search(r"const label = r\.unbounded(.*?);\n", self.PAGE, re.S)
         self.assertIsNotNone(label, "the rung label was not found")
-        self.assertIn("share", label.group(0), "the rung column drops the share")
+        self.assertNotIn("share", label.group(0))
 
     def test_the_preview_asks_about_every_seed_not_the_ticked_ones(self):
         """Which directories are taken is what decides the ticks."""
