@@ -1,0 +1,35 @@
+# ============================================================
+# Squeeze-and-Excitation baseline
+# Ablation 1 — Baseline: TCN Only (EOG artifact)
+# ============================================================
+
+# --- Model ---
+variant: "tcn_se"
+se_reduction: 8            # C -> C/8 -> C channel gate on every residual block,
+                           # squeezed over a RUNNING mean so it cannot see ahead
+hidden_channels: 64
+
+# --- Data ---
+artifact: "EOG"
+data_dir: "./data/EEGdenoisenet/data/"
+batch_size: 32
+snr_range_db: [-7.0, 2.0]
+master_seed: 42
+
+# --- Training ---
+learning_rate: 5.0e-4
+attn_lr_scale: 1.0          # ignored for TCN-only
+weight_decay: 0.0
+max_epochs: 100
+log_every: 20
+
+# --- Scheduler (CosineAnnealing + linear warmup) ---
+sched_warmup_epochs: 5
+eta_min: 1.0e-6
+
+# --- Loss function ---
+loss_fn: "l1_combined"              # "l1_combined", "l2_combined", "mse", "l1", or "stft"
+
+# --- Output ---
+save_dir: "./runs/tcn_se_eog"
+tensorboard: false

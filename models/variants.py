@@ -130,7 +130,9 @@ Bidirectional teachers and knowledge distillation
 """
 
 from functools import partial
+from typing import Sequence
 
+import inspect
 import torch
 import torch.nn as nn
 import os
@@ -140,6 +142,12 @@ project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 from models.TCN_backbone import CausalTCNBackbone, CausalConv1d
 from models.AttentionBlocks.attention import CausalTransformerDecoder, init_transformer_weights
+from models.lookahead import LOOKAHEAD_LADDER, TCN_LOOKAHEAD_LADDER
+from models.receptive_field import DEFAULT_DILATIONS, RF_LADDER, field
+
+#: Default squeeze ratio for the SE variants: C -> C/8 -> C.
+SE_REDUCTION = 8
+
 
 # ============================================================
 # Variant 1: Pure TCN (baseline)
@@ -165,16 +173,35 @@ class TCNOnly(nn.Module):
     helps".  Same weights and shapes as ``tcn``, so it distils into it.
     """
 
-    def __init__(self, hidden_channels: int = 64, dropout: float = 0.1, causal: bool = True):
+    def __init__(self, hidden_channels: int = 64, dropout: float = 0.1, causal: bool = True,
+                 se_reduction: int | None = None, lookahead: int | None = None,
+                 dilations: Sequence[int] | None = DEFAULT_DILATIONS):
         super().__init__()
+        if causal and lookahead:
+            raise ValueError(
+                f"lookahead={lookahead} contradicts causal=True: a causal model reads nothing "
+                f"ahead of the sample it emits. Pass causal=False with the lookahead, which is "
+                f"what the tcn_se_la{{N}} variants pin, or drop the lookahead."
+            )
         self.causal = causal
+        self.lookahead = lookahead
+        # How far back the stack reaches is the whole subject of the receptive
+        # field sweep, so it is an argument rather than a constant. The default
+        # is what every existing run and checkpoint used.
+        # Spelled as the signature default, not resolved from None here, so
+        # that resolved_arch() reads the real schedule off the signature and
+        # every run records the reach it was trained at. ``None`` still means
+        # the default, for a config that says so explicitly.
+        self.dilations = list(dilations or DEFAULT_DILATIONS)
 
         self.backbone = CausalTCNBackbone(
             in_channels=1,
             hidden_channels=hidden_channels,
-            dilations=[1, 2, 4, 8, 16],
+            dilations=self.dilations,
             dropout=dropout,
             causal=causal,
+            se_reduction=se_reduction,
+            lookahead=lookahead,
         )
 
         # 1×1 conv maps hidden_channels back to 1 channel (the denoised signal).
@@ -190,6 +217,33 @@ class TCNOnly(nn.Module):
         x = self.backbone(x)
         x = self.head(x)
         return x
+
+
+class TCNWithSE(TCNOnly):
+    """
+    The baseline with a causal Squeeze-and-Excitation gate on every block.
+
+    A subclass rather than ``partial(TCNOnly, se_reduction=8)`` because a
+    partial's keywords are *pinned*: ``build_model`` refuses to let a caller
+    override them, which is what ``tcn_mla_r8`` wants (its name states the
+    rank) and the opposite of what this wants. Here 8 is a default and the
+    config may say otherwise; ``tcn_se_r{N}`` exists for the sweep, where the
+    name does state it and pinning is right again.
+
+    The weights are identical to ``TCNOnly(se_reduction=...)``, so this is a
+    name for a configuration, not a different model.
+    """
+
+    def __init__(self, hidden_channels: int = 64, dropout: float = 0.1, causal: bool = True,
+                 se_reduction: int | None = SE_REDUCTION, lookahead: int | None = None,
+                 dilations: Sequence[int] | None = DEFAULT_DILATIONS):
+        # Spelled out rather than *args/**kwargs: resolved_arch() reads this
+        # signature to record what a run trained, and a catch-all would hide
+        # every inherited parameter from it -- the run would record its name
+        # and nothing else.
+        super().__init__(hidden_channels=hidden_channels, dropout=dropout, causal=causal,
+                         se_reduction=se_reduction if se_reduction else SE_REDUCTION,
+                         lookahead=lookahead, dilations=dilations)
 
 
 # ============================================================
@@ -588,11 +642,30 @@ class TCNParallelMLA(nn.Module):
 # ============================================================
 VARIANT_REGISTRY = {
     "tcn":          TCNOnly,
+    "tcn_channelnorm": partial(TCNOnly, se_reduction=None),
     "tcn_mha":      TCNWithMHA,
     "tcn_mla":      TCNWithMLA,
     "tcn_mha_par":  TCNParallelMHA,
     "tcn_mla_par":  TCNParallelMLA,
 }
+
+# Factory-level settings fixed by a named variant, alongside constructor pins.
+# The explicit no-SE alias remains identifiable as the plain TCN family.
+VARIANT_SETTINGS = {"tcn_channelnorm": {"tcn_norm": "channel"}}
+
+# Squeeze-and-Excitation baseline: the same TCN with a causal SE gate on every
+# residual block.  It is in the study as the cheap end of "attention": SE
+# reweights channels from a running summary and does no temporal mixing at
+# all, for about 5k parameters and no measurable compute, where the MHA/MLA
+# decoder costs roughly 5x the baseline's inference time on the Pi.  If it
+# closes the same gap, the expensive machinery is not what was buying it.
+VARIANT_REGISTRY["tcn_se"] = TCNWithSE
+
+# The sweep, where the name fixes the squeeze ratio the way tcn_mla_r{N} fixes
+# the KV rank: tcn_se_r2 .. tcn_se_r16, so a run's name cannot misdescribe it.
+SE_REDUCTION_SWEEP = [2, 4, 8, 16]
+for _r in SE_REDUCTION_SWEEP:
+    VARIANT_REGISTRY[f"tcn_se_r{_r}"] = partial(TCNWithSE, se_reduction=_r)
 
 # MLA rank sweep: tcn_mla_r4, tcn_mla_r8, tcn_mla_r16, tcn_mla_r32
 # Each fixes kv_lora_rank so the only variable across the sweep is the
@@ -609,7 +682,7 @@ for _rank in MLA_RANK_SWEEP:
 # everywhere.  All of them are non-deployable teachers for distillation.
 BIDIRECTIONAL_SUFFIX = "_bi"
 BIDIRECTIONAL_VARIANTS = []
-for _base in ["tcn", "tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
+for _base in ["tcn", "tcn_se", "tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
     _name = _base + BIDIRECTIONAL_SUFFIX
     VARIANT_REGISTRY[_name] = partial(VARIANT_REGISTRY[_base], causal=False)
     BIDIRECTIONAL_VARIANTS.append(_name)
@@ -623,6 +696,46 @@ for _base in ["tcn", "tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
 #
 # tcn has no attention, so tcn_bi is already fully non-causal and there is no
 # tcn_full_bi — the two axes collapse into one when there is no mask to drop.
+# Bounded lookahead: tcn_se_la1 .. tcn_se_la186.  Between tcn_se (reads
+# nothing ahead) and tcn_se_bi (reads the whole epoch) there is a continuum
+# nothing in this project could express, and it is the one an online system
+# actually sits on: L samples of lookahead is L/fs of added output latency,
+# 3.9 ms a sample at 256 Hz, and the question is what each millisecond buys.
+#
+# The name pins the budget for the same reason tcn_mla_r{N} pins the rank --
+# a run called tcn_se_la32 cannot turn out to hold anything else -- and it
+# pins causal=False with it, because a model that reads ahead is not causal
+# and every tool here decides what it may do from that flag: the ONNX
+# exporter refuses it, and the streaming paths in incremental.py and
+# step_graph.py refuse it, all correctly.  Deploying one needs an output
+# delay of L samples, which no path here implements yet.
+#
+# See models/lookahead.py for how a budget is spread over the stack.
+LOOKAHEAD_SUFFIX = "_la"
+LOOKAHEAD_VARIANTS = []
+for _la in LOOKAHEAD_LADDER:
+    _name = f"tcn_se{LOOKAHEAD_SUFFIX}{_la}"
+    VARIANT_REGISTRY[_name] = partial(TCNWithSE, causal=False, lookahead=_la)
+    LOOKAHEAD_VARIANTS.append(_name)
+TCN_LOOKAHEAD_VARIANTS = []
+for _la in TCN_LOOKAHEAD_LADDER:
+    _name = f"tcn{LOOKAHEAD_SUFFIX}{_la}"
+    VARIANT_REGISTRY[_name] = partial(TCNOnly, causal=False, lookahead=_la, se_reduction=None)
+    TCN_LOOKAHEAD_VARIANTS.append(_name)
+
+# Receptive-field sweep: tcn_rf5 .. tcn_rf509, and the SE family alongside.
+# The name states the reach in samples, so a run cannot be mislabelled about
+# the one axis the sweep is measuring -- the same reason tcn_mla_r{N} states
+# its rank. Registered for the plain baseline first: it isolates reach from
+# the channel gate, which is the comparison the sweep exists to make.
+RF_SUFFIX = "_rf"
+RECEPTIVE_FIELD_VARIANTS = []
+for _base, _cls in (("tcn", TCNOnly), ("tcn_se", TCNWithSE)):
+    for _dil in RF_LADDER:
+        _name = f"{_base}{RF_SUFFIX}{field(_dil)}"
+        VARIANT_REGISTRY[_name] = partial(_cls, dilations=list(_dil))
+        RECEPTIVE_FIELD_VARIANTS.append(_name)
+
 FULLY_BIDIRECTIONAL_SUFFIX = "_full" + BIDIRECTIONAL_SUFFIX
 FULLY_BIDIRECTIONAL_VARIANTS = []
 for _base in ["tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
@@ -633,22 +746,42 @@ for _base in ["tcn_mha", "tcn_mla", "tcn_mha_par", "tcn_mla_par"]:
 
 
 def variant_is_causal(variant: str) -> bool:
-    """True for every deployable (past-only) variant, False for the ``_bi`` teachers."""
-    return not variant.endswith(BIDIRECTIONAL_SUFFIX)
+    """
+    True for every deployable (past-only) variant, False for the ``_bi``
+    teachers and the bounded-lookahead ``_la{N}`` rungs.
+
+    Read off what the name pins rather than from a list of names, so a new
+    family of non-causal variants cannot be added without this answering for
+    it. A lookahead variant pins ``causal=False`` precisely so that it lands
+    here: it reads fewer future samples than a ``_bi`` teacher, but "fewer"
+    is not "none", and everything downstream needs the same answer it gives
+    for a teacher.
+    """
+    if variant.endswith(BIDIRECTIONAL_SUFFIX):
+        return False
+    if variant not in VARIANT_REGISTRY:
+        # A legacy checkpoint records no variant at all, and
+        # load_checkpoint_model asks this of the empty string.  The suffix test
+        # this replaced answered True there, and the answer has to stay True:
+        # those checkpoints are the project's own causal runs, and reading them
+        # as non-causal would have the exporter refuse every one of them.
+        return True
+    return bool(pinned_kwargs(variant).get("causal", True))
 
 
 def pinned_kwargs(variant: str) -> dict:
     """
-    Constructor arguments that the variant NAME itself fixes.
+    Model settings that the variant NAME itself fixes.
 
     ``tcn_mla_r8`` pins ``kv_lora_rank=8``; every ``*_bi`` twin pins
-    ``causal=False``; the five base variants pin nothing.  These are the
-    registry's ``functools.partial`` keywords, and they are authoritative:
+    ``causal=False``; ``tcn_channelnorm`` fixes channel normalization and
+    disables SE. Constructor pins and factory-level settings are authoritative:
     a caller must not be able to override them, or a checkpoint saved as
     ``tcn_mla_r8`` could silently hold a rank-16 model.
     """
     entry = VARIANT_REGISTRY[variant]
-    return dict(entry.keywords) if isinstance(entry, partial) else {}
+    constructor = dict(entry.keywords) if isinstance(entry, partial) else {}
+    return {**constructor, **VARIANT_SETTINGS.get(variant, {})}
 
 
 def base_variant(variant: str) -> str:
@@ -660,6 +793,19 @@ def base_variant(variant: str) -> str:
     """
     if variant not in VARIANT_REGISTRY:
         raise ValueError(f"Unknown variant '{variant}'. Available: {list(VARIANT_REGISTRY.keys())}")
+
+    # Strip the non-causal suffix first, longest first so ``_full_bi`` is not
+    # read as ``_bi``.  This has to come before the class lookup because
+    # functools.partial *flattens*: ``tcn_se_bi`` is one partial over TCNOnly,
+    # indistinguishable by class from ``tcn``, and the lookup below would hand
+    # back the wrong twin -- a teacher paired with a student of a different
+    # shape, which only shows up as a shape error much later.
+    for suffix in (FULLY_BIDIRECTIONAL_SUFFIX, BIDIRECTIONAL_SUFFIX):
+        if variant.endswith(suffix):
+            stripped = variant[: -len(suffix)]
+            if stripped in VARIANT_REGISTRY:
+                return stripped
+
     entry = VARIANT_REGISTRY[variant]
     cls = entry.func if isinstance(entry, partial) else entry   # nested partials flatten
     return next(name for name, e in VARIANT_REGISTRY.items() if e is cls)
@@ -667,7 +813,8 @@ def base_variant(variant: str) -> str:
 
 def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
                 turboquant_key_mode="prod", turboquant_train_mode="off",
-                turboquant_seed=42, **kwargs) -> nn.Module:
+                turboquant_seed=42, tcn_norm="channel", se_window=None,
+                attention_window=None, **kwargs) -> nn.Module:
     """
     Factory function for model construction.
 
@@ -704,6 +851,10 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
     # override its keywords, so without this check build_model("tcn_mla_r8",
     # kv_lora_rank=16) would quietly return a rank-16 model.
     pinned = pinned_kwargs(variant)
+    pinned_norm = pinned.pop("tcn_norm", None)
+    if pinned_norm is not None and tcn_norm != pinned_norm:
+        raise ValueError(f"tcn_norm={tcn_norm} contradicts variant '{variant}' "
+                         f"(which fixes tcn_norm={pinned_norm})")
     for key, value in pinned.items():
         if key in kwargs and kwargs[key] != value:
             raise ValueError(
@@ -712,6 +863,8 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
             )
     from models.AttentionBlocks.turboquant import attach_turboquant
     model = VARIANT_REGISTRY[variant](**kwargs)
+    from models.causal_config import configure_causal_blocks
+    configure_causal_blocks(model, tcn_norm, se_window, attention_window)
     attach_turboquant(model, turboquant, turboquant_bits, turboquant_key_mode,
                      turboquant_train_mode, turboquant_seed)
     # Record the pinned values too, so the checkpoint states its rank / causality
@@ -720,7 +873,8 @@ def build_model(variant: str, *, turboquant=False, turboquant_bits=3,
                               turboquant_bits=turboquant_bits,
                               turboquant_key_mode=turboquant_key_mode,
                               turboquant_train_mode=turboquant_train_mode,
-                              turboquant_seed=turboquant_seed)
+                              turboquant_seed=turboquant_seed, tcn_norm=tcn_norm,
+                              se_window=se_window, attention_window=attention_window)
     return model
 
 
@@ -809,6 +963,51 @@ if __name__ == "__main__":
         print(f"{name:<16} {n:>10,} {diff:>10}")
 
 
+def resolved_arch(model) -> dict:
+    """
+    Every architecture argument a model was built with, defaults filled in.
+
+    ``model.model_config`` records only what was *passed*, so a run that took
+    a default does not record it: ``build_model("tcn")`` stores no
+    ``hidden_channels`` at all.  That is enough to rebuild the model today and
+    not enough to say what was trained, which is the question asked of a run
+    months later — and if a default ever moves, every run that relied on it
+    becomes ambiguous in hindsight.
+
+    This resolves the constructor's signature against what was passed, so the
+    answer is complete and does not depend on the defaults staying put.  A
+    rank alias's pinned value wins, because that is what the name means.
+
+    Used by the trainer to write the architecture into ``history.json``.  Runs
+    from before that carry none, which is how the 2-layer MHA / 4-layer MLA
+    pair in this project went unnoticed: both configs said 2, the MLA runs
+    were trained at 4, and nothing in the run recorded either.
+    """
+    cfg = dict(getattr(model, "model_config", {}) or {})
+    variant = cfg.get("variant")
+    if not variant or variant not in VARIANT_REGISTRY:
+        return cfg
+
+    out = {"variant": variant}
+    try:
+        signature = inspect.signature(VARIANT_REGISTRY[variant])
+    except (TypeError, ValueError):            # pragma: no cover - defensive
+        return cfg
+    for name, param in signature.parameters.items():
+        if param.default is inspect.Parameter.empty or name == "self":
+            continue
+        out[name] = cfg.get(name, param.default)
+
+    # What the variant's own name fixes beats anything passed alongside it.
+    out.update(pinned_kwargs(variant))
+    # Not constructor arguments, but part of what produced the weights.
+    for key in ("turboquant", "turboquant_bits", "turboquant_key_mode",
+                "turboquant_train_mode", "turboquant_seed", "tcn_norm", "se_window", "attention_window"):
+        if key in cfg:
+            out[key] = cfg[key]
+    return out
+
+
 def build_model_from_config(config):
     """
     Forward supported architecture and quantization options from a run config.
@@ -824,13 +1023,17 @@ def build_model_from_config(config):
     signature = inspect.signature(VARIANT_REGISTRY[variant])
     kwargs = {key: value for key, value in config.items()
               if key in signature.parameters and value is not None}
-    for key, value in pinned_kwargs(variant).items():
+    pinned = pinned_kwargs(variant)
+    for key, value in pinned.items():
         if key in kwargs and kwargs[key] != value:
             print(f"[build_model] variant '{variant}' fixes {key}={value}; "
                   f"ignoring {key}={kwargs[key]} from the config")
         kwargs.pop(key, None)
     for key in ("turboquant", "turboquant_bits", "turboquant_key_mode",
-                "turboquant_train_mode", "turboquant_seed"):
-        if key in config:
-            kwargs[key] = config[key]
+                "turboquant_train_mode", "turboquant_seed", "tcn_norm", "se_window", "attention_window"):
+        if key in config or key in pinned:
+            if key in pinned and key in config and config[key] != pinned[key]:
+                print(f"[build_model] variant '{variant}' fixes {key}={pinned[key]}; "
+                      f"ignoring {key}={config[key]} from the config")
+            kwargs[key] = pinned[key] if key in pinned else config[key]
     return build_model(variant, **kwargs)

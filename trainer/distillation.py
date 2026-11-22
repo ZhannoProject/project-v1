@@ -72,7 +72,7 @@ Usage
         --kd_feature_weight 0.1 --save_dir runs/tcn_mla_eog_kd
 
 The student is validated and checkpointed exactly like a normal run
-(task loss + RRMSE_t / RRMSE_s / ACC against the clean signal), so its
+(task loss + RRMSE_t / RRMSE_f / CC against the clean signal), so its
 ``best.pt`` is a drop-in for eval.py and deploy/export_onnx.py.
 ``history.json`` additionally records the per-epoch KD terms
 (``kd_task``, ``kd_output``, ``kd_feature``) and the teacher's own
@@ -95,10 +95,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from models.variants import build_model_from_config, variant_is_causal
+from models.variants import variant_is_causal
 from trainer.training import Trainer
 from trainer.losses import build_loss
 from utils.utils import get_device
+from data.protocol import validate_distillation_data
 
 
 # ============================================================
@@ -120,32 +121,8 @@ def load_teacher(
     ckpt_path = Path(ckpt_path)
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"Teacher checkpoint not found: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    sd = ckpt["model_state"]
-
-    cfg: dict = {}
-    if config_path:
-        from configs import load_config
-        cfg.update(load_config(str(config_path)))
-    cfg.update(ckpt.get("model_config") or {})      # what the checkpoint recorded wins
-    if "variant" not in cfg:
-        # Legacy checkpoint without model_config and no YAML: the weights are
-        # the ground truth for every shape-determined hyperparameter.
-        from deploy.export_onnx import infer_arch_from_state_dict
-        cfg.update(infer_arch_from_state_dict(sd))
-
-    teacher = build_model_from_config(cfg)
-    try:
-        teacher.load_state_dict(sd, strict=True)
-    except RuntimeError as e:
-        raise RuntimeError(
-            f"Teacher weights in {ckpt_path} do not fit the architecture {cfg}. "
-            f"Pass --teacher_config with the YAML the teacher was trained with."
-        ) from e
-
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
+    from experiment.checkpoints import load_model
+    teacher, _, ckpt = load_model(ckpt_path, config=config_path, device=device, freeze=True)
 
     variant = teacher.model_config.get("variant", "?")
     n_params = sum(p.numel() for p in teacher.parameters())
@@ -213,7 +190,7 @@ class FeatureTap:
     Names are dotted paths as in ``model.named_modules()``.
     """
 
-    def __init__(self, model: nn.Module, layer_names: Sequence[str]):
+    def __init__(self, model: nn.Module, layer_names: Sequence[str], role: str = "model"):
         self.features: Dict[str, torch.Tensor] = {}
         self._handles = []
         for name in layer_names:
@@ -222,8 +199,8 @@ class FeatureTap:
             except AttributeError as e:
                 available = [n for n, _ in model.named_modules() if n and "." not in n]
                 raise ValueError(
-                    f"kd_feature_layers: '{name}' is not a submodule of "
-                    f"{type(model).__name__}; top-level modules are {available}"
+                    f"kd_feature_layers: the {role} ({type(model).__name__}) has no "
+                    f"submodule '{name}'; its top-level modules are {available}"
                 ) from e
             self._handles.append(module.register_forward_hook(self._make_hook(name)))
 
@@ -239,6 +216,28 @@ class FeatureTap:
         for h in self._handles:
             h.remove()
         self._handles = []
+
+
+def default_feature_layers(model) -> list:
+    """
+    Where to match features when the caller did not say.
+
+    ``decoder`` is the interesting place in the sandwich and parallel
+    variants: it is the attention stack, and the part a bidirectional teacher
+    actually does differently. The TCN families have no decoder -- naming one
+    raises -- so they match at ``backbone``, which is the whole convolutional
+    trunk and the only representation they have.
+
+    Only the default. A layer the caller names is used as given, and still
+    fails loudly if the model has no such module.
+    """
+    for name in ("decoder", "backbone", "tcn_pt1"):
+        if isinstance(getattr(model, name, None), nn.Module):
+            return [name]
+    raise ValueError(
+        f"{type(model).__name__} has no module this knows to match features at; "
+        f"name one with --kd_feature_layers (top-level modules: "
+        f"{[n for n, _ in model.named_children()]})")
 
 
 def parse_feature_layers(layer_names: Sequence[str]) -> list:
@@ -300,15 +299,52 @@ class FeatureProjector(nn.Module):
 
 
 @torch.no_grad()
+def _check_tappable(student: nn.Module, teacher: nn.Module, pairs) -> None:
+    """
+    Refuse a feature tap that cannot exist, and say what to do instead.
+
+    The feature term matches a named submodule of the student against one of
+    the teacher, and ``kd_feature_layers`` defaults to ``["decoder"]`` --
+    which only the MHA/MLA sandwich variants have.  Distilling across
+    families is where this bites: a ``tcn_se`` teacher is a backbone and a
+    head, with no attention decoder for a sandwich student's ``decoder`` to
+    be matched against.  torch's own message for that is "X has no attribute
+    `decoder`", which says nothing about which model, or that three perfectly
+    good ways out exist.
+    """
+    tops = lambda m: [n for n, _ in m.named_modules() if n and "." not in n]  # noqa: E731
+    for label, s_name, t_name in pairs:
+        for role, model, name in (("student", student, s_name), ("teacher", teacher, t_name)):
+            try:
+                model.get_submodule(name)
+            except AttributeError as e:
+                other = "teacher" if role == "student" else "student"
+                other_model = teacher if role == "student" else student
+                raise ValueError(
+                    f"kd_feature_layers: the {role} ({type(model).__name__}) has no "
+                    f"submodule '{name}'.\n"
+                    f"  {role} top-level modules: {tops(model)}\n"
+                    f"  {other} ({type(other_model).__name__}): {tops(other_model)}\n"
+                    f"  The feature term matches one named module against another, so it "
+                    f"needs a module both models have. Either:\n"
+                    f"    kd_feature_weight: 0      turn the feature term off and distil on "
+                    f"the outputs alone, which needs no shared module;\n"
+                    f"    kd_feature_layers: [...]  name a module both have;\n"
+                    f"    kd_feature_layers: ['student_path:teacher_path']  pair two that "
+                    f"are named differently."
+                ) from e
+
+
 def probe_feature_shapes(student: nn.Module, teacher: nn.Module, pairs, seq_len: int) -> dict:
     """
     One dry forward of each model on a zero window → ``{label: (student_shape,
     teacher_shape)}`` for the tapped submodules (batch axis excluded).
     """
+    _check_tappable(student, teacher, pairs)
     dev = next(student.parameters()).device
     x = torch.zeros(1, 1, seq_len, device=dev)
-    s_tap = FeatureTap(student, [s for _, s, _ in pairs])
-    t_tap = FeatureTap(teacher, [t for _, _, t in pairs])
+    s_tap = FeatureTap(student, [s for _, s, _ in pairs], "student")
+    t_tap = FeatureTap(teacher, [t for _, _, t in pairs], "teacher")
     was_training = student.training
     try:
         student.eval()(x)
@@ -426,6 +462,8 @@ class KDTrainer(Trainer):
         loss_fn: str = "l1_combined",
         **trainer_kwargs,
     ):
+        validate_distillation_data(teacher, train_loader, val_loader,
+                                   trainer_kwargs.get("run_config"))
         if init_from_teacher:
             init_student_from_teacher(model, teacher)
 
@@ -449,6 +487,11 @@ class KDTrainer(Trainer):
                          loss_fn=loss_fn, **trainer_kwargs)
 
         self.teacher = teacher.to(self.device).eval()
+        if self.history["config"].get("protocol") == "paper":
+            from experiment.methodology import validate_model
+            teacher_cfg = {**self.history["config"],
+                           "output_delay": getattr(teacher, "run_config", {}).get("output_delay", 0)}
+            validate_model(teacher, teacher_cfg, train_loader.dataset.clean.shape[-1])
         for p in self.teacher.parameters():
             p.requires_grad_(False)
 
@@ -464,6 +507,11 @@ class KDTrainer(Trainer):
             task_loss=self.criterion, output_loss=output_loss,
             alpha=kd_alpha, feature_weight=kd_feature_weight, feature_loss=kd_feature_loss,
         ).to(self.device)
+        self.history["config"].update(
+            teacher_ckpt=teacher_ckpt, kd_alpha=kd_alpha,
+            kd_feature_weight=kd_feature_weight, kd_feature_layers=list(kd_feature_layers or []),
+            kd_output_loss=kd_output_loss or loss_fn, kd_feature_loss=kd_feature_loss,
+            init_from_teacher=init_from_teacher)
 
         pairs = self._pairs
         self._student_tap = FeatureTap(self.model, [s for _, s, _ in pairs]) if pairs else None
@@ -529,6 +577,30 @@ class KDTrainer(Trainer):
             pred = self.model(noisy)
             student_feats = self._student_features()
 
+            from experiment.methodology import aligned, target_interval
+            cfg = self.history["config"]
+            full_length = clean.shape[-1]
+            start, stop = target_interval(clean.shape[-1], cfg)
+            sd = cfg.get("output_delay", 0)
+            td = getattr(self.teacher, "run_config", {}).get("output_delay", 0)
+            pred, clean = aligned(pred, clean, cfg)
+            teacher_out = teacher_out[..., start + td:stop + td]
+            if student_feats:
+                def crop_feature(value, path, delay):
+                    if start == 0 and stop == full_length and delay == 0:
+                        return value
+                    axes = [i for i in range(1, value.ndim) if value.shape[i] == full_length]
+                    if len(axes) != 1:
+                        raise ValueError(f"Cannot identify the time axis of feature {path}: {tuple(value.shape)}")
+                    axis = axes[0]
+                    index = [slice(None)] * value.ndim
+                    index[axis] = slice(start + delay, stop + delay)
+                    return value[tuple(index)]
+                student_feats = {label: crop_feature(student_feats[label], s, sd)
+                                 for label, s, _ in self._pairs}
+                teacher_feats = {label: crop_feature(teacher_feats[label], t, td)
+                                 for label, _, t in self._pairs}
+
             loss, parts = self.kd_criterion(pred, teacher_out, clean, student_feats, teacher_feats)
 
             self.optimizer.zero_grad()
@@ -573,4 +645,10 @@ class KDTrainer(Trainer):
         t = self.history.get("teacher", {})
         if t:
             print(f"Teacher reference: val_loss={t['val_loss']:.4f}  "
-                  f"RRMSE_t={t['rrmse_t']:.3f}  RRMSE_s={t['rrmse_s']:.3f}  ACC={t['acc']:.3f}")
+                  f"RRMSE_t={t['rrmse_t']:.3f}  RRMSE_f={t['rrmse_s']:.3f}  CC={t['acc']:.3f}")
+
+    def _cleanup_training(self):
+        if self._student_tap:
+            self._student_tap.remove()
+            self._teacher_tap.remove()
+        super()._cleanup_training()

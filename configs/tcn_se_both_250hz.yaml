@@ -1,0 +1,46 @@
+# ============================================================
+# tcn_se on BOTH, trained at EEG-IO's rate instead of EEGdenoiseNet's
+# ============================================================
+# Identical to tcn_se_both.yaml except for target_fs. The point is the
+# comparison: every other model in this project is trained at 256 Hz and run
+# on EEG-IO by resampling 250 -> 256, which costs the model nothing in
+# frequency but is a step a deployment also has to run. Training here instead
+# removes the step and the 2.4% time dilation with it.
+#
+# 512-sample epochs become 500 (256 -> 250 is exactly 125/128), so the
+# receptive field is the same 125 samples but now covers 500 ms rather than
+# 488, and every figure in milliseconds must be divided by 250 and not 256.
+# A run records target_fs in its history so that cannot be got wrong later.
+
+# --- Model ---
+variant: "tcn_se"
+se_reduction: 8            # C -> C/8 -> C channel gate on every residual block,
+                           # squeezed over a RUNNING mean so it cannot see ahead
+hidden_channels: 64
+
+# --- Data ---
+artifact: "BOTH"
+data_dir: "./data/EEGdenoisenet/data/"
+batch_size: 32
+snr_range_db: [-7.0, 2.0]
+target_fs: 250.0           # EEG-IO's rate; absent or empty = 256 Hz as shipped
+master_seed: 42            # 42 / 54 / 67 are the repeats; the seed picks the
+                           # split, the SNR pairing, the init and the batch order
+
+# --- Training ---
+learning_rate: 5.0e-4
+attn_lr_scale: 3.0          # no attention decoder here, so this does nothing
+weight_decay: 0.0
+max_epochs: 200
+log_every: 20
+
+# --- Scheduler (CosineAnnealing + linear warmup) ---
+sched_warmup_epochs: 5
+eta_min: 1.0e-6
+
+# --- Loss function ---
+loss_fn: "mse"              # "l1_combined", "l2_combined", "mse", "l1", or "stft"
+
+# --- Output ---
+save_dir: "./runs/tcn_se_both_250hz"
+tensorboard: false

@@ -1,0 +1,1221 @@
+{
+  "title": "Bounded Lookahead for Streaming EEG Artifact Removal on an Edge Device",
+  "sample_rate_hz": 250,
+  "training_window_samples": 500,
+  "synthetic_common_test_interval": [
+    272,
+    438
+  ],
+  "eegio_comparison_window": {
+    "samples": 500,
+    "left": 125,
+    "right": 186
+  },
+  "models": [
+    {
+      "id": "attention_s67",
+      "family": "attn",
+      "seed": 67,
+      "source_run": "tcn_mla_r16_both_250hz_fixed_s67",
+      "path": "pretrained/pytorch/attention_s67.pt",
+      "sha256": "7b36a5cb8a2a8d4399cfff4e7a440ca370f1ecae983ede591dd6ed2af83a04d7",
+      "bytes": 4754315,
+      "parameters": 127839,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.7434529002098477,
+        "rrmse_f": 0.7000058060767604,
+        "cc": 0.6754091462229981
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "attention_s72",
+      "family": "attn",
+      "seed": 72,
+      "source_run": "tcn_mla_r16_both_250hz_fixed_s72",
+      "path": "pretrained/pytorch/attention_s72.pt",
+      "sha256": "47cac915aa0949aa18e7917bc2df35f1984136023a14715768819d35e9451b98",
+      "bytes": 4754315,
+      "parameters": 127839,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.7296926794098872,
+        "rrmse_f": 0.6813963836898991,
+        "cc": 0.6870392688933541
+      },
+      "test_segments": 510,
+      "onnx_path": "pretrained/onnx/attention_s72_step.onnx",
+      "onnx_sha256": "3e6794634dc16fa6063f29b9845e9352c4184d9d6336daea86e231f588a86b45"
+    },
+    {
+      "id": "attention_s88",
+      "family": "attn",
+      "seed": 88,
+      "source_run": "tcn_mla_r16_both_250hz_fixed_s88",
+      "path": "pretrained/pytorch/attention_s88.pt",
+      "sha256": "9637becfe5b162091a57529ae357513850c4a5279e34936ff50532f72ca46357",
+      "bytes": 4754315,
+      "parameters": 127839,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.7348970091226055,
+        "rrmse_f": 0.6851980315996151,
+        "cc": 0.684311961017403
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l0_s42",
+      "family": "se_0",
+      "seed": 42,
+      "source_run": "tcn_se_both_250hz_fixed",
+      "path": "pretrained/pytorch/se_l0_s42.pt",
+      "sha256": "7ef2e383d3ae71b4027dd69637a58698cc6abd50525f1d7fc3fb2286c01fc3ed",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.7271765693729999,
+        "rrmse_f": 0.6770363066710677,
+        "cc": 0.6922916106587531
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l0_s54",
+      "family": "se_0",
+      "seed": 54,
+      "source_run": "tcn_se_both_250hz_fixed_s54",
+      "path": "pretrained/pytorch/se_l0_s54.pt",
+      "sha256": "8a1f2d2191d5595905e61d1fa0f061d5b9f76f34ad7d4dd6bfdb55d526465810",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.7455064301397286,
+        "rrmse_f": 0.6880853188972847,
+        "cc": 0.6745266468793738
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l0_s67",
+      "family": "se_0",
+      "seed": 67,
+      "source_run": "tcn_se_both_250hz_fixed_s67",
+      "path": "pretrained/pytorch/se_l0_s67.pt",
+      "sha256": "7146d63d7ed5ea6fab31ff80369fef315b4c113973254ad5083098987321a71a",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.7424217003817651,
+        "rrmse_f": 0.6998991390945865,
+        "cc": 0.6741974777742928
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l0_s72",
+      "family": "se_0",
+      "seed": 72,
+      "source_run": "tcn_se_both_250hz_fixed_s72",
+      "path": "pretrained/pytorch/se_l0_s72.pt",
+      "sha256": "48514b6242323611cc523ffb7c036c8504b1da2f4bd1c8599c49c2e02c9eee93",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.732453034438339,
+        "rrmse_f": 0.6799848814220989,
+        "cc": 0.6842374572128642
+      },
+      "test_segments": 510,
+      "onnx_path": "pretrained/onnx/se_l0_s72_step.onnx",
+      "onnx_sha256": "06799820c142fe39d98e5ad40ac6ec47f495f7173ad9adc213a9bf12fe058dec"
+    },
+    {
+      "id": "se_l0_s88",
+      "family": "se_0",
+      "seed": 88,
+      "source_run": "tcn_se_both_250hz_fixed_s88",
+      "path": "pretrained/pytorch/se_l0_s88.pt",
+      "sha256": "9c9c6fe354ce5d357ca04ddb9c76e721635cbfdd40691d0e0638c5c0e479f12e",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.735361788611786,
+        "rrmse_f": 0.6841781359092862,
+        "cc": 0.6824688874915534
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l1_s42",
+      "family": "se_1",
+      "seed": 42,
+      "source_run": "tcn_se_la1_both_250hz_s42_5dbefeae5d_retry2",
+      "path": "pretrained/pytorch/se_l1_s42.pt",
+      "sha256": "05d8da49b25d0c17388a60185e9dc2887b2aa38e8eeb1fd45fc74a6d514e798f",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 1,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.7043146669864655,
+        "rrmse_f": 0.6586777301687821,
+        "cc": 0.7174573067466126
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l1_s54",
+      "family": "se_1",
+      "seed": 54,
+      "source_run": "tcn_se_la1_both_250hz_s54_abedab4f03",
+      "path": "pretrained/pytorch/se_l1_s54.pt",
+      "sha256": "8a5c9c3ea84097f8344600aa985d213916386554ff97c1c5ed60eeafac845036",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 1,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.7250136144605337,
+        "rrmse_f": 0.667771180850618,
+        "cc": 0.6987381559960982
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l1_s67",
+      "family": "se_1",
+      "seed": 67,
+      "source_run": "tcn_se_la1_both_250hz_s67_969c777875",
+      "path": "pretrained/pytorch/se_l1_s67.pt",
+      "sha256": "73482c46a2bc4596c94bd062085e1645bc5fc195e5de1ee06929a4fee891ca1a",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 1,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.7224239636285632,
+        "rrmse_f": 0.6821216263023078,
+        "cc": 0.6970030267814211
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l1_s72",
+      "family": "se_1",
+      "seed": 72,
+      "source_run": "tcn_se_la1_both_250hz_s72_ba64f946c4",
+      "path": "pretrained/pytorch/se_l1_s72.pt",
+      "sha256": "e760200a80014745d89971bf6563dc886c610631e86a60efa1fe26c5be2f23bf",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 1,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.7080422378053852,
+        "rrmse_f": 0.6643752811001796,
+        "cc": 0.7105249826230254
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l1_s88",
+      "family": "se_1",
+      "seed": 88,
+      "source_run": "tcn_se_la1_both_250hz_s88_34ce5ff6b9",
+      "path": "pretrained/pytorch/se_l1_s88.pt",
+      "sha256": "f76bc6018c72496561eb21314f391e4736a4142c558ed7b85804f61d750ae069",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 1,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.7152368445606793,
+        "rrmse_f": 0.6709418539907418,
+        "cc": 0.7052609315105512
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l124_s42",
+      "family": "se_124",
+      "seed": 42,
+      "source_run": "tcn_se_la124_both_250hz_s42_3ca3c0ee95",
+      "path": "pretrained/pytorch/se_l124_s42.pt",
+      "sha256": "9d906b2a85be90b3b11de8cc221d771c2a491b83de4663f161c05f076dd52fc8",
+      "bytes": 516872,
+      "parameters": 122548,
+      "lookahead_samples": 124,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.6229529228280573,
+        "rrmse_f": 0.5907649664902219,
+        "cc": 0.7796882959557515
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l124_s54",
+      "family": "se_124",
+      "seed": 54,
+      "source_run": "tcn_se_la124_both_250hz_s54_a38e2a705a",
+      "path": "pretrained/pytorch/se_l124_s54.pt",
+      "sha256": "2fcee3b79af56a0781f59ac91924ac1b4d80d7981e12c80c35d79b313b978d04",
+      "bytes": 516872,
+      "parameters": 122548,
+      "lookahead_samples": 124,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.6335055801798316,
+        "rrmse_f": 0.5902277112007142,
+        "cc": 0.7689064869109322
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l124_s67",
+      "family": "se_124",
+      "seed": 67,
+      "source_run": "tcn_se_la124_both_250hz_s67_c4af08181a",
+      "path": "pretrained/pytorch/se_l124_s67.pt",
+      "sha256": "a97b58ca8524e534003af347a1c9d63d90a714d07a987ee94f25cc171e7537e7",
+      "bytes": 516872,
+      "parameters": 122548,
+      "lookahead_samples": 124,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.6330074681663046,
+        "rrmse_f": 0.6071177956812522,
+        "cc": 0.7716153831531604
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l124_s72",
+      "family": "se_124",
+      "seed": 72,
+      "source_run": "tcn_se_la124_both_250hz_s72_76e6f00afb",
+      "path": "pretrained/pytorch/se_l124_s72.pt",
+      "sha256": "b8d26d008e690769869db0a2930d26c11ce507af39024fc9c9a56ebcbc95083b",
+      "bytes": 516872,
+      "parameters": 122548,
+      "lookahead_samples": 124,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.6213366170724233,
+        "rrmse_f": 0.5912415891593578,
+        "cc": 0.7781210466461512
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l124_s88",
+      "family": "se_124",
+      "seed": 88,
+      "source_run": "tcn_se_la124_both_250hz_s88_bd70548306",
+      "path": "pretrained/pytorch/se_l124_s88.pt",
+      "sha256": "fef7e4d27c3014c4e8e5c9f03b2077bcc9ee8f48ebadf4fbafa392335b2dba05",
+      "bytes": 516872,
+      "parameters": 122548,
+      "lookahead_samples": 124,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.6365811032699603,
+        "rrmse_f": 0.6023436677368248,
+        "cc": 0.7685823184164131
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l16_s42",
+      "family": "se_16",
+      "seed": 42,
+      "source_run": "tcn_se_la16_both_channelnorm_250hz_s42",
+      "path": "pretrained/pytorch/se_l16_s42.pt",
+      "sha256": "48e956f9345d32b822dd089779c68ae91590461d377b319ffccfeaabfd805a93",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 16,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.6389387567253674,
+        "rrmse_f": 0.6161638702247657,
+        "cc": 0.7699524581286252
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l16_s54",
+      "family": "se_16",
+      "seed": 54,
+      "source_run": "tcn_se_la16_both_channelnorm_250hz_s54",
+      "path": "pretrained/pytorch/se_l16_s54.pt",
+      "sha256": "407640170f8704a11365378e76c3c92fbf9c06296b7347f888bd50beefb2f52b",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 16,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.6590248837774875,
+        "rrmse_f": 0.6267296702254053,
+        "cc": 0.7532172594584671
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l16_s67",
+      "family": "se_16",
+      "seed": 67,
+      "source_run": "tcn_se_la16_both_channelnorm_250hz_s67",
+      "path": "pretrained/pytorch/se_l16_s67.pt",
+      "sha256": "f547617e6dbde2d8cd738d3963c301b788bb4149ef1ba6e7923aabe8e82c78eb",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 16,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.6562949224429973,
+        "rrmse_f": 0.6318266828416609,
+        "cc": 0.7535841812817927
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l16_s72",
+      "family": "se_16",
+      "seed": 72,
+      "source_run": "tcn_se_la16_both_250hz_s72_e69e56f458",
+      "path": "pretrained/pytorch/se_l16_s72.pt",
+      "sha256": "9829c1d6b55700120287c8e27b873e34770101b30e2ce624c0514482053abb93",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 16,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.6409259499872432,
+        "rrmse_f": 0.618247644179592,
+        "cc": 0.7650267008107667
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l16_s88",
+      "family": "se_16",
+      "seed": 88,
+      "source_run": "tcn_se_la16_both_250hz_s88_c548eb2449",
+      "path": "pretrained/pytorch/se_l16_s88.pt",
+      "sha256": "9e5dd29f58b46b71a5a3641939a947b259e89f13ce6f89854144e5dc53c6f6bc",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 16,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.6563999001594151,
+        "rrmse_f": 0.6268047763436448,
+        "cc": 0.7547260842194744
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l186_s42",
+      "family": "se_186",
+      "seed": 42,
+      "source_run": "tcn_se_la186_both_250hz_s42_ac11ee6687",
+      "path": "pretrained/pytorch/se_l186_s42.pt",
+      "sha256": "91b5ea6b7a8fba97192caa273ea89197943c0b62a0fb6a24ac016db8db284045",
+      "bytes": 516872,
+      "parameters": 122548,
+      "lookahead_samples": 186,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.6919879612969417,
+        "rrmse_f": 0.6495705761745865,
+        "cc": 0.7164595244708014
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l186_s54",
+      "family": "se_186",
+      "seed": 54,
+      "source_run": "tcn_se_la186_both_250hz_s54_d44d751aa7",
+      "path": "pretrained/pytorch/se_l186_s54.pt",
+      "sha256": "b8a8836f3fa135a3e08329ac4908e313a41c00b0c6b467050a6d547a351c9296",
+      "bytes": 516872,
+      "parameters": 122548,
+      "lookahead_samples": 186,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.7064472619809357,
+        "rrmse_f": 0.6499287099814882,
+        "cc": 0.7021991836381893
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l186_s67",
+      "family": "se_186",
+      "seed": 67,
+      "source_run": "tcn_se_la186_both_250hz_s67_1743de6817",
+      "path": "pretrained/pytorch/se_l186_s67.pt",
+      "sha256": "1987ca00133dbbd2844583c864909f06afbffe065ade0c93b41491720c4b3d4a",
+      "bytes": 516872,
+      "parameters": 122548,
+      "lookahead_samples": 186,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.7048185938421417,
+        "rrmse_f": 0.6632384996788174,
+        "cc": 0.706112954210417
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l186_s72",
+      "family": "se_186",
+      "seed": 72,
+      "source_run": "tcn_se_la186_both_250hz_s72_b37b42e549",
+      "path": "pretrained/pytorch/se_l186_s72.pt",
+      "sha256": "112b0f55c16fcf766d5dc48cf0ca7f0a118870bf33f87e3076a64354760a5530",
+      "bytes": 516872,
+      "parameters": 122548,
+      "lookahead_samples": 186,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.6970014974767087,
+        "rrmse_f": 0.6541109448262289,
+        "cc": 0.7119138943250565
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l186_s88",
+      "family": "se_186",
+      "seed": 88,
+      "source_run": "tcn_se_la186_both_250hz_s88_0259c6cfe9",
+      "path": "pretrained/pytorch/se_l186_s88.pt",
+      "sha256": "bf73663c0d2767188681a47055fd484e365dd58b93e5e346dc03559ebb274bca",
+      "bytes": 516872,
+      "parameters": 122548,
+      "lookahead_samples": 186,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.7040947169065476,
+        "rrmse_f": 0.6475024234430463,
+        "cc": 0.7056728699920224
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l2_s42",
+      "family": "se_2",
+      "seed": 42,
+      "source_run": "tcn_se_la2_both_channelnorm_250hz_s42",
+      "path": "pretrained/pytorch/se_l2_s42.pt",
+      "sha256": "48a21eee42727a2c73d3f657e26708a8ac4bef9760f4cbf72c767efccbd2c5b7",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 2,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.6958075959308475,
+        "rrmse_f": 0.6567825563105882,
+        "cc": 0.7247457234462833
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l2_s54",
+      "family": "se_2",
+      "seed": 54,
+      "source_run": "tcn_se_la2_both_channelnorm_250hz_s54",
+      "path": "pretrained/pytorch/se_l2_s54.pt",
+      "sha256": "39f78db9246ecc6198dfeb1f469001500f4fe19fdb7223b93764c428dd34590b",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 2,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.7154199405628092,
+        "rrmse_f": 0.6665576408891117,
+        "cc": 0.7089683169243383
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l2_s67",
+      "family": "se_2",
+      "seed": 67,
+      "source_run": "tcn_se_la2_both_channelnorm_250hz_s67",
+      "path": "pretrained/pytorch/se_l2_s67.pt",
+      "sha256": "a6b42795067832bb0160a0bb8b5fd485037c5b74b297860cd66fb27ee2fc6c99",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 2,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.7138055774511075,
+        "rrmse_f": 0.6756633254535058,
+        "cc": 0.7054475701103607
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l2_s72",
+      "family": "se_2",
+      "seed": 72,
+      "source_run": "tcn_se_la2_both_250hz_s72_b611c3cc13",
+      "path": "pretrained/pytorch/se_l2_s72.pt",
+      "sha256": "31808305542dc799939755379f06e2dffc44c46e3ead6ef2675a5417e9902808",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 2,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.6976792534192403,
+        "rrmse_f": 0.653866407976431,
+        "cc": 0.7197208479631181
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l2_s88",
+      "family": "se_2",
+      "seed": 88,
+      "source_run": "tcn_se_la2_both_250hz_s88_f6fae74c97",
+      "path": "pretrained/pytorch/se_l2_s88.pt",
+      "sha256": "da8a503be8978373f5b0339d05d263a8052612a5fe6dc857e571c0cd4298b2b6",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 2,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.7079898412321128,
+        "rrmse_f": 0.6652065222462018,
+        "cc": 0.7128137226380846
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l32_s42",
+      "family": "se_32",
+      "seed": 42,
+      "source_run": "tcn_se_la32_both_250hz_s42_8c3443a3d5",
+      "path": "pretrained/pytorch/se_l32_s42.pt",
+      "sha256": "41ea14a20d7cd6cb81fa9d84d11e56dc26f0c631abdf68a367de30dfc35954e9",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 32,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.6266883353976642,
+        "rrmse_f": 0.5985054301572781,
+        "cc": 0.7782936833214527
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l32_s54",
+      "family": "se_32",
+      "seed": 54,
+      "source_run": "tcn_se_la32_both_250hz_s54_2dd8769382",
+      "path": "pretrained/pytorch/se_l32_s54.pt",
+      "sha256": "9ad7dccaf77b044a66ba2d0755183b3ecc3b96b4811dc26131ee46162058cf0c",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 32,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.643024264042284,
+        "rrmse_f": 0.6106249647397621,
+        "cc": 0.7631162915159674
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l32_s67",
+      "family": "se_32",
+      "seed": 67,
+      "source_run": "tcn_se_la32_both_250hz_s67_3d667a4dea",
+      "path": "pretrained/pytorch/se_l32_s67.pt",
+      "sha256": "0aa27765d3b5a5ae92b990fc7fb59388a5c0ce6c8e014383d8aa81b5032449a8",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 32,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.6421678272532482,
+        "rrmse_f": 0.6179690349627943,
+        "cc": 0.763783183102222
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l32_s72",
+      "family": "se_32",
+      "seed": 72,
+      "source_run": "tcn_se_la32_both_250hz_s72_5bd9207eb9",
+      "path": "pretrained/pytorch/se_l32_s72.pt",
+      "sha256": "95340e80cefc568a4ed101dea1ae6f44124ba0229f57238b1a54e5354ab229cf",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 32,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.6291627186186174,
+        "rrmse_f": 0.6039343779577928,
+        "cc": 0.7733849189180296
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l32_s88",
+      "family": "se_32",
+      "seed": 88,
+      "source_run": "tcn_se_la32_both_250hz_s88_7ebe1c535a_retry2",
+      "path": "pretrained/pytorch/se_l32_s88.pt",
+      "sha256": "fda9de6f3673b19e7f382ed09e909acb25b22de0c0a5fceb4fb0671f5be9acab",
+      "bytes": 516853,
+      "parameters": 122548,
+      "lookahead_samples": 32,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.6443979339272368,
+        "rrmse_f": 0.6153240713710878,
+        "cc": 0.7620694332555229
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l4_s42",
+      "family": "se_4",
+      "seed": 42,
+      "source_run": "tcn_se_la4_both_channelnorm_250hz_s42",
+      "path": "pretrained/pytorch/se_l4_s42.pt",
+      "sha256": "24944d5d4ef1a3f115372cbf2a3d014100cf76551c7fc27c372d944f84f7d64d",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 4,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.6937084833196565,
+        "rrmse_f": 0.6537072115961243,
+        "cc": 0.7276611329615572
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l4_s54",
+      "family": "se_4",
+      "seed": 54,
+      "source_run": "tcn_se_la4_both_channelnorm_250hz_s54",
+      "path": "pretrained/pytorch/se_l4_s54.pt",
+      "sha256": "4aff2c25cb9e2ea0d4b601b464763e8275320ca9db3a99c7599766ec8943e98f",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 4,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.7090815737551334,
+        "rrmse_f": 0.6641612184690494,
+        "cc": 0.714051109917608
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l4_s67",
+      "family": "se_4",
+      "seed": 67,
+      "source_run": "tcn_se_la4_both_channelnorm_250hz_s67",
+      "path": "pretrained/pytorch/se_l4_s67.pt",
+      "sha256": "9b4853a886dfa44ee35ccfa9fcfe51a34c126794ddc9e707fc906c091bf0372f",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 4,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.7085271321675357,
+        "rrmse_f": 0.6697814102850709,
+        "cc": 0.7097148486139143
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l4_s72",
+      "family": "se_4",
+      "seed": 72,
+      "source_run": "tcn_se_la4_both_250hz_s72_709166f44a",
+      "path": "pretrained/pytorch/se_l4_s72.pt",
+      "sha256": "e66d4551a63cabaae18bd116bf2fe0fa330d0e219712d34a1c077c1e0e1ec885",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 4,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.6916381144640492,
+        "rrmse_f": 0.6504405020206583,
+        "cc": 0.7254170299160714
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l4_s88",
+      "family": "se_4",
+      "seed": 88,
+      "source_run": "tcn_se_la4_both_250hz_s88_997170fad4",
+      "path": "pretrained/pytorch/se_l4_s88.pt",
+      "sha256": "cba101bffa6220a8dd43ec08365bf625501c84e32e8a0369248ffa4bed889e4f",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 4,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.7046732426858415,
+        "rrmse_f": 0.6656833333711998,
+        "cc": 0.7161162897433136
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l62_s42",
+      "family": "se_62",
+      "seed": 42,
+      "source_run": "tcn_se_la62_both_250hz_s42_21be6f4077",
+      "path": "pretrained/pytorch/se_l62_s42.pt",
+      "sha256": "97d943258ae67e26784a0f5e1f31264de1fab57b8050260fa24b4384a497d9a4",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 62,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.6194856549302737,
+        "rrmse_f": 0.5960566622661609,
+        "cc": 0.7822290365602456
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l62_s54",
+      "family": "se_62",
+      "seed": 54,
+      "source_run": "tcn_se_la62_both_250hz_s54_75d0aa15dd",
+      "path": "pretrained/pytorch/se_l62_s54.pt",
+      "sha256": "24202bc1bf581615ed9fdf48617a85a3eeab5315cde0869f9ebb5d09b9cc5b45",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 62,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.6342370319600199,
+        "rrmse_f": 0.595880539817553,
+        "cc": 0.7682361491170584
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l62_s67",
+      "family": "se_62",
+      "seed": 67,
+      "source_run": "tcn_se_la62_both_250hz_s67_387b0f4df3",
+      "path": "pretrained/pytorch/se_l62_s67.pt",
+      "sha256": "79254b1070348b59a3f29ad829b76a8d07aa72ba4cbf5f82c1b0001342d1b90e",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 62,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.6333072194573925,
+        "rrmse_f": 0.6083911495758038,
+        "cc": 0.7708439313897899
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l62_s72",
+      "family": "se_62",
+      "seed": 72,
+      "source_run": "tcn_se_la62_both_250hz_s72_4983b14ca0",
+      "path": "pretrained/pytorch/se_l62_s72.pt",
+      "sha256": "65ef57cc7f7068778ae91ba0f9fd269e162e8c556ff8cb7869d7404e9466a69b",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 62,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.6208074367513844,
+        "rrmse_f": 0.5934050844872699,
+        "cc": 0.7782439154152777
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l62_s88",
+      "family": "se_62",
+      "seed": 88,
+      "source_run": "tcn_se_la62_both_250hz_s88_a0705dc5fe",
+      "path": "pretrained/pytorch/se_l62_s88.pt",
+      "sha256": "0775b1bec282bd7ec58092de099caad05ad27902acc1169a6058f19f81351e93",
+      "bytes": 516789,
+      "parameters": 122548,
+      "lookahead_samples": 62,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.6366276729925006,
+        "rrmse_f": 0.6087927666218842,
+        "cc": 0.7675141376899738
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l8_s42",
+      "family": "se_8",
+      "seed": 42,
+      "source_run": "tcn_se_la8_both_channelnorm_250hz_s42",
+      "path": "pretrained/pytorch/se_l8_s42.pt",
+      "sha256": "49cf12b4f91dc968714c1c2fca2331f824558c8e211757df8110bb8ac7aa274e",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 8,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.6694489517048293,
+        "rrmse_f": 0.6380465091151349,
+        "cc": 0.747363414352431
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l8_s54",
+      "family": "se_8",
+      "seed": 54,
+      "source_run": "tcn_se_la8_both_channelnorm_250hz_s54",
+      "path": "pretrained/pytorch/se_l8_s54.pt",
+      "sha256": "ca3c0d1920e30602719d609b346d86d8e1c368613400b9bc2bb4f6c8cda3ba75",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 8,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.6872465481945113,
+        "rrmse_f": 0.6503588751542801,
+        "cc": 0.7321415377013824
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l8_s67",
+      "family": "se_8",
+      "seed": 67,
+      "source_run": "tcn_se_la8_both_channelnorm_250hz_s67",
+      "path": "pretrained/pytorch/se_l8_s67.pt",
+      "sha256": "46ab67575e93257339c3d668101dcc45538e2843e84b82c46cac20194b630e66",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 8,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.6849100165799552,
+        "rrmse_f": 0.6529411329358232,
+        "cc": 0.7302647344138035
+      },
+      "test_segments": 510,
+      "onnx_path": "pretrained/onnx/se_l8_s67_step.onnx",
+      "onnx_sha256": "c52f704e74ed584e3140b6eb3887d984395d9a52ddf3345649113ed714842e26"
+    },
+    {
+      "id": "se_l8_s72",
+      "family": "se_8",
+      "seed": 72,
+      "source_run": "tcn_se_la8_both_250hz_s72_70c1f35856",
+      "path": "pretrained/pytorch/se_l8_s72.pt",
+      "sha256": "77d93c59629173e353f2627bedc18e56e64c6efda4975a6c9f256b56cdc3e8e8",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 8,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.6696736297771042,
+        "rrmse_f": 0.6381376043546434,
+        "cc": 0.742069855025586
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_l8_s88",
+      "family": "se_8",
+      "seed": 88,
+      "source_run": "tcn_se_la8_both_250hz_s88_2fb5a2da1c",
+      "path": "pretrained/pytorch/se_l8_s88.pt",
+      "sha256": "997e3c26916bad0a54df5191f969ee42d6ea7c36146333561376ee2a2c25ce7f",
+      "bytes": 516706,
+      "parameters": 122548,
+      "lookahead_samples": 8,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.6837117130849876,
+        "rrmse_f": 0.6434395626187325,
+        "cc": 0.7337948204401661
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_offline_s42",
+      "family": "se_off",
+      "seed": 42,
+      "source_run": "tcn_se_bi_both_250hz_s42_a9c62737bc",
+      "path": "pretrained/pytorch/se_offline_s42.pt",
+      "sha256": "e93099e4aadca13b6adbd3c1ebf6ff4863ab5409400b74be2c81131d1038c3c0",
+      "bytes": 517121,
+      "parameters": 122548,
+      "lookahead_samples": null,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.6191465433321747,
+        "rrmse_f": 0.5868545275692846,
+        "cc": 0.7828148099721647
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_offline_s54",
+      "family": "se_off",
+      "seed": 54,
+      "source_run": "tcn_se_bi_both_250hz_s54_491cc983e2",
+      "path": "pretrained/pytorch/se_offline_s54.pt",
+      "sha256": "2ebd157ef196800c4b8e9cef8fe8881f17d1d7be34ae2b9438a88451b94e1434",
+      "bytes": 517121,
+      "parameters": 122548,
+      "lookahead_samples": null,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.6290637084374241,
+        "rrmse_f": 0.5851956587796118,
+        "cc": 0.771011085895931
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_offline_s67",
+      "family": "se_off",
+      "seed": 67,
+      "source_run": "tcn_se_bi_both_250hz_s67_493aae9785",
+      "path": "pretrained/pytorch/se_offline_s67.pt",
+      "sha256": "b584f41b1dd6f00869f715ad5359b44bef845a2e951efdf8e23a41dd8c13b648",
+      "bytes": 517121,
+      "parameters": 122548,
+      "lookahead_samples": null,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.630345928581322,
+        "rrmse_f": 0.5994155391174204,
+        "cc": 0.7729531986858038
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_offline_s72",
+      "family": "se_off",
+      "seed": 72,
+      "source_run": "tcn_se_bi_both_250hz_fixed_s72",
+      "path": "pretrained/pytorch/se_offline_s72.pt",
+      "sha256": "d567a5b24e1edb2e195cace6c939c5f98ae2bae91d1b826c2f71415eaf4f6720",
+      "bytes": 517121,
+      "parameters": 122548,
+      "lookahead_samples": null,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.6164141374767995,
+        "rrmse_f": 0.5854552475845113,
+        "cc": 0.7815633583813906
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "se_offline_s88",
+      "family": "se_off",
+      "seed": 88,
+      "source_run": "tcn_se_bi_both_250hz_fixed_s88",
+      "path": "pretrained/pytorch/se_offline_s88.pt",
+      "sha256": "627b0cd3788458e265838ddacb0185585597b0d81cd4487ce1f95643f2cec6b6",
+      "bytes": 517121,
+      "parameters": 122548,
+      "lookahead_samples": null,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.6332120501819779,
+        "rrmse_f": 0.5979412060888375,
+        "cc": 0.7702748894253197
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "tcn_s42",
+      "family": "tcn",
+      "seed": 42,
+      "source_run": "tcn_both_channelnorm_250hz_s42",
+      "path": "pretrained/pytorch/tcn_s42.pt",
+      "sha256": "c4d35fc6abe70aad7dabbc9ca1bc10961db99619c264b9259de0eecfb9bd28d0",
+      "bytes": 488184,
+      "parameters": 117068,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.74221918990898,
+      "test_metrics": {
+        "rrmse_t": 0.7377547365777632,
+        "rrmse_f": 0.6875328211807737,
+        "cc": 0.6804245028900457
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "tcn_s54",
+      "family": "tcn",
+      "seed": 54,
+      "source_run": "tcn_both_channelnorm_250hz_s54",
+      "path": "pretrained/pytorch/tcn_s54.pt",
+      "sha256": "6f55d4552b2dfc3712d9efc6cacab60f543f2ad76da77598d4986f9d1ccf0eb4",
+      "bytes": 488184,
+      "parameters": 117068,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.5799291562661,
+      "test_metrics": {
+        "rrmse_t": 0.7579198093975291,
+        "rrmse_f": 0.7098880924430548,
+        "cc": 0.6622782379680989
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "tcn_s67",
+      "family": "tcn",
+      "seed": 67,
+      "source_run": "tcn_both_channelnorm_250hz_s67",
+      "path": "pretrained/pytorch/tcn_s67.pt",
+      "sha256": "149e4a22c62ab70ccb253a85a4e1e59ce5486865a27dd89c7ae3dbc49f052414",
+      "bytes": 488184,
+      "parameters": 117068,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.18793868549258,
+      "test_metrics": {
+        "rrmse_t": 0.7597132759935715,
+        "rrmse_f": 0.7203585146688948,
+        "cc": 0.6597368065779116
+      },
+      "test_segments": 510
+    },
+    {
+      "id": "tcn_s72",
+      "family": "tcn",
+      "seed": 72,
+      "source_run": "tcn_both_channelnorm_250hz_s72",
+      "path": "pretrained/pytorch/tcn_s72.pt",
+      "sha256": "7e7dddc5324324dcd908b0e7b42723f1815b0df5b6e7d18b701045ce6a80047e",
+      "bytes": 488184,
+      "parameters": 117068,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 228.83613159744738,
+      "test_metrics": {
+        "rrmse_t": 0.7480107832188699,
+        "rrmse_f": 0.7036187450383223,
+        "cc": 0.6711629359672467
+      },
+      "test_segments": 510,
+      "onnx_path": "pretrained/onnx/tcn_s72_step.onnx",
+      "onnx_sha256": "0804557863e62418db79e4acada0a9edfd9b2ca77590bc50cfad06adfdadb360"
+    },
+    {
+      "id": "tcn_s88",
+      "family": "tcn",
+      "seed": 88,
+      "source_run": "tcn_both_channelnorm_250hz_s88",
+      "path": "pretrained/pytorch/tcn_s88.pt",
+      "sha256": "eaee0fff29a88a6562bb938d43a47943b54e481aff32a16e36bb4a05068a1c8c",
+      "bytes": 488184,
+      "parameters": 117068,
+      "lookahead_samples": 0,
+      "sample_rate_hz": 250.0,
+      "normalization_scale": 229.95969929206987,
+      "test_metrics": {
+        "rrmse_t": 0.7495360848950404,
+        "rrmse_f": 0.6961484159032504,
+        "cc": 0.6709932192575698
+      },
+      "test_segments": 510
+    }
+  ]
+}

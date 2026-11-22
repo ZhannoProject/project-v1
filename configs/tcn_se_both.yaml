@@ -1,0 +1,47 @@
+# ============================================================
+# Squeeze-and-Excitation baseline on BOTH artifacts
+#
+# This is the recipe the three SE seed repeats were trained with
+# (runs/tcn_se_both, _s54, _s67_h64 -- 122,548 params each). It existed
+# only inside runs/gui_train_*.log until now, which made the one thing
+# the error bar depends on -- that the repeats differ in nothing but
+# master_seed -- impossible to check without reading logs. One of them
+# was in fact trained at hidden_channels 48 and nobody could see it.
+#
+# It is also the base of the lookahead ladder: the Lookahead tab trains a
+# rung by overriding --variant tcn_se_la{N} and --save_dir on top of this
+# file, so every rung and the causal baseline share one recipe by
+# construction rather than by hand.
+# ============================================================
+
+# --- Model ---
+variant: "tcn_se"
+se_reduction: 8            # C -> C/8 -> C channel gate on every residual block,
+                           # squeezed over a RUNNING mean so it cannot see ahead
+hidden_channels: 64
+
+# --- Data ---
+artifact: "BOTH"
+data_dir: "./data/EEGdenoisenet/data/"
+batch_size: 32
+snr_range_db: [-7.0, 2.0]
+master_seed: 42            # 42 / 54 / 67 are the repeats; the seed picks the
+                           # split, the SNR pairing, the init and the batch order
+
+# --- Training ---
+learning_rate: 5.0e-4
+attn_lr_scale: 3.0          # no attention decoder here, so this does nothing
+weight_decay: 0.0
+max_epochs: 200
+log_every: 20
+
+# --- Scheduler (CosineAnnealing + linear warmup) ---
+sched_warmup_epochs: 5
+eta_min: 1.0e-6
+
+# --- Loss function ---
+loss_fn: "mse"              # "l1_combined", "l2_combined", "mse", "l1", or "stft"
+
+# --- Output ---
+save_dir: "./runs/tcn_se_both"
+tensorboard: false

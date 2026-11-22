@@ -1,0 +1,442 @@
+{
+  "model": {
+    "checkpoint": "../pytorch/se_l8_s67.pt",
+    "epoch": 181,
+    "val_loss": 0.45704666492985746,
+    "variant": "tcn_se_la8",
+    "hidden_channels": 64,
+    "dropout": 0.1,
+    "causal": false,
+    "se_reduction": 8,
+    "lookahead": 8,
+    "dilations": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "turboquant": false,
+    "turboquant_bits": 3,
+    "turboquant_key_mode": "prod",
+    "turboquant_train_mode": "off",
+    "turboquant_seed": 42,
+    "tcn_norm": "channel",
+    "se_window": null,
+    "attention_window": null,
+    "n_params": 122548
+  },
+  "data_protocol": {
+    "variant": "tcn_se_la8",
+    "hidden_channels": 64,
+    "n_heads": 4,
+    "n_attn_layers": 2,
+    "max_seq_len": 512,
+    "dropout": 0.1,
+    "kv_lora_rank": 16,
+    "bottleneck_ratio": 0.5,
+    "skip_bottleneck_ratio": null,
+    "se_reduction": 8,
+    "dilations": null,
+    "causal": false,
+    "causal_tcn": null,
+    "lookahead": 8,
+    "turboquant": false,
+    "turboquant_bits": 3,
+    "turboquant_key_mode": "prod",
+    "turboquant_train_mode": "off",
+    "turboquant_seed": 42,
+    "tcn_norm": "channel",
+    "se_window": null,
+    "attention_window": null,
+    "artifact": "BOTH",
+    "batch_size": 32,
+    "snr_range_db": [
+      -7.0,
+      2.0
+    ],
+    "split_ratios": [
+      0.7,
+      0.15,
+      0.15
+    ],
+    "sampling": "legacy",
+    "target_fs": 250.0,
+    "normalization": "fixed",
+    "normalization_scale": 228.18793868549258,
+    "master_seed": 67,
+    "resampling": "offline",
+    "learning_rate": 0.0005,
+    "attn_lr_scale": 3.0,
+    "weight_decay": 0.0,
+    "max_epochs": 200,
+    "loss_fn": "mse",
+    "sched_warmup_epochs": 5,
+    "protocol": "exploratory",
+    "output_delay": 0,
+    "valid_history_samples": null,
+    "valid_future_samples": 0
+  },
+  "export": {
+    "mode": "bounded_incremental",
+    "experimental": true,
+    "opset": 18,
+    "exporter": "torchscript",
+    "topology": "tcn_bounded",
+    "window": 125,
+    "state": [
+      {
+        "name": "acquired_0",
+        "shape": [
+          1,
+          1
+        ]
+      },
+      {
+        "name": "conv_1",
+        "shape": [
+          1,
+          2
+        ]
+      },
+      {
+        "name": "conv_2",
+        "shape": [
+          64,
+          2
+        ]
+      },
+      {
+        "name": "se_sum_3",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "conv_4",
+        "shape": [
+          64,
+          4
+        ]
+      },
+      {
+        "name": "conv_5",
+        "shape": [
+          64,
+          4
+        ]
+      },
+      {
+        "name": "se_sum_6",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "conv_7",
+        "shape": [
+          64,
+          8
+        ]
+      },
+      {
+        "name": "conv_8",
+        "shape": [
+          64,
+          8
+        ]
+      },
+      {
+        "name": "se_sum_9",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "conv_10",
+        "shape": [
+          64,
+          16
+        ]
+      },
+      {
+        "name": "conv_11",
+        "shape": [
+          64,
+          16
+        ]
+      },
+      {
+        "name": "se_sum_12",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_delay_13",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "residual_delay_14",
+        "shape": [
+          64,
+          3
+        ]
+      },
+      {
+        "name": "conv_15",
+        "shape": [
+          64,
+          32
+        ]
+      },
+      {
+        "name": "conv_16",
+        "shape": [
+          64,
+          32
+        ]
+      },
+      {
+        "name": "se_sum_17",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_delay_18",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "residual_delay_19",
+        "shape": [
+          64,
+          5
+        ]
+      }
+    ],
+    "state_tensors": 20,
+    "state_floats": 8771,
+    "n_nodes": 245,
+    "file_size_kb": 518.7,
+    "torch": "2.12.0"
+  },
+  "io": {
+    "input": {
+      "name": "x_t",
+      "shape": [
+        1,
+        1,
+        1
+      ],
+      "dtype": "float32"
+    },
+    "output": {
+      "name": "y_t",
+      "shape": [
+        1,
+        1,
+        1
+      ],
+      "dtype": "float32"
+    },
+    "state": [
+      {
+        "name": "acquired_0",
+        "shape": [
+          1,
+          1
+        ]
+      },
+      {
+        "name": "conv_1",
+        "shape": [
+          1,
+          2
+        ]
+      },
+      {
+        "name": "conv_2",
+        "shape": [
+          64,
+          2
+        ]
+      },
+      {
+        "name": "se_sum_3",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "conv_4",
+        "shape": [
+          64,
+          4
+        ]
+      },
+      {
+        "name": "conv_5",
+        "shape": [
+          64,
+          4
+        ]
+      },
+      {
+        "name": "se_sum_6",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "conv_7",
+        "shape": [
+          64,
+          8
+        ]
+      },
+      {
+        "name": "conv_8",
+        "shape": [
+          64,
+          8
+        ]
+      },
+      {
+        "name": "se_sum_9",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "conv_10",
+        "shape": [
+          64,
+          16
+        ]
+      },
+      {
+        "name": "conv_11",
+        "shape": [
+          64,
+          16
+        ]
+      },
+      {
+        "name": "se_sum_12",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_delay_13",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "residual_delay_14",
+        "shape": [
+          64,
+          3
+        ]
+      },
+      {
+        "name": "conv_15",
+        "shape": [
+          64,
+          32
+        ]
+      },
+      {
+        "name": "conv_16",
+        "shape": [
+          64,
+          32
+        ]
+      },
+      {
+        "name": "se_sum_17",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_delay_18",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "residual_delay_19",
+        "shape": [
+          64,
+          5
+        ]
+      }
+    ]
+  },
+  "preprocessing": {
+    "sample_rate_hz": 250.0,
+    "window_samples": 125,
+    "artifact_trained_on": "BOTH",
+    "normalization": "fixed",
+    "normalization_scale": 228.18793868549258,
+    "normalise": "x_in = x / normalization_scale; x_out = model(x_in) * normalization_scale",
+    "causal": true,
+    "model_causal": false,
+    "streaming": "one sample plus persistent state; acquisition u returns target u-8; discard first 8 outputs",
+    "output_delay_samples": 8,
+    "output_semantics": "output at acquisition t estimates target t-output_delay_samples",
+    "valid_history_samples": null,
+    "valid_future_samples": 8,
+    "lookahead_samples": 8,
+    "lookahead_semantics": "output index t estimates target t and reads inputs <= t+L; emit it once sample t+L has been acquired",
+    "future_wait_ms": 32.0,
+    "latency_budget": {
+      "sample_rate_hz": 250.0,
+      "hop_samples": 4,
+      "output_delay_samples": 0,
+      "future_delay_ms": 0.0,
+      "algorithmic_budget_ms": 48.0,
+      "measured": false,
+      "lookahead_samples": 8,
+      "lookahead_wait_ms": 32.0
+    },
+    "output_alignment": "acquisition",
+    "state_reset": "recording_start",
+    "se_pooling": "cumulative_since_recording_start"
+  },
+  "provenance": {
+    "trained_master_seed": 67,
+    "trained_artifact": "BOTH",
+    "inference_semantics": "whole_recording_stateful",
+    "comparison_note": "Does not reproduce cumulative SE reset independently in sliding windows"
+  },
+  "verification": {
+    "max_abs_diff_vs_whole_recording": 5.140900611877441e-07,
+    "n_steps": 2048,
+    "domain": "model_input",
+    "beyond_horizon_diff": 0.0,
+    "startup_outputs_invalid": 8,
+    "final_targets_unavailable": 8
+  }
+}

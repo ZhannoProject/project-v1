@@ -18,6 +18,7 @@ selected variant.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -29,6 +30,9 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "configs"
 RUNS_DIR = PROJECT_ROOT / "runs"
+
+from experiment.config import defaults as config_defaults
+GUI_DEFAULTS = config_defaults("gui")
 
 LOSS_NAMES = ["l1_combined", "l2_combined", "mse", "l1", "stft"]
 ARTIFACTS = ["EOG", "EMG", "BOTH"]
@@ -45,7 +49,7 @@ class Field:
     help: str = ""
     choices: Optional[str] = None      # name of a choice list served by /api/meta
     nullable: bool = False             # empty input → null (else empty is an error)
-    show_if: Optional[str] = None      # attention | mla | sandwich | staged | turboquant | kd
+    show_if: Optional[str] = None      # attention | mla | se | sandwich | staged | turboquant | kd
     min: Optional[float] = None
     max: Optional[float] = None
     step: Optional[float] = None
@@ -60,88 +64,140 @@ class Section:
 
 SCHEMA: List[Section] = [
     Section("Model", [
-        Field("variant", "select", "tcn_mla", choices="variants",
-              help="Registry name. *_bi = bidirectional teacher (not deployable)."),
-        Field("hidden_channels", "int", 64, min=8, step=8, help="TCN width H"),
-        Field("n_heads", "int", 4, min=1, show_if="attention",
+        Field("variant", "select", GUI_DEFAULTS["variant"], choices="variants",
+              help="tcn_channelnorm = plain TCN with ChannelNorm and no SE. "
+                   "*_bi = bidirectional teacher (not deployable)."),
+        Field("hidden_channels", "int", GUI_DEFAULTS["hidden_channels"], min=8, step=8, help="TCN width H"),
+        Field("tcn_norm", "select", GUI_DEFAULTS["tcn_norm"], choices="tcn_normalizations",
+              help="none skips TCN normalization. channel normalizes channels independently at each sample."),
+        Field("se_window", "int", GUI_DEFAULTS["se_window"], nullable=True, min=1, show_if="se",
+              help="Finite causal SE pooling window in samples; paper baseline uses 16"),
+        Field("attention_window", "int", GUI_DEFAULTS["attention_window"], nullable=True, min=1, show_if="attention",
+              help="Finite attention history shared by batch and cached inference"),
+        Field("n_heads", "int", GUI_DEFAULTS["n_heads"], min=1, show_if="attention",
               help="Attention heads; attn_dim must be divisible by it"),
-        Field("n_attn_layers", "int", 2, min=1, show_if="attention",
+        Field("n_attn_layers", "int", GUI_DEFAULTS["n_attn_layers"], min=1, show_if="attention",
               help="Transformer depth (presets: 2 / 10 / 20 / 50)"),
-        Field("max_seq_len", "int", 512, min=16, show_if="attention",
+        Field("max_seq_len", "int", GUI_DEFAULTS["max_seq_len"], min=16, show_if="attention",
               help="Causal-mask size; must be ≥ the 512-sample epoch length"),
-        Field("kv_lora_rank", "int", 16, min=1, show_if="mla",
-              help="MLA latent KV rank (d_model // 4 = 16 by default)"),
-        Field("bottleneck_ratio", "float", 0.5, min=0.05, max=1.0, step=0.05, show_if="sandwich",
+        Field("kv_lora_rank", "int", GUI_DEFAULTS["kv_lora_rank"], min=1, show_if="mla",
+              help="MLA latent KV rank. Cache per step is 2*d_model/rank smaller than MHA; d_model is 32 after the channel squeeze, so 16 gives 4x"),
+        # Nullable with no default on purpose. A plain 8 here would be merged
+        # into *every* variant's config, and TCNOnly accepts the argument --
+        # that is how tcn_se is built -- so the baseline would quietly grow an
+        # SE gate and report 122k parameters instead of 117k. Empty means
+        # "whatever the variant decides", which for tcn is none and for
+        # tcn_se is 8.
+        Field("se_reduction", "int", GUI_DEFAULTS["se_reduction"], nullable=True, min=1, show_if="se",
+              help="Squeeze-and-Excitation ratio: C -> C/r -> C channel gate on every residual "
+                   "block, squeezed over a RUNNING mean so it cannot see ahead. "
+                   "Empty = 8; the tcn_se_r{N} variants fix it instead"),
+        Field("bottleneck_ratio", "float", GUI_DEFAULTS["bottleneck_ratio"], min=0.05, max=1.0, step=0.05, show_if="sandwich",
               help="Channel squeeze before attention: attn_dim = H × ratio"),
-        Field("skip_bottleneck_ratio", "float", None, nullable=True, min=0.05, max=1.0, step=0.05,
+        Field("skip_bottleneck_ratio", "float", GUI_DEFAULTS["skip_bottleneck_ratio"], nullable=True, min=0.05, max=1.0, step=0.05,
               show_if="attention",
               help="BottleneckSkip on each attention residual (anti-collapse); empty = identity skip"),
-        Field("dropout", "float", 0.1, min=0.0, max=0.9, step=0.05,
+        Field("dropout", "float", GUI_DEFAULTS["dropout"], min=0.0, max=0.9, step=0.05,
               help="Dropout in TCN blocks and attention"),
     ]),
     Section("Data", [
-        Field("artifact", "select", "EOG", choices="artifacts"),
-        Field("data_dir", "str", "./data/EEGdenoisenet/data/",
+        Field("artifact", "select", GUI_DEFAULTS["artifact"], choices="artifacts"),
+        Field("data_dir", "str", GUI_DEFAULTS["data_dir"],
               help="Folder with EEG/EOG/EMG_all_epochs.npy"),
-        Field("batch_size", "int", 32, min=1),
-        Field("snr_range_db", "range2", [-7.0, 2.0],
+        Field("batch_size", "int", GUI_DEFAULTS["batch_size"], min=1),
+        Field("normalization", "select", GUI_DEFAULTS["normalization"], choices="normalizations",
+              help="fixed: one scale calibrated on training EEG, shared with evaluation and online inference. "
+                   "epoch: legacy offline normalization using the entire input window"),
+        Field("normalization_scale", "float", GUI_DEFAULTS["normalization_scale"], nullable=True, min=0.000001,
+              help="Fixed input scale. Empty calibrates it on training EEG and saves it in the checkpoint"),
+        Field("snr_range_db", "range2", GUI_DEFAULTS["snr_range_db"],
               help="Train: uniform in [lo, hi]; val/test: 10-point grid over it"),
-        Field("master_seed", "int", 42, min=0,
+        Field("target_fs", "float", GUI_DEFAULTS["target_fs"], nullable=True, min=1.0, max=100000.0,
+              datalist="sample_rates",
+              help="Resample the epochs to this rate before training (e.g. 250, "
+                   "EEG-IO's rate: 512-sample epochs become 500). Empty leaves "
+                   "them at the 256 Hz they arrive at, as every run on disk did"),
+        Field("master_seed", "int", GUI_DEFAULTS["master_seed"], min=0,
               help="Seed for splits, SNR, weight init, dropout and batch order"),
-        Field("device", "select", "auto", choices="devices",
+        Field("device", "select", GUI_DEFAULTS["device"], choices="devices",
               help="auto = cuda > mps > cpu; cpu for bit-exact repeats (MPS is not deterministic)"),
     ]),
+    Section("Methodology", [
+        Field("protocol", "select", GUI_DEFAULTS["protocol"], choices="protocols",
+              help="paper enforces the seven methodology rules; exploratory results are not paper-ready"),
+        Field("output_delay", "int", GUI_DEFAULTS["output_delay"], min=0,
+              help="Target shift ell, in samples. Same causal model; output arrives ell samples later"),
+        Field("valid_history_samples", "int", GUI_DEFAULTS["valid_history_samples"], nullable=True, min=1,
+              help="Shared complete-history span for every compared model; use the generated study plan"),
+        Field("valid_future_samples", "int", GUI_DEFAULTS["valid_future_samples"], min=0,
+              help="Shared tail exclusion, covering all delays and offline reference future reach"),
+        Field("hop", "int", GUI_DEFAULTS["hop"], min=1, help="Paper operating point: 4 samples"),
+        Field("resampling", "select", GUI_DEFAULTS["resampling"], choices="resampling_methods",
+              help="causal preserves FIR delay; offline is a legacy analysis control"),
+    ]),
     Section("Training", [
-        Field("learning_rate", "float", 5e-4, min=0.0, step=1e-4, help="Base LR (TCN)"),
-        Field("attn_lr_scale", "float", 3.0, min=0.0, step=0.5, show_if="attention",
+        Field("learning_rate", "float", GUI_DEFAULTS["learning_rate"], min=0.0, step=1e-4, help="Base LR (TCN)"),
+        Field("attn_lr_scale", "float", GUI_DEFAULTS["attn_lr_scale"], min=0.0, step=0.5, show_if="attention",
               help="Decoder LR = base × scale"),
-        Field("weight_decay", "float", 0.0, min=0.0, step=1e-4),
-        Field("max_epochs", "int", 100, min=1),
-        Field("log_every", "int", 20, min=1, help="Print every N steps"),
+        Field("weight_decay", "float", GUI_DEFAULTS["weight_decay"], min=0.0, step=1e-4),
+        Field("max_epochs", "int", GUI_DEFAULTS["max_epochs"], min=1),
+        Field("log_every", "int", GUI_DEFAULTS["log_every"], min=1, help="Print every N steps"),
     ]),
     Section("Scheduler", [
-        Field("sched_warmup_epochs", "int", 5, min=0, help="Linear warmup before cosine decay"),
-        Field("eta_min", "float", 1e-6, min=0.0, step=1e-6, help="Cosine floor"),
+        Field("sched_warmup_epochs", "int", GUI_DEFAULTS["sched_warmup_epochs"], min=0, help="Linear warmup before cosine decay"),
+        Field("eta_min", "float", GUI_DEFAULTS["eta_min"], min=0.0, step=1e-6, help="Cosine floor"),
     ]),
     Section("Staged training", [
-        Field("staged", "bool", False, help="Phase 1: TCN only (decoder frozen) → Phase 2: all"),
-        Field("warmup_epochs", "int", 20, min=1, show_if="staged", help="Phase 1 length"),
-        Field("warmup_lr", "float", 1e-3, min=0.0, step=1e-4, show_if="staged"),
-        Field("finetune_lr", "float", 5e-4, min=0.0, step=1e-4, show_if="staged"),
+        Field("staged", "bool", GUI_DEFAULTS["staged"], help="Phase 1: TCN only (decoder frozen) → Phase 2: all"),
+        Field("warmup_epochs", "int", GUI_DEFAULTS["warmup_epochs"], min=1, show_if="staged", help="Phase 1 length"),
+        Field("warmup_lr", "float", GUI_DEFAULTS["warmup_lr"], min=0.0, step=1e-4, show_if="staged"),
+        Field("finetune_lr", "float", GUI_DEFAULTS["finetune_lr"], min=0.0, step=1e-4, show_if="staged"),
     ]),
     Section("Loss", [
-        Field("loss_fn", "select", "l1_combined", choices="losses",
+        Field("loss_fn", "select", GUI_DEFAULTS["loss_fn"], choices="losses",
               help="l1_combined = L1 + 0.05 × multi-res STFT"),
     ]),
     Section("Output", [
-        Field("save_dir", "str", None, nullable=True,
-              help="Checkpoint folder; empty → runs/<variant>_<artifact>[_kd]"),
-        Field("tensorboard", "bool", False),
+        Field("save_dir", "str", GUI_DEFAULTS["save_dir"], nullable=True,
+              help="Leave empty for runs/<variant>_<artifact>[_kd]_<rate>hz[_fixed][_s<seed>]. "
+                   "Fixed input scale adds _fixed; epoch scale keeps the legacy name. "
+                   "The native rate is 256 Hz and the default seed is 42."),
+        Field("overwrite", "bool", GUI_DEFAULTS["overwrite"],
+              help="Replace the run already in that folder. Without it, training refuses "
+                   "to start on top of a run from a different (or unrecorded) master_seed"),
+        Field("tensorboard", "bool", GUI_DEFAULTS["tensorboard"]),
     ]),
     Section("TurboQuant", [
-        Field("turboquant", "bool", False, show_if="attention",
+        Field("turboquant", "bool", GUI_DEFAULTS["turboquant"], show_if="attention",
               help="Fake K/V quantisation experiment (no runtime benefit)"),
-        Field("turboquant_bits", "int", 3, min=2, max=8, show_if="turboquant"),
-        Field("turboquant_key_mode", "select", "prod", choices="tq_key_modes", show_if="turboquant"),
-        Field("turboquant_train_mode", "select", "off", choices="tq_train_modes", show_if="turboquant"),
-        Field("turboquant_seed", "int", 42, min=0, show_if="turboquant"),
+        Field("turboquant_bits", "int", GUI_DEFAULTS["turboquant_bits"], min=2, max=8, show_if="turboquant"),
+        Field("turboquant_key_mode", "select", GUI_DEFAULTS["turboquant_key_mode"], choices="tq_key_modes", show_if="turboquant"),
+        Field("turboquant_train_mode", "select", GUI_DEFAULTS["turboquant_train_mode"], choices="tq_train_modes", show_if="turboquant"),
+        Field("turboquant_seed", "int", GUI_DEFAULTS["turboquant_seed"], min=0, show_if="turboquant"),
     ]),
     Section("Knowledge distillation", [
-        Field("teacher_ckpt", "str", None, nullable=True, datalist="checkpoints",
+        Field("teacher_ckpt", "str", GUI_DEFAULTS["teacher_ckpt"], nullable=True, datalist="checkpoints",
               help="Teacher best.pt (normally a *_bi run). Setting it enables KD."),
-        Field("teacher_config", "str", None, nullable=True, show_if="kd",
+        Field("teacher_config", "str", GUI_DEFAULTS["teacher_config"], nullable=True, show_if="kd",
               help="Only for legacy teacher checkpoints without model_config"),
-        Field("kd_alpha", "float", 0.5, min=0.0, max=1.0, step=0.05, show_if="kd",
+        Field("kd_alpha", "float", GUI_DEFAULTS["kd_alpha"], min=0.0, max=1.0, step=0.05, show_if="kd",
               help="Weight of loss(student, teacher); ground truth gets 1 − α"),
-        Field("kd_feature_weight", "float", 0.0, min=0.0, step=0.05, show_if="kd",
+        Field("kd_feature_weight", "float", GUI_DEFAULTS["kd_feature_weight"], min=0.0, step=0.05, show_if="kd",
               help="Weight of MSE(student features, teacher features); 0 = off"),
-        Field("kd_feature_layers", "list_str", ["decoder"], show_if="kd",
-              help="Submodules to match, comma-separated; student:teacher pairs for different depths "
-                   "(e.g. decoder, decoder.blocks.1:decoder.blocks.9)"),
-        Field("kd_output_loss", "select", None, choices="losses", nullable=True, show_if="kd",
+        # Empty by default, and nullable, so the form does not write a value
+        # into every config. A hard "decoder" here was sent explicitly on every
+        # GUI run, which meant the trainer never got to resolve it from the
+        # model -- and tcn/tcn_se have no decoder, so switching feature
+        # distillation on failed with "'decoder' is not a submodule".
+        Field("kd_feature_layers", "list_str", GUI_DEFAULTS["kd_feature_layers"], nullable=True, show_if="kd",
+              help="Submodules to match, comma-separated; empty = pick for this model "
+                   "(decoder for the attention variants, backbone for tcn/tcn_se). "
+                   "student:teacher pairs for different depths, e.g. "
+                   "decoder.blocks.1:decoder.blocks.9"),
+        Field("kd_output_loss", "select", GUI_DEFAULTS["kd_output_loss"], choices="losses", nullable=True, show_if="kd",
               help="Loss vs teacher output; empty → same as loss_fn"),
-        Field("kd_feature_loss", "select", "mse", choices="feature_losses", show_if="kd"),
-        Field("init_from_teacher", "bool", False, show_if="kd",
+        Field("kd_feature_loss", "select", GUI_DEFAULTS["kd_feature_loss"], choices="feature_losses", show_if="kd"),
+        Field("init_from_teacher", "bool", GUI_DEFAULTS["init_from_teacher"], show_if="kd",
               help="Copy the teacher's weights into the student first (leading slice if the student is smaller)"),
     ]),
 ]
@@ -348,13 +404,17 @@ def update_yaml_text(text: str, values: Dict[str, Any]) -> str:
 def render_config(name: str, values: Dict[str, Any]) -> str:
     """The text that save_config would write, without writing it."""
     current = read_config(name)
-    return update_yaml_text(current["text"], coerce_all(values))
+    text = update_yaml_text(current["text"], coerce_all(values))
+    from experiment.config import resolve_config
+    resolve_config(yaml.safe_load(text), profile="gui")
+    return text
 
 
 def save_config(name: str, values: Dict[str, Any]) -> str:
     new_text = render_config(name, values)
     yaml.safe_load(new_text)                       # must still parse
-    config_path(name).write_text(new_text)
+    from experiment.storage import atomic_write
+    atomic_write(config_path(name), lambda f: f.write(new_text.encode("utf-8")))
     return new_text
 
 
@@ -478,8 +538,13 @@ def _checkpoint_info(path: Path) -> dict:
     info: dict = {}
     try:
         import torch
-        ck = torch.load(path, map_location="cpu", weights_only=False)
+        from experiment.checkpoints import read_checkpoint
+        ck = read_checkpoint(path)
         info = {"epoch": ck.get("epoch"), "saved_at": ck.get("saved_at"),
+                "weights_only_release": ck.get("weights_only_release") is True,
+                "schema_version": ck.get("schema_version"), "run_id": ck.get("run_id"),
+                "val_loss": ck.get("val_loss"),
+                "validation_history": (ck.get("history") or {}).get("val_loss"),
                 "model_config": dict(ck.get("model_config") or {}),
                 "run_config": dict(ck.get("run_config") or {}),
                 "params": sum(v.numel() for k, v in (ck.get("model_state") or {}).items()
@@ -569,6 +634,99 @@ def _loss_of(run_dir: Path, history: Optional[dict]) -> tuple[Optional[str], str
     return None, "unknown"
 
 
+def _lookahead_of(variant: Optional[str], model_config: dict) -> Optional[int]:
+    """
+    Samples of future a run was licensed to read, or None if it is not a
+    bounded-lookahead run at all (causal, or an unbounded teacher).
+
+    Taken from the variant the run recorded, with the checkpoint's own
+    ``lookahead`` as the fallback: the registry is authoritative about what a
+    name means, and the recorded value covers a run built before a rung was
+    registered. Reading it from the directory name is deliberately not an
+    option -- a name is a convention, and ``runs/tcn_se_both_s67`` already
+    proved it can be wrong about what is inside.
+    """
+    try:
+        from models.variants import LOOKAHEAD_VARIANTS, TCN_LOOKAHEAD_VARIANTS, pinned_kwargs
+        if variant in LOOKAHEAD_VARIANTS or variant in TCN_LOOKAHEAD_VARIANTS:
+            return pinned_kwargs(variant).get("lookahead")
+    except Exception:                          # torch missing: fall through
+        pass
+    value = (model_config or {}).get("lookahead")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+RUN_CATEGORIES = (
+    ("direct", "Direct training"),
+    ("receptive", "Receptive field"),
+    ("lookahead", "Lookahead / output delay"),
+    ("distillation", "Knowledge distillation"),
+    ("other", "Other experiments"),
+)
+
+
+def run_category(variant=None, model_config=None, run_config=None, *, kd=False):
+    """Classify the recorded experiment, independently of its directory name."""
+    mc, cfg = model_config or {}, run_config or {}
+    arch = {**(cfg.get("arch") or {}), **mc}
+    explicit = cfg.get("experiment_group")
+    if explicit in dict(RUN_CATEGORIES):
+        return explicit
+    variant = mc.get("variant") or (cfg.get("arch") or {}).get("variant") or cfg.get("variant") or variant or ""
+    if re.search(r"_rf\d+(?:_|$)", variant):
+        return "receptive"
+    delay = cfg.get("output_delay")
+    if re.search(r"_la\d+(?:_|$)", variant) or arch.get("lookahead") or cfg.get("lookahead") or (
+            isinstance(delay, (int, float)) and delay > 0):
+        return "lookahead"
+    if kd or cfg.get("teacher_ckpt"):
+        return "distillation"
+    # Custom finite dilation schedules belong with receptive-field experiments;
+    # the default schedule alone is not evidence of a sweep.
+    dilations = mc.get("dilations") or (cfg.get("arch") or {}).get("dilations") or cfg.get("dilations")
+    if dilations and list(dilations) != [1, 2, 4, 8, 16] and variant in ("tcn", "tcn_se"):
+        return "receptive"
+    if re.fullmatch(r"tcn_(?:mla|se)_r\d+(?:_bi)?", variant):
+        return "other"
+    return "direct"
+
+
+def run_categories(runs=None):
+    rows = list_runs() if runs is None else runs
+    return [{"key": key, "label": label,
+             "n": sum(r.get("category", "direct") == key for r in rows)}
+            for key, label in RUN_CATEGORIES]
+
+
+def _qualified_legacy_validation(row, best, last, history):
+    """Check historical validation provenance separately from the paper protocol."""
+    if (row["training_protocol"] != "legacy" or row["status"] != "complete"
+            or row["epochs"] != 200 or last.get("epoch") != 200 or not history):
+        return False
+    cfg = best["run_config"]
+    seed, artifact = cfg.get("master_seed"), cfg.get("artifact")
+    if type(seed) is not int or seed < 0 or artifact not in ("EOG", "EMG", "BOTH"):
+        return False
+    recipe = dict(master_seed=seed, artifact=artifact, optimizer="AdamW", loss_fn="mse",
+                  max_epochs=200)
+    for saved in (cfg, last.get("run_config") or {}, history.get("config") or {}):
+        if any(saved.get(key) != value for key, value in recipe.items()):
+            return False
+    curve = history["val_loss"]
+    epoch = row["best_epoch"]
+    return (all(checkpoint.get("optimizer", {}).get("family") == "AdamW"
+                for checkpoint in (best, last))
+            and best.get("model_config") == last.get("model_config")
+            and best.get("run_id") == last.get("run_id") == history.get("run_id")
+            and best.get("epoch") == epoch
+            and best.get("val_loss") == curve[epoch - 1]
+            and last.get("val_loss") == curve[-1]
+            and best.get("validation_history") == curve[:epoch]
+            and last.get("validation_history") == curve
+            and all(isinstance(value, (float, int)) and math.isfinite(value)
+                    for value in (*curve, row["rrmse_t"], row["rrmse_s"], row["acc"])))
+
+
 def list_runs() -> List[dict]:
     """
     One row per runs/<dir> that holds a best.pt.
@@ -577,11 +735,13 @@ def list_runs() -> List[dict]:
     checkpoint says about itself (``variant``, depth, rank, parameter count) and
     a ``status``:
 
+      pretrained   released model weights without a training history
       complete     history.json exists and last.pt sits at its final epoch
       stale        history.json exists but last.pt is at a different epoch — the
                    directory was re-used, so the metrics shown describe weights
                    that have been overwritten
-      interrupted  no history.json: the run never reached _finish()
+      interrupted  no history.json, or fewer epochs than the run's own max_epochs:
+                   it never reached _finish() (or is still training)
 
     ``kind`` groups runs that are the same experiment (variant x artifact).
     """
@@ -593,22 +753,46 @@ def list_runs() -> List[dict]:
         if not d.is_dir() or not best.is_file():
             continue
         info = _checkpoint_info(best)
+        last_info = _checkpoint_info(d / "last.pt")
+        run_config = info.get("run_config") or {}
         mc = info.get("model_config") or {}
-        artifact = _artifact_from_name(d.name)
+        artifact = run_config.get("artifact") or _artifact_from_name(d.name)
         variant = mc.get("variant") or _variant_from_name(d.name, artifact)
+        # Causality has three answers now, not two, and collapsing them loses
+        # the one in the middle: a bounded-lookahead run reads 32 samples
+        # ahead, a *_bi teacher reads the whole epoch, and only the second is
+        # "bidirectional".  ``model_config.causal is False`` is true of both,
+        # so reading the flag alone would badge every rung of the ladder as a
+        # teacher -- a run labelled as something it is not, which is the
+        # failure this project keeps writing guards against.
+        look = _lookahead_of(variant, mc)
+        causal = look is None and not (mc.get("causal") is False or d.name.endswith("_bi")
+                                       or "_bi_" in d.name)
         row = {"name": d.name, "checkpoint": f"./runs/{d.name}/best.pt",
-               "bidirectional": bool(mc.get("causal") is False) or d.name.endswith("_bi")
-                                or "_bi_" in d.name,
+               #: Unbounded only.  A bounded rung is not one of these.
+               "bidirectional": not causal and look is None,
+               #: Samples of future the run may read; None unless bounded.
+               "lookahead": look,
+               #: False for both -- what the ONNX exporter and the streaming
+               #: paths actually key on.
+               "causal": causal,
                "epochs": None, "best_epoch": None, "val_loss": None,
                "rrmse_t": None, "rrmse_s": None, "acc": None, "kd": False,
                "variant": variant, "artifact": artifact,
+               "tcn_norm": mc.get("tcn_norm"),
+               "dilations": mc.get("dilations"),
+               "se_reduction": mc.get("se_reduction"),
+               "se_window": mc.get("se_window"),
                "kind": f"{variant} · {artifact}" if variant and artifact else (variant or d.name),
                "hidden_channels": mc.get("hidden_channels"),
                "n_attn_layers": mc.get("n_attn_layers"),
                "kv_lora_rank": mc.get("kv_lora_rank"),
                "params": info.get("params"),
-               "master_seed": (info.get("run_config") or {}).get("master_seed"),
-               "last_epoch": (_checkpoint_info(d / "last.pt") or info).get("epoch"),
+               "master_seed": run_config.get("master_seed"),
+               # This describes the training recipe, not publication approval.
+               # In particular, only the checkpoint can establish paper provenance.
+               "training_protocol": (run_config.get("protocol") or "legacy") if info else "unknown",
+               "last_epoch": (last_info or info).get("epoch"),
                **_run_time(d, info),
                "loss_fn": None, "loss_source": "unknown",
                "optimizer": (info.get("optimizer") or {}).get("label"),
@@ -630,6 +814,32 @@ def list_runs() -> List[dict]:
                     # without torch; only fall back when it is missing.
                     if (h.get("config") or {}).get("master_seed") is not None:
                         row["master_seed"] = h["config"]["master_seed"]
+                    # The run wrote down what it trained on. Preferred over the
+                    # directory-name parse, which only works for runs named
+                    # <variant>_<artifact> and silently yields nothing for any
+                    # other name.
+                    if (h.get("config") or {}).get("artifact"):
+                        row["artifact"] = h["config"]["artifact"]
+                        row["kind"] = (f"{row['variant']} · {row['artifact']}"
+                                       if row["variant"] else row["kind"])
+                    # The architecture the run recorded for itself. Complete
+                    # (defaults resolved) where the checkpoint's model_config
+                    # holds only what was passed, and readable without torch,
+                    # so it fills the columns in for a run whose best.pt
+                    # cannot be loaded here. Only where the checkpoint is
+                    # silent: the weights are the final authority on shape.
+                    # ``h["config"]`` would raise for a history that has none,
+                    # and the except below would then throw the whole history
+                    # away and report the run as unfinished.
+                    hcfg = h.get("config") or {}
+                    arch = hcfg.get("arch") or {}
+                    if row["tcn_norm"] is None:
+                        row["tcn_norm"] = arch.get("tcn_norm") or hcfg.get("tcn_norm")
+                    for key in ("hidden_channels", "n_attn_layers", "kv_lora_rank", "dilations", "se_reduction", "se_window"):
+                        if row.get(key) is None and arch.get(key) is not None:
+                            row[key] = arch[key]
+                    if row.get("params") is None and hcfg.get("n_params"):
+                        row["params"] = hcfg["n_params"]
                     # last.pt should sit at the final epoch of that history; if it
                     # does not, the directory was re-used by a later, shorter run.
                     last = row["last_epoch"]
@@ -637,6 +847,33 @@ def list_runs() -> List[dict]:
             except (ValueError, KeyError, IndexError):
                 h = None
         row["loss_fn"], row["loss_source"] = _loss_of(d, h)
+        recorded = dict((h or {}).get("config") or {})
+        recorded.update(run_config)
+        # history.json and last.pt are rewritten every epoch, so a run that
+        # died (or is still going) at epoch 3 matches the test above and would
+        # read as complete -- and then join a rung's average beside its own
+        # 200-epoch _retry2. Training has no early stopping, so a finished run
+        # always holds max_epochs entries; anything shorter did not finish.
+        planned = recorded.get("max_epochs")
+        if (row["status"] == "complete" and isinstance(planned, int) and not isinstance(planned, bool)
+                and row["epochs"] is not None and row["epochs"] < planned):
+            row["status"] = "interrupted"
+        row["planned_epochs"] = planned if isinstance(planned, int) else None
+        row["input_normalization"] = recorded.get("normalization") or "epoch"
+        row["category"] = run_category(variant, mc, recorded, kd=row["kd"])
+        row["output_delay"] = recorded.get("output_delay", 0)
+        rate_config = run_config if row["status"] == "stale" else recorded
+        try:
+            rate = float(rate_config.get("target_fs"))
+        except (TypeError, ValueError):
+            rate = 0.0
+        row["train_fs_recorded"] = math.isfinite(rate) and rate > 0
+        # Historical EEGdenoiseNet runs used the native 256 Hz rate by default.
+        row["train_fs"] = rate if row["train_fs_recorded"] else 256.0
+        if info.get("weights_only_release") and not hist.is_file():
+            row.update(status="pretrained", best_epoch=info.get("epoch"),
+                       val_loss=info.get("val_loss"))
+        row["qualified"] = _qualified_legacy_validation(row, info, last_info, h)
         rows.append(row)
     return rows
 

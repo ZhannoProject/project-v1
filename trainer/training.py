@@ -15,6 +15,9 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import time
+import inspect
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
@@ -29,9 +32,50 @@ from .optimizer import (
     freeze_decoder,
     unfreeze_all,
 )
-from trainer.checkpoint import save_checkpoint, save_history
+from trainer.checkpoint import ensure_writable, save_checkpoint, save_history
 from trainer.logger import create_tb_writer, log_lr, log_scalars
 from trainer.losses import build_loss
+from data.protocol import dataset_protocol
+from experiment.config import defaults, resolve_config, STAGED_API_DEFAULTS
+from experiment.storage import RunLease, SCHEMA_VERSION, atomic_json, archive_existing
+from trainer.checkpoint import RUN_FILES
+from experiment.methodology import aligned, validate_model
+
+API_DEFAULTS = defaults("api")
+
+
+def training_session(method):
+    """All public training entry points own the output directory until cleanup."""
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        if method.__name__ == "staged_fit" and self.history["config"].get("protocol") == "paper":
+            raise ValueError("Paper protocol uses one ordinary 200-epoch AdamW schedule")
+        if getattr(self, "_session_owner", None) == threading.get_ident():
+            return method(self, *args, **kwargs)
+        with RunLease(self.save_dir) as lease:
+            self._guard_save_dir(self.history["config"].get("master_seed"), self.overwrite)
+            archive_existing(self.save_dir, RUN_FILES, lease.run_id)
+            if method.__name__ == "staged_fit":
+                bound = inspect.signature(method).bind(self, *args, **kwargs)
+                bound.apply_defaults()
+                self.history["config"].update({k: v for k, v in bound.arguments.items() if k != "self"})
+                self.history["config"]["staged"] = True
+            self.history.update(schema_version=SCHEMA_VERSION, run_id=lease.run_id)
+            self.model.run_config = dict(self.history["config"])
+            atomic_json(self.save_dir / "resolved_config.json",
+                        dict(schema_version=SCHEMA_VERSION, run_id=lease.run_id,
+                             model_config=self.history["config"]["arch"],
+                             run_config=self.history["config"]))
+            self._session_active = True
+            self._session_owner = threading.get_ident()
+            try:
+                self.writer = create_tb_writer(self.save_dir, self.use_tensorboard)
+                return method(self, *args, **kwargs)
+            finally:
+                self._session_active = False
+                self._session_owner = None
+                self._cleanup_training()
+    return run
 
 
 class Trainer:
@@ -44,19 +88,41 @@ class Trainer:
         model: nn.Module,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        save_dir: str = "./runs/exp1",
-        learning_rate: float = 5e-4,
-        attn_lr_scale: float = 1.0,
-        weight_decay: float = 0.0,
-        max_epochs: int = 50,
-        log_every: int = 20,
-        sched_warmup_epochs: int = 5,
-        eta_min: float = 1e-6,
+        save_dir: str = API_DEFAULTS["save_dir"],
+        learning_rate: float = API_DEFAULTS["learning_rate"],
+        attn_lr_scale: float = API_DEFAULTS["attn_lr_scale"],
+        weight_decay: float = API_DEFAULTS["weight_decay"],
+        max_epochs: int = API_DEFAULTS["max_epochs"],
+        log_every: int = API_DEFAULTS["log_every"],
+        sched_warmup_epochs: int = API_DEFAULTS["sched_warmup_epochs"],
+        eta_min: float = API_DEFAULTS["eta_min"],
         device: Optional[torch.device] = None,
-        use_tensorboard: bool = False,
-        loss_fn: str = "l1_combined",
+        use_tensorboard: bool = API_DEFAULTS["tensorboard"],
+        loss_fn: str = API_DEFAULTS["loss_fn"],
         run_config: Optional[dict] = None,
+        overwrite: bool = API_DEFAULTS["overwrite"],
     ):
+        run_config = dict(run_config or {})
+        if any(isinstance(layer, nn.BatchNorm1d) for layer in model.modules()):
+            raise ValueError("Build a fresh model with tcn_norm=none or channel for new training.")
+        resolve_config(dict(profile="api", learning_rate=learning_rate, attn_lr_scale=attn_lr_scale,
+                            weight_decay=weight_decay, max_epochs=max_epochs, log_every=log_every,
+                            sched_warmup_epochs=sched_warmup_epochs, eta_min=eta_min, loss_fn=loss_fn))
+        dataset = getattr(train_loader, "dataset", None)
+        if hasattr(dataset, "normalization"):
+            # Save the actual fitted scale and split, not an unresolved CLI default.
+            run_config.update(dataset_protocol(dataset))
+        if run_config.get("protocol") == "paper":
+            resolve_config({**run_config, "max_epochs": max_epochs, "loss_fn": loss_fn})
+            n = int(dataset.clean.shape[-1]) if hasattr(dataset, "clean") else 512
+            validate_model(model, run_config, n)
+        # Before anything is built or any directory is made: refusing early
+        # means a clash costs a second, not a model and an optimizer.
+        self.save_dir = Path(save_dir)
+        self.overwrite = overwrite
+        self.use_tensorboard = use_tensorboard
+        self._guard_save_dir((run_config or {}).get("master_seed"), overwrite)
+
         self.device = device or get_device()
         print(f"[Trainer] Device: {self.device}")
 
@@ -78,37 +144,55 @@ class Trainer:
             eta_min=eta_min,
         )
 
-        self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-
-        # Reusing a directory silently mixes two runs: the new run overwrites best.pt
-        # at its first epoch, while history.json survives from the old one unless this
-        # run finishes.  Warn loudly; history.json is now rewritten every epoch so the
-        # two files cannot drift apart even if training is interrupted.
-        existing = [f for f in ("best.pt", "last.pt", "history.json") if (self.save_dir / f).is_file()]
-        if existing:
-            print(f"[Trainer] WARNING: {self.save_dir} already contains {', '.join(existing)} "
-                  f"from an earlier run — they will be overwritten.")
 
         self.best_val_loss = float("inf")
         # ``config`` records what produced these numbers.  val_loss is only comparable
         # across runs that share loss_fn, artifact, snr_range_db and master_seed.
-        self.history = {"train_loss": [], "val_loss": [], "rrmse_t": [], "rrmse_s": [], "acc": [],
-                        "config": {"loss_fn": loss_fn,
-                                   # the optimizer class actually built, not the one
-                                   # the code is assumed to build
-                                   "optimizer": type(self.optimizer).__name__,
-                                   **{k: v for k, v in (run_config or {}).items()
-                                      if k in ("variant", "artifact", "max_epochs", "batch_size",
-                                               "learning_rate", "attn_lr_scale", "weight_decay",
-                                               "sched_warmup_epochs", "eta_min",
-                                               "snr_range_db", "master_seed",
-                                               "staged", "teacher_ckpt")}}}
+        #
+        # ``arch`` is the shape of the model, read off the model itself rather than
+        # off the config that was meant to build it.  Without it a run records the
+        # training recipe and not the thing trained, and the two can disagree: a CLI
+        # override, a config edited after the run, a variant whose name pins a value.
+        # This project has the scar — every MLA run here was trained with 4 attention
+        # layers and 2 heads while its YAML said 2 and 4, so the headline MHA/MLA
+        # ablation differs in depth, head count and parameter count, and nothing in
+        # any run said so.  Taken from the built model, it cannot drift from the
+        # weights beside it.
+        self.history = {"train_loss": [], "val_loss": [], "rrmse_t": [], "rrmse_s": [],
+                        "acc": [], "config": {}}
 
-        self.writer = create_tb_writer(self.save_dir, use_tensorboard)
+        # Keep a complete record, including direct Python API arguments that
+        # used to be absent when no CLI run_config was supplied.
+        self.history["config"].update(run_config)
+        self.history["config"].update(
+            profile=run_config.get("profile", "api"), save_dir=str(self.save_dir),
+            learning_rate=learning_rate, attn_lr_scale=attn_lr_scale,
+            weight_decay=weight_decay, max_epochs=max_epochs, log_every=log_every,
+            sched_warmup_epochs=sched_warmup_epochs, eta_min=eta_min,
+            device=str(self.device), tensorboard=use_tensorboard, overwrite=overwrite,
+            loss_fn=loss_fn, optimizer=type(self.optimizer).__name__,
+            selection_metric="gt_mse",
+            arch=self._architecture(), n_params=sum(p.numel() for p in self.model.parameters()))
+        self.writer = None
+        self.model.run_config = dict(self.history["config"])
 
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"[Trainer] Trainable params: {n_params:,}")
+
+    def _architecture(self) -> dict:
+        """
+        The model's own account of its shape, for ``history.json``.
+
+        Falls back to whatever ``model_config`` holds if the variant cannot be
+        resolved (a hand-built model passed straight to the Trainer, which the
+        tests do): an incomplete record beats refusing to start a run over one.
+        """
+        try:
+            from experiment.checkpoints import complete_architecture
+            return complete_architecture(self.model)
+        except Exception:                      # pragma: no cover - defensive
+            return dict(getattr(self.model, "model_config", {}) or {})
 
     def _extra_trainable(self):
         """Trainable tensors outside ``self.model`` (none here; KDTrainer adds its projectors)."""
@@ -136,6 +220,7 @@ class Trainer:
 
             # Forward pass
             pred = self.model(noisy)
+            pred, clean = aligned(pred, clean, self.model)
             loss = self.criterion(pred, clean)
 
             # Backward pass and optimization
@@ -158,6 +243,10 @@ class Trainer:
         print(f"  → train_loss = {avg_loss:.4f}  ({elapsed:.1f}s)")
         return avg_loss
 
+    def _guard_save_dir(self, seed, overwrite: bool):
+        """Refuse to start on top of someone else's run — see ensure_writable."""
+        ensure_writable(self.save_dir, seed, overwrite)
+
     @torch.no_grad()  # disable gradient calculation to save memory / compute
     def _validate(self, epoch: int, model: Optional[nn.Module] = None):
         """
@@ -177,7 +266,12 @@ class Trainer:
             clean = batch["clean"].to(self.device)
 
             pred = model(noisy)
-            loss = self.criterion(pred, clean)
+            # Teacher references use the student's common target positions,
+            # with the teacher's own delay alignment.
+            cfg = {**self.history["config"],
+                   "output_delay": getattr(model, "run_config", {}).get("output_delay", 0)}
+            pred, clean = aligned(pred, clean, cfg)
+            loss = torch.nn.functional.mse_loss(pred, clean)
 
             bs = noisy.size(0)
             running_loss += loss.item() * bs
@@ -193,8 +287,8 @@ class Trainer:
 
         print(f"  → val_loss   = {avg_loss:.4f}  "
               f"RRMSE_t={agg_metrics['rrmse_t']:.3f}  "
-              f"RRMSE_s={agg_metrics['rrmse_s']:.3f}  "
-              f"ACC={agg_metrics['acc']:.3f}")
+              f"RRMSE_f={agg_metrics['rrmse_s']:.3f}  "
+              f"CC={agg_metrics['acc']:.3f}")
         if model is self.model:
             log_lr(self.optimizer, self.model)
         return avg_loss, agg_metrics
@@ -241,10 +335,15 @@ class Trainer:
         if self.writer:
             self.writer.close()
 
+    def _cleanup_training(self):
+        if self.writer:
+            self.writer.close()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
+    @training_session
     def fit(self):
         """
         Standard training: all parameters are trained jointly from epoch 1.
@@ -256,15 +355,16 @@ class Trainer:
         self._run_epochs(1, self.max_epochs, phase_label="fit")
         self._finish()
 
+    @training_session
     def staged_fit(
         self,
-        warmup_epochs: int = 20,
-        warmup_lr: float = 1e-3,
-        finetune_lr: float = 5e-4,
-        attn_lr_scale: float = 1.0,
-        weight_decay: float = 0.0,
-        sched_warmup_epochs: int = 3,
-        eta_min: float = 1e-6,
+        warmup_epochs: int = STAGED_API_DEFAULTS["warmup_epochs"],
+        warmup_lr: float = STAGED_API_DEFAULTS["warmup_lr"],
+        finetune_lr: float = STAGED_API_DEFAULTS["finetune_lr"],
+        attn_lr_scale: float = STAGED_API_DEFAULTS["attn_lr_scale"],
+        weight_decay: float = STAGED_API_DEFAULTS["weight_decay"],
+        sched_warmup_epochs: int = STAGED_API_DEFAULTS["sched_warmup_epochs"],
+        eta_min: float = STAGED_API_DEFAULTS["eta_min"],
     ):
         """
         Two-phase training for sandwich models (TCN + attention).

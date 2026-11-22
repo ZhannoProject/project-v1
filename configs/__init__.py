@@ -10,10 +10,11 @@ CLI overrides take precedence over the YAML file — this lets you
 share one config across similar runs while tweaking a single knob
 from the command line:
 
-    python trainer/trainer.py --config configs/tcn_mha_eog.yaml --epochs 200
+    python -m trainer --config configs/tcn_mha_eog.yaml --max_epochs 200
 """
 
 import yaml
+import json
 from pathlib import Path
 
 
@@ -27,7 +28,22 @@ def load_config(path: str) -> dict:
     if not p.exists():
         raise FileNotFoundError(f"Config not found: {p}")
     with open(p, "r") as f:
-        cfg = yaml.safe_load(f)
+        # PyYAML treats JSON exponent-only numbers such as 1e-06 as strings.
+        # Frozen GUI commands and run snapshots must preserve numeric types.
+        cfg = json.load(f) if p.suffix.lower() == ".json" else yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config must be a mapping: {p}")
+    if "schema_version" in cfg and "run_config" in cfg:
+        from experiment.storage import SCHEMA_VERSION
+        if type(cfg["schema_version"]) is not int or cfg["schema_version"] != SCHEMA_VERSION:
+            raise ValueError(f"Unsupported configuration snapshot version: {cfg['schema_version']}")
+        saved = dict(cfg["run_config"])
+        for key in ("arch", "optimizer", "n_params"):
+            saved.pop(key, None)
+        saved.update(cfg.get("model_config") or {})
+        # A saved execution permission is not permission for a later replay.
+        saved["overwrite"] = False
+        cfg = saved
     return cfg
 
 

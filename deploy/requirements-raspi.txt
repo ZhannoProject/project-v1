@@ -2,4 +2,5 @@
 #   python -m venv ~/eeg-env && source ~/eeg-env/bin/activate
 #   pip install -r requirements-raspi.txt
 numpy>=1.24
+scipy>=1.10          # forward-only filters in channel replay
 onnxruntime>=1.18      # IR version 10 / opset 18 support; aarch64 wheels on PyPI

@@ -1,0 +1,388 @@
+{
+  "model": {
+    "checkpoint": "../pytorch/attention_s72.pt",
+    "epoch": 193,
+    "val_loss": 0.507971824501075,
+    "variant": "tcn_mla_r16",
+    "hidden_channels": 52,
+    "n_heads": 2,
+    "n_attn_layers": 4,
+    "max_seq_len": 512,
+    "dropout": 0.1,
+    "kv_lora_rank": 16,
+    "bottleneck_ratio": 0.5,
+    "skip_bottleneck_ratio": null,
+    "causal": true,
+    "causal_tcn": true,
+    "turboquant": false,
+    "turboquant_bits": 3,
+    "turboquant_key_mode": "prod",
+    "turboquant_train_mode": "off",
+    "turboquant_seed": 42,
+    "tcn_norm": "channel",
+    "se_window": null,
+    "attention_window": null,
+    "n_params": 127839
+  },
+  "export": {
+    "opset": 18,
+    "exporter": "torchscript",
+    "mode": "incremental",
+    "n_nodes": 342,
+    "file_size_kb": 565.2,
+    "window": 512,
+    "topology": "sandwich",
+    "state": [
+      {
+        "name": "conv_0",
+        "shape": [
+          1,
+          2
+        ]
+      },
+      {
+        "name": "conv_1",
+        "shape": [
+          52,
+          2
+        ]
+      },
+      {
+        "name": "conv_2",
+        "shape": [
+          52,
+          4
+        ]
+      },
+      {
+        "name": "conv_3",
+        "shape": [
+          52,
+          4
+        ]
+      },
+      {
+        "name": "conv_4",
+        "shape": [
+          52,
+          8
+        ]
+      },
+      {
+        "name": "conv_5",
+        "shape": [
+          52,
+          8
+        ]
+      },
+      {
+        "name": "attn_mask_0",
+        "shape": [
+          1,
+          512
+        ]
+      },
+      {
+        "name": "kv_c_0",
+        "shape": [
+          512,
+          16
+        ]
+      },
+      {
+        "name": "kv_c_1",
+        "shape": [
+          512,
+          16
+        ]
+      },
+      {
+        "name": "kv_c_2",
+        "shape": [
+          512,
+          16
+        ]
+      },
+      {
+        "name": "kv_c_3",
+        "shape": [
+          512,
+          16
+        ]
+      },
+      {
+        "name": "conv_6",
+        "shape": [
+          52,
+          16
+        ]
+      },
+      {
+        "name": "conv_7",
+        "shape": [
+          52,
+          16
+        ]
+      },
+      {
+        "name": "conv_8",
+        "shape": [
+          52,
+          32
+        ]
+      },
+      {
+        "name": "conv_9",
+        "shape": [
+          52,
+          32
+        ]
+      },
+      {
+        "name": "conv_10",
+        "shape": [
+          52,
+          64
+        ]
+      },
+      {
+        "name": "conv_11",
+        "shape": [
+          52,
+          64
+        ]
+      }
+    ],
+    "state_tensors": 17,
+    "state_floats": 46282,
+    "mask_fill": -1000000000.0,
+    "torch": "2.12.0+cpu"
+  },
+  "data_protocol": {
+    "variant": "tcn_mla_r16",
+    "hidden_channels": 52,
+    "n_heads": 2,
+    "n_attn_layers": 4,
+    "max_seq_len": 512,
+    "dropout": 0.1,
+    "kv_lora_rank": 16,
+    "bottleneck_ratio": 0.5,
+    "skip_bottleneck_ratio": null,
+    "se_reduction": null,
+    "dilations": null,
+    "causal": null,
+    "causal_tcn": null,
+    "lookahead": null,
+    "turboquant": false,
+    "turboquant_bits": 3,
+    "turboquant_key_mode": "prod",
+    "turboquant_train_mode": "off",
+    "turboquant_seed": 42,
+    "tcn_norm": "channel",
+    "se_window": null,
+    "attention_window": null,
+    "artifact": "BOTH",
+    "batch_size": 32,
+    "snr_range_db": [
+      -7.0,
+      2.0
+    ],
+    "split_ratios": [
+      0.7,
+      0.15,
+      0.15
+    ],
+    "sampling": "legacy",
+    "target_fs": 250.0,
+    "normalization": "fixed",
+    "normalization_scale": 228.83613159744738,
+    "master_seed": 72,
+    "resampling": "offline",
+    "learning_rate": 0.0005,
+    "attn_lr_scale": 3.0,
+    "weight_decay": 0.0,
+    "max_epochs": 200,
+    "loss_fn": "mse",
+    "sched_warmup_epochs": 5,
+    "protocol": "exploratory",
+    "output_delay": 0,
+    "valid_history_samples": null,
+    "valid_future_samples": 0
+  },
+  "io": {
+    "input": {
+      "name": "x_t",
+      "shape": [
+        1,
+        1,
+        1
+      ],
+      "dtype": "float32"
+    },
+    "output": {
+      "name": "y_t",
+      "shape": [
+        1,
+        1,
+        1
+      ],
+      "dtype": "float32"
+    },
+    "state": [
+      {
+        "name": "conv_0",
+        "shape": [
+          1,
+          2
+        ]
+      },
+      {
+        "name": "conv_1",
+        "shape": [
+          52,
+          2
+        ]
+      },
+      {
+        "name": "conv_2",
+        "shape": [
+          52,
+          4
+        ]
+      },
+      {
+        "name": "conv_3",
+        "shape": [
+          52,
+          4
+        ]
+      },
+      {
+        "name": "conv_4",
+        "shape": [
+          52,
+          8
+        ]
+      },
+      {
+        "name": "conv_5",
+        "shape": [
+          52,
+          8
+        ]
+      },
+      {
+        "name": "attn_mask_0",
+        "shape": [
+          1,
+          512
+        ]
+      },
+      {
+        "name": "kv_c_0",
+        "shape": [
+          512,
+          16
+        ]
+      },
+      {
+        "name": "kv_c_1",
+        "shape": [
+          512,
+          16
+        ]
+      },
+      {
+        "name": "kv_c_2",
+        "shape": [
+          512,
+          16
+        ]
+      },
+      {
+        "name": "kv_c_3",
+        "shape": [
+          512,
+          16
+        ]
+      },
+      {
+        "name": "conv_6",
+        "shape": [
+          52,
+          16
+        ]
+      },
+      {
+        "name": "conv_7",
+        "shape": [
+          52,
+          16
+        ]
+      },
+      {
+        "name": "conv_8",
+        "shape": [
+          52,
+          32
+        ]
+      },
+      {
+        "name": "conv_9",
+        "shape": [
+          52,
+          32
+        ]
+      },
+      {
+        "name": "conv_10",
+        "shape": [
+          52,
+          64
+        ]
+      },
+      {
+        "name": "conv_11",
+        "shape": [
+          52,
+          64
+        ]
+      }
+    ]
+  },
+  "provenance": {
+    "trained_master_seed": 72,
+    "trained_artifact": "BOTH"
+  },
+  "preprocessing": {
+    "sample_rate_hz": 250.0,
+    "window_samples": 512,
+    "artifact_trained_on": "BOTH",
+    "normalization": "fixed",
+    "normalization_scale": 228.83613159744738,
+    "normalise": "x_in = x / normalization_scale; x_out = model(x_in) * normalization_scale",
+    "causal": true,
+    "model_causal": true,
+    "streaming": "feed one sample and the state; keep the output and new state",
+    "output_delay_samples": 0,
+    "output_semantics": "output at acquisition t estimates target t-output_delay_samples",
+    "valid_history_samples": null,
+    "valid_future_samples": 0,
+    "lookahead_samples": 0,
+    "lookahead_semantics": "output index t estimates target t and reads inputs <= t+L; emit it once sample t+L has been acquired",
+    "future_wait_ms": 0.0,
+    "latency_budget": {
+      "sample_rate_hz": 250.0,
+      "hop_samples": 4,
+      "output_delay_samples": 0,
+      "future_delay_ms": 0.0,
+      "algorithmic_budget_ms": 16.0,
+      "measured": false
+    }
+  },
+  "verification": {
+    "max_abs_diff_vs_incremental": 3.3527612686157227e-07,
+    "n_steps": 640,
+    "domain": "model_input"
+  }
+}

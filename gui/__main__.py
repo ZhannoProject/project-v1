@@ -4,7 +4,6 @@ CLI entry point.
     python -m gui                 native window (pywebview) if available, else browser
     python -m gui --browser       serve on http://127.0.0.1:8765/ and open a browser tab
     python -m gui --native        insist on the native window (error if pywebview is missing)
-    python -m gui.make_app        build a double-clickable "EEG Training GUI.app" (macOS)
 """
 
 import argparse

@@ -1,0 +1,432 @@
+{
+  "model": {
+    "checkpoint": "../pytorch/se_l0_s72.pt",
+    "epoch": 185,
+    "val_loss": 0.5116008399748335,
+    "variant": "tcn_se",
+    "hidden_channels": 64,
+    "dropout": 0.1,
+    "causal": true,
+    "se_reduction": 8,
+    "lookahead": null,
+    "dilations": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "turboquant": false,
+    "turboquant_bits": 3,
+    "turboquant_key_mode": "prod",
+    "turboquant_train_mode": "off",
+    "turboquant_seed": 42,
+    "tcn_norm": "channel",
+    "se_window": null,
+    "attention_window": null,
+    "n_params": 122548
+  },
+  "export": {
+    "opset": 18,
+    "exporter": "torchscript",
+    "mode": "incremental",
+    "n_nodes": 164,
+    "file_size_kb": 514.2,
+    "window": 125,
+    "topology": "tcn",
+    "state": [
+      {
+        "name": "conv_0",
+        "shape": [
+          1,
+          2
+        ]
+      },
+      {
+        "name": "conv_1",
+        "shape": [
+          64,
+          2
+        ]
+      },
+      {
+        "name": "se_sum_0",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_count_0",
+        "shape": [
+          1,
+          1
+        ]
+      },
+      {
+        "name": "conv_2",
+        "shape": [
+          64,
+          4
+        ]
+      },
+      {
+        "name": "conv_3",
+        "shape": [
+          64,
+          4
+        ]
+      },
+      {
+        "name": "se_sum_1",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_count_1",
+        "shape": [
+          1,
+          1
+        ]
+      },
+      {
+        "name": "conv_4",
+        "shape": [
+          64,
+          8
+        ]
+      },
+      {
+        "name": "conv_5",
+        "shape": [
+          64,
+          8
+        ]
+      },
+      {
+        "name": "se_sum_2",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_count_2",
+        "shape": [
+          1,
+          1
+        ]
+      },
+      {
+        "name": "conv_6",
+        "shape": [
+          64,
+          16
+        ]
+      },
+      {
+        "name": "conv_7",
+        "shape": [
+          64,
+          16
+        ]
+      },
+      {
+        "name": "se_sum_3",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_count_3",
+        "shape": [
+          1,
+          1
+        ]
+      },
+      {
+        "name": "conv_8",
+        "shape": [
+          64,
+          32
+        ]
+      },
+      {
+        "name": "conv_9",
+        "shape": [
+          64,
+          32
+        ]
+      },
+      {
+        "name": "se_sum_4",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_count_4",
+        "shape": [
+          1,
+          1
+        ]
+      }
+    ],
+    "state_tensors": 20,
+    "state_floats": 8135,
+    "mask_fill": -1000000000.0,
+    "torch": "2.12.0+cpu"
+  },
+  "data_protocol": {
+    "variant": "tcn_se",
+    "hidden_channels": 64,
+    "n_heads": 2,
+    "n_attn_layers": 4,
+    "max_seq_len": 512,
+    "dropout": 0.1,
+    "kv_lora_rank": 16,
+    "bottleneck_ratio": 0.5,
+    "skip_bottleneck_ratio": null,
+    "se_reduction": null,
+    "dilations": null,
+    "causal": null,
+    "causal_tcn": null,
+    "lookahead": null,
+    "turboquant": false,
+    "turboquant_bits": 3,
+    "turboquant_key_mode": "prod",
+    "turboquant_train_mode": "off",
+    "turboquant_seed": 42,
+    "tcn_norm": "channel",
+    "se_window": null,
+    "attention_window": null,
+    "artifact": "BOTH",
+    "batch_size": 32,
+    "snr_range_db": [
+      -7.0,
+      2.0
+    ],
+    "split_ratios": [
+      0.7,
+      0.15,
+      0.15
+    ],
+    "sampling": "legacy",
+    "target_fs": 250.0,
+    "normalization": "fixed",
+    "normalization_scale": 228.83613159744738,
+    "master_seed": 72,
+    "resampling": "offline",
+    "learning_rate": 0.0005,
+    "attn_lr_scale": 3.0,
+    "weight_decay": 0.0,
+    "max_epochs": 200,
+    "loss_fn": "mse",
+    "sched_warmup_epochs": 5,
+    "protocol": "exploratory",
+    "output_delay": 0,
+    "valid_history_samples": null,
+    "valid_future_samples": 0
+  },
+  "io": {
+    "input": {
+      "name": "x_t",
+      "shape": [
+        1,
+        1,
+        1
+      ],
+      "dtype": "float32"
+    },
+    "output": {
+      "name": "y_t",
+      "shape": [
+        1,
+        1,
+        1
+      ],
+      "dtype": "float32"
+    },
+    "state": [
+      {
+        "name": "conv_0",
+        "shape": [
+          1,
+          2
+        ]
+      },
+      {
+        "name": "conv_1",
+        "shape": [
+          64,
+          2
+        ]
+      },
+      {
+        "name": "se_sum_0",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_count_0",
+        "shape": [
+          1,
+          1
+        ]
+      },
+      {
+        "name": "conv_2",
+        "shape": [
+          64,
+          4
+        ]
+      },
+      {
+        "name": "conv_3",
+        "shape": [
+          64,
+          4
+        ]
+      },
+      {
+        "name": "se_sum_1",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_count_1",
+        "shape": [
+          1,
+          1
+        ]
+      },
+      {
+        "name": "conv_4",
+        "shape": [
+          64,
+          8
+        ]
+      },
+      {
+        "name": "conv_5",
+        "shape": [
+          64,
+          8
+        ]
+      },
+      {
+        "name": "se_sum_2",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_count_2",
+        "shape": [
+          1,
+          1
+        ]
+      },
+      {
+        "name": "conv_6",
+        "shape": [
+          64,
+          16
+        ]
+      },
+      {
+        "name": "conv_7",
+        "shape": [
+          64,
+          16
+        ]
+      },
+      {
+        "name": "se_sum_3",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_count_3",
+        "shape": [
+          1,
+          1
+        ]
+      },
+      {
+        "name": "conv_8",
+        "shape": [
+          64,
+          32
+        ]
+      },
+      {
+        "name": "conv_9",
+        "shape": [
+          64,
+          32
+        ]
+      },
+      {
+        "name": "se_sum_4",
+        "shape": [
+          64,
+          1
+        ]
+      },
+      {
+        "name": "se_count_4",
+        "shape": [
+          1,
+          1
+        ]
+      }
+    ]
+  },
+  "provenance": {
+    "trained_master_seed": 72,
+    "trained_artifact": "BOTH"
+  },
+  "preprocessing": {
+    "sample_rate_hz": 250.0,
+    "window_samples": 125,
+    "artifact_trained_on": "BOTH",
+    "normalization": "fixed",
+    "normalization_scale": 228.83613159744738,
+    "normalise": "x_in = x / normalization_scale; x_out = model(x_in) * normalization_scale",
+    "causal": true,
+    "model_causal": true,
+    "streaming": "feed one sample and the state; keep the output and new state",
+    "output_delay_samples": 0,
+    "output_semantics": "output at acquisition t estimates target t-output_delay_samples",
+    "valid_history_samples": null,
+    "valid_future_samples": 0,
+    "lookahead_samples": 0,
+    "lookahead_semantics": "output index t estimates target t and reads inputs <= t+L; emit it once sample t+L has been acquired",
+    "future_wait_ms": 0.0,
+    "latency_budget": {
+      "sample_rate_hz": 250.0,
+      "hop_samples": 4,
+      "output_delay_samples": 0,
+      "future_delay_ms": 0.0,
+      "algorithmic_budget_ms": 16.0,
+      "measured": false
+    }
+  },
+  "verification": {
+    "max_abs_diff_vs_incremental": 2.980232238769531e-07,
+    "n_steps": 253,
+    "domain": "model_input"
+  }
+}

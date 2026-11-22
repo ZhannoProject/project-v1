@@ -1,0 +1,37 @@
+# Plain TCN + ChannelNorm control for tcn_se_both_250hz (seed 42).
+# Matches the saved SE run's data/training protocol; SE gates are absent.
+
+# --- Model ---
+variant: "tcn_channelnorm"
+tcn_norm: "channel"
+se_reduction: null
+hidden_channels: 64
+dropout: 0.1
+
+# --- Data ---
+artifact: "BOTH"
+data_dir: "./data/EEGdenoisenet/data/"
+batch_size: 32
+snr_range_db: [-7.0, 2.0]
+target_fs: 250.0
+master_seed: 67
+normalization: "epoch"     # Match the existing exploratory SE checkpoint.
+resampling: "offline"
+sampling: "legacy"
+
+# --- Training ---
+learning_rate: 5.0e-4
+attn_lr_scale: 3.0
+weight_decay: 0.0
+max_epochs: 200
+loss_fn: "mse"
+log_every: 20
+sched_warmup_epochs: 5
+eta_min: 1.0e-6
+protocol: "exploratory"
+hop: 4
+output_delay: 0
+
+# --- Output ---
+save_dir: "./runs/tcn_channelnorm_both_250hz)_s67"
+tensorboard: false
